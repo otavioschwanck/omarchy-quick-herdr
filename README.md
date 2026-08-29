@@ -70,6 +70,18 @@ recarrega o QML, mas não registra o alvo de IPC.
 Nada é instalado por você: quando um opcional falta, o recurso dele some e o
 painel diz qual é e o que fazer.
 
+Num Omarchy recém-instalado, só o `gh` costuma faltar — `herdr`, `python`,
+`hyprctl`, `wl-copy`, `ssh` e `tailscale` já vêm. Para garantir todos de uma
+vez (o comando pula o que já está instalado):
+
+```bash
+omarchy pkg add github-cli wl-clipboard openssh tailscale
+```
+
+O `gh` ainda precisa de `gh auth login` uma vez, senão a coluna de PR continua
+vazia — e o rodapé do painel diz exatamente isso, com o comando pronto para
+copiar.
+
 ### O que ele escreve
 
 Só isto, e nada fora daqui:

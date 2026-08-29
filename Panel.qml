@@ -153,11 +153,18 @@ Panel {
   )
   property bool copied: false
 
+  // O bar expoe `run`, mas nao `shellQuote` -- confiar nela dava
+  // "Property 'shellQuote' is not a function" e engolia a acao inteira, em
+  // silencio para quem clicava. Citar aqui nao depende de API de terceiro.
+  function shq(valor) {
+    return "'" + String(valor === undefined || valor === null ? "" : valor).replace(/'/g, "'\\''") + "'";
+  }
+
   function copyCommand(comando) {
     if (!comando || !bar) return;
     // printf e não echo: o comando pode ter barra invertida, e echo a
     // interpretaria antes de o texto chegar na área de transferência.
-    bar.run("printf %s " + bar.shellQuote(comando) + " | wl-copy");
+    bar.run("printf %s " + root.shq(comando) + " | wl-copy");
     copied = true;
     copiedTimer.restart();
   }
@@ -399,10 +406,10 @@ Panel {
 
     // O "--" e obrigatorio: sem ele o xdg-terminal-exec le o "--local" que vem
     // depois como opcao dele, engole, e o terminal abre e fecha na hora.
-    var partes = ["omarchy-launch-terminal", "--", bar.shellQuote(root.janela)];
-    if (root.session !== "default") partes.push("--session", bar.shellQuote(root.session));
+    var partes = ["omarchy-launch-terminal", "--", root.shq(root.janela)];
+    if (root.session !== "default") partes.push("--session", root.shq(root.session));
     if (root.useLocal) partes.push("--local");
-    for (var i = 0; i < root.machines.length; i++) partes.push("--remote", bar.shellQuote(root.machines[i]));
+    for (var i = 0; i < root.machines.length; i++) partes.push("--remote", root.shq(root.machines[i]));
 
     bar.run(partes.join(" "));
     close();
@@ -410,7 +417,7 @@ Panel {
 
   function openPr(url) {
     if (!url) return;
-    if (bar) bar.run("omarchy-launch-webapp " + bar.shellQuote(url));
+    if (bar) bar.run("omarchy-launch-webapp " + root.shq(url));
     close();
   }
 
