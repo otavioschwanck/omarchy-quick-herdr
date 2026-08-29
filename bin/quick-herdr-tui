@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import termios
+import traceback
 import tty
 
 HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herdr-bar")
@@ -317,25 +318,89 @@ def main():
     sys.stdout.write(TELA_ALT + CURSOR_OFF)
     signal.signal(signal.SIGWINCH, lambda *_: None)
 
+    tombo = ""
     try:
         tty.setcbreak(sys.stdin.fileno())
         tela.desenhar()
         while True:
             pronto, _, _ = select.select([sys.stdin], [], [], INTERVALO)
             if pronto:
-                if not tratar(tela, sys.stdin.read(1)):
+                # Byte a byte, e nao caractere: em modo texto o Python segura o
+                # byte esperando fechar um caractere multibyte, e uma tecla
+                # solta ficaria pendurada ate a proxima.
+                bruto = os.read(sys.stdin.fileno(), 1)
+                if not bruto:
+                    break
+                if not em_seguranca(tela, decodificar(bruto)):
                     break
             else:
                 tela.buscar()
             tela.desenhar()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        tombo = traceback.format_exc()
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, antes)
         sys.stdout.write(TELA_NORMAL + CURSOR_ON)
         sys.stdout.flush()
 
+    # Uma janela que fecha sozinha nao diz nada a ninguem: o terminal some junto
+    # com a mensagem. Entao o tombo fica no log e na tela, e a janela espera.
+    if tombo:
+        try:
+            with open("/tmp/omarchy-quick-herdr.log", "a") as registro:
+                registro.write("\n--- quick-herdr-tui caiu ---\n" + tombo)
+        except OSError:
+            pass
+        sys.stderr.write("\n" + tombo + "\nEnter para fechar.")
+        sys.stderr.flush()
+        try:
+            os.read(sys.stdin.fileno(), 1)
+        except OSError:
+            pass
+        return 1
+
     return 0
+
+
+def decodificar(primeiro):
+    """Completa um caractere UTF-8 que veio em mais de um byte."""
+    restam = 0
+    valor = primeiro[0]
+    if 0xF0 <= valor <= 0xF7:
+        restam = 3
+    elif 0xE0 <= valor <= 0xEF:
+        restam = 2
+    elif 0xC0 <= valor <= 0xDF:
+        restam = 1
+
+    bytes_ = bytearray(primeiro)
+    for _ in range(restam):
+        if not select.select([sys.stdin], [], [], 0.05)[0]:
+            break
+        bytes_ += os.read(sys.stdin.fileno(), 1)
+    return bytes_.decode("utf-8", "replace")
+
+
+def em_seguranca(tela, tecla):
+    """Uma tecla nunca derruba a janela.
+
+    O tratamento chama o helper, mexe em estado e le buffer alheio -- qualquer
+    um desses pode levantar. Se levantar, o certo e a linha de recado dizer o
+    que houve e a lista continuar de pe: uma janela que some quando voce aperta
+    uma tecla nao deixa nem como perguntar por que.
+    """
+    try:
+        return tratar(tela, tecla)
+    except Exception as erro:
+        tela.recado = "%s: %s" % (type(erro).__name__, erro)
+        try:
+            with open("/tmp/omarchy-quick-herdr.log", "a") as registro:
+                registro.write("\n--- tecla %r ---\n%s" % (tecla, traceback.format_exc()))
+        except OSError:
+            pass
+        return True
 
 
 def tratar(tela, tecla):
@@ -347,7 +412,8 @@ def tratar(tela, tecla):
         return False
     if tecla == "\x1b":
         # Pode ser Esc sozinho ou o inicio de uma seta; le o resto sem bloquear.
-        resto = sys.stdin.read(2) if select.select([sys.stdin], [], [], 0.02)[0] else ""
+        resto = os.read(sys.stdin.fileno(), 2).decode("utf-8", "replace") \
+            if select.select([sys.stdin], [], [], 0.02)[0] else ""
         if resto.endswith("A"):
             mover(tela, -1)
         elif resto.endswith("B"):

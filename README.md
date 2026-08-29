@@ -8,7 +8,7 @@ lista para ir até um deles ou mandar texto sem sair da barra.
 ▶ 2  ◼ 0  ○ 1
 ```
 
-![O painel com um agente parado numa pergunta, as alternativas como botões, e duas conversas abaixo](demo.png)
+![O painel aberto sobre a sessão do Herdr: um agente parado num pedido de aprovação, com o comando que ele quer rodar, a pergunta e as alternativas como botões](demo.png)
 
 Clicar abre a lista. Clicar numa linha **vai** até o agente: foca a aba dele
 dentro do Herdr e a janela do terminal que roda o cliente. Se não houver
