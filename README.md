@@ -463,10 +463,12 @@ In `~/.config/omarchy/shell.json`, on the widget's entry:
   instant the panel maps, so the list claims it back right after: writing is one
   extra gesture (`i`), not the default.
 
-- Row order is Herdr's own (workspace, tab, pane). Ordering by state would put
-  the blocked one on top, but would make the row run from the cursor every time
-  an agent changed state; the urgent button already warns without moving the
-  list.
+- **Row order is urgency**: blocked, then working, then done, then idle. Inside
+  each state the sort is stable, so rows keep the order Herdr itself shows
+  (workspace, tab, pane) and a machine's block does not shuffle on its own. The
+  cost is real — a row moves when its agent changes state, which can pull it
+  out from under the cursor — and that is the trade for the blocked one always
+  being the first thing you read.
 
 - The whole row's `MouseArea` is declared **before** the content: in QML
   whatever comes later sits on top and gets the click first, and the PR number

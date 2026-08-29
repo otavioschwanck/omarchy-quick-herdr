@@ -126,6 +126,10 @@ TIMEOUT_HYPR = 5
 # in the list, where you can mark what finished while you were away.
 STATUSES = ("working", "blocked", "idle", "done", "unknown")
 
+# List order: what asks for you now, then what is moving, then what finished
+# while you were away, then what is simply waiting.
+URGENCY = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4}
+
 SESSION = DEFAULT_SESSION
 
 # The current machine is per thread, not per module: machines are queried in
@@ -1667,6 +1671,16 @@ def cmd_all(args):
         # to say about repositories over here.
         if not target:
             gh = str(data.get("gh") or "")
+
+    # Whoever is waiting on you first, then whoever is doing something, then
+    # whoever finished, then the quiet ones. A stable sort, so inside each
+    # state the rows keep the order Herdr itself shows (workspace, tab, pane)
+    # and a machine's block does not shuffle on its own.
+    #
+    # The cost is real: a row moves when its agent changes state, which can
+    # pull it out from under the cursor. That is the trade for the blocked one
+    # always being the first thing you read.
+    lines.sort(key=lambda l: URGENCY.get(l.get("status"), len(URGENCY)))
 
     alvo_padrao, reason = resolve_global_default(lines)
     for line in lines:
