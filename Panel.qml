@@ -759,7 +759,11 @@ Panel {
         // ---------- cabecalho ----------
         Item {
           width: parent.width
-          implicitHeight: header.implicitHeight
+          // A altura tem de caber os dois lados. Com so a do titulo, a linha da
+          // direita transbordava: aparecia por cima do campo de texto, e o
+          // clique no glifo caia fora dos limites do pai -- em Qt Quick, filho
+          // fora do retangulo do pai desenha, mas nao recebe mouse.
+          implicitHeight: Math.max(header.implicitHeight, direita.implicitHeight)
 
           PanelSectionHeader {
             id: header
@@ -781,8 +785,14 @@ Panel {
           }
 
           Row {
+            id: direita
+
             anchors.right: parent.right
-            anchors.baseline: header.baseline
+            // Centralizada, e nao pela linha de base: o PanelSectionHeader tem
+            // um topPadding proprio (reserva o transbordo dos glifos da Nerd
+            // Font), e alinhar pela base empurrava esta linha para baixo dele,
+            // por cima da borda do campo.
+            anchors.verticalCenter: parent.verticalCenter
             visible: !root.settingsOpen
             spacing: Style.space(10)
 
