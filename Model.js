@@ -78,10 +78,16 @@ function title(label, machines, withLocal) {
   return "Quick Herdr · " + (list.length + (withLocal ? 1 : 0)) + " machines";
 }
 
-// A row's short name, for the field placeholder and the status notices.
+// A row's name, for the field placeholder and the status notices. Project and
+// terminal title together, because the project alone stops identifying as soon
+// as you have two tabs in it -- and the field is the one place that says where
+// the text is going, so it has to name the right one.
 function nameOf(row) {
   if (!row) return "";
-  return row.project || row.title || row.pane_id || "";
+  var project = row.project || "";
+  var title = row.title || "";
+  if (project && title) return project + " · " + title;
+  return project || title || row.pane_id || "";
 }
 
 function findPane(rows, paneId) {
