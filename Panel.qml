@@ -673,6 +673,11 @@ Panel {
   readonly property var defaultRow: Model.findRow(rows, defaultMachine, defaultPane)
   readonly property var cursorRow: cursor >= 0 && cursor < rows.length ? rows[cursor] : null
 
+  // The machine tag only shows when more than one answered: with a single
+  // machine the column would repeat the same word on every row.
+  readonly property bool severalMachines:
+    machineStates.filter(function (m) { return m && m.ok !== false; }).length > 1
+
   KeyboardPanel {
     id: panel
 
@@ -1159,6 +1164,20 @@ Panel {
                   font.pixelSize: Style.font.body
                 }
 
+                // Which machine the row came from. Beside the project because
+                // that is what it qualifies -- two machines can hold a project
+                // of the same name, and then the name alone stops identifying.
+                Text {
+                  id: machineTag
+
+                  visible: text !== ""
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: Model.machineBadge(row.modelData.machine, root.severalMachines)
+                  color: root.fadeColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
                 // The terminal title is what tells two tabs of the same project apart; it
                 // yields width to the rest and disappears when it would repeat the project.
                 // The width discounts the star even when it is hidden: reserving the space
@@ -1169,6 +1188,7 @@ Panel {
                   width: parent.width
                          - Style.space(20)
                          - project_.width
+                         - (machineTag.visible ? machineTag.width + Style.space(8) : 0)
                          - (row.pr !== "" ? Style.space(50) : 0)
                          - Style.space(26)
                          - Style.space(20)

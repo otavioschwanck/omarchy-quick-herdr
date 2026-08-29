@@ -9,7 +9,7 @@ the bar.
 ▶ 2  ◼ 0  ○ 1
 ```
 
-![The panel open over the Herdr session: an agent stopped on an approval request, with the command it wants to run, the question and the options as buttons](preview.png)
+![The panel: an agent stopped on an approval request with the command, the question and the options as buttons, and three more agents across two machines](preview.png)
 
 Clicking opens the list. Clicking a row **goes** to the agent: it focuses its
 tab inside Herdr and the terminal window running the client. If no client is
