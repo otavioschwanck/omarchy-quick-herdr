@@ -1589,6 +1589,41 @@ def cmd_prs(args):
     reply(queried=queried, gh=gh_state())
 
 
+# ------------------------------------------------------------ configuration
+
+SHELL_JSON = os.path.expanduser("~/.config/omarchy/shell.json")
+PLUGIN_ID = "otavio.quick-herdr"
+
+
+def my_entry():
+    """(section, index, entry) of this instance in shell.json.
+
+    The bar hands the widget only `bar`, `moduleName` and `settings` -- not its
+    position on the bar, which is what `setBarWidget` needs. So it is found
+    again here: a plugin with allowMultiple can have several entries, and what
+    tells mine apart from the others is exactly the `remote` I was given.
+    """
+    config = read_json(SHELL_JSON, teto=4 * 1024 * 1024)
+    layout = ((config.get("bar") or {}).get("layout") or {})
+
+    candidates = []
+    for section in ("left", "center", "right"):
+        for index, entry in enumerate(layout.get(section) or []):
+            if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
+                candidates.append((section, index, entry))
+
+    if not candidates:
+        return (None, "this instance is not in shell.json")
+    if len(candidates) == 1:
+        return (candidates[0], "")
+
+    same = [c for c in candidates if str(c[2].get("remote") or "") == remote()]
+    if len(same) == 1:
+        return (same[0], "")
+
+    return (None, "there are %d copies of this widget on the same machine — edit shell.json" % len(candidates))
+
+
 def cmd_config(args):
     found, err = my_entry()
     if err:
