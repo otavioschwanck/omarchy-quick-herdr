@@ -428,9 +428,23 @@ def error_from(code, out, err):
 
 
 def herdr_text(*args):
-    """For commands returning raw text rather than JSON -- `pane read`."""
+    """For commands returning raw text rather than JSON -- `pane read`.
+
+    Text on success, but failure still arrives as Herdr's JSON envelope, so it
+    is unwrapped here too. Otherwise the panel's status line showed a raw
+    `{"error":{"code":...}}` blob where a sentence belonged.
+    """
     code, out, err = call_herdr(*args)
-    return ("", error_from(code, out, err)) if code != 0 else (out, "")
+    if code == 0:
+        return (out, "")
+
+    body = json_from(out) or json_from(err)
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        detail = body["error"]
+        message = detail.get("message") or detail.get("code") or "herdr error"
+        return ("", ("%s: %s" % (remote(), message)) if remote() else message)
+
+    return ("", error_from(code, out, err))
 
 
 def herdr(*args):
