@@ -48,6 +48,7 @@ repository neither survives nor needs that pace.
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -120,6 +121,7 @@ TIMEOUT_SSH = 15
 TIMEOUT_GIT = 5
 TIMEOUT_GH = 20
 TIMEOUT_HYPR = 5
+TIMEOUT_STDIN = 5
 
 # idle and done are the same state underneath: done is the idle of work that
 # finished with nobody watching. They count together as "idle" and only split
@@ -204,6 +206,31 @@ def run(argv, timeout, cwd=None):
         proc.stdout[:MAX_OUTPUT].decode("utf-8", "replace"),
         proc.stderr[:4096].decode("utf-8", "replace"),
     )
+
+
+def read_prompt():
+    """The prompt from stdin, up to EOF.
+
+    A whole read and not one line: the field is multi-line, and a prompt cut at
+    the first newline would arrive as its own first sentence -- which reads like
+    a complete instruction and is not one.
+
+    The deadline exists because stdin only ends when the caller closes it. If
+    something forgets to, the worst case is a helper that answers late rather
+    than one that hangs holding the widget's action open forever.
+    """
+    data = b""
+    deadline = time.time() + TIMEOUT_STDIN
+
+    while len(data) < MAX_TEXT and time.time() < deadline:
+        if not select.select([sys.stdin], [], [], 0.2)[0]:
+            continue
+        chunk = os.read(sys.stdin.fileno(), 4096)
+        if not chunk:
+            break
+        data += chunk
+
+    return data.decode("utf-8", "replace").strip()
 
 
 def json_from(text):
@@ -1343,7 +1370,7 @@ def cmd_answer(args):
         log_event("respondeu", pane=args[0], option=chosen["label"][:60])
         reply(answered=chosen["label"], keys=keys, pane_id=args[0])
 
-    text = sys.stdin.readline(MAX_TEXT).strip()
+    text = read_prompt()
     if not text:
         fail("chose “%s”, but no text came to write" % chosen["label"][:60])
 
@@ -1391,7 +1418,7 @@ def cmd_send(args):
     if not args:
         fail("send needs a pane_id")
 
-    text = sys.stdin.readline(MAX_TEXT).strip()
+    text = read_prompt()
     if not text:
         fail("nothing to send")
 

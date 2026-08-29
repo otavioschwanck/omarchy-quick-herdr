@@ -477,8 +477,13 @@ Panel {
 
     stdinEnabled: true
     onStarted: {
-      write(payload + "\n");
+      write(payload);
       payload = "";
+      // Closing stdin is what ends the helper's read: the prompt can be several
+      // lines now, so it reads to EOF rather than stopping at the first break.
+      // The helper also has a deadline, so a pipe left open costs a delay and
+      // not a hang -- but the close is what makes it immediate.
+      stdinEnabled = false;
     }
     stdout: StdioCollector {
       waitForEnd: true
@@ -539,8 +544,13 @@ Panel {
 
     stdinEnabled: true
     onStarted: {
-      write(payload + "\n");
+      write(payload);
       payload = "";
+      // Closing stdin is what ends the helper's read: the prompt can be several
+      // lines now, so it reads to EOF rather than stopping at the first break.
+      // The helper also has a deadline, so a pipe left open costs a delay and
+      // not a hang -- but the close is what makes it immediate.
+      stdinEnabled = false;
     }
     stdout: StdioCollector {
       waitForEnd: true
@@ -806,26 +816,63 @@ Panel {
         // ---------- send field ----------
         // It sits above the list because it is the panel's cheapest gesture: it sends
         // one line and does not take you away from where you are.
-        TextField {
+        // A TextArea and not the kit's TextField: a prompt is not always one
+        // line. Enter sends, shift+enter breaks the line, and the field grows
+        // with what you wrote -- up to a ceiling, because a pasted essay must
+        // not push the whole list off the screen.
+        //
+        // The styling is copied from qs.Ui.TextField on purpose, so the two
+        // inputs of this panel look like the same control.
+        TextArea {
           id: field
 
+          readonly property color accentColor: root.pendingOption ? root.urgentColor : root.barForeground
+          readonly property var borderSpec: Border.controlSpec(
+            activeFocus ? "focus" : (hovered ? "hover-cursor" : "normal"),
+            root.barForeground, accentColor)
+
           width: parent.width
+          height: Math.min(implicitHeight, Style.space(190))
           visible: !root.settingsOpen
           enabled: root.pendingOption !== null || root.defaultPane !== ""
           placeholderText: root.pendingOption
                            ? Model.optionPlaceholder(root.pendingOption)
                            : Model.placeholder(root.defaultRow, root.rows.length > 0)
-          foreground: root.barForeground
-          // The lit border is what separates "writing inside a dialog" from "sending a
-          // new prompt": they are different destinations in the same field.
-          accent: root.pendingOption ? root.urgentColor : root.barForeground
+
+          color: root.barForeground
+          placeholderTextColor: Qt.darker(root.barForeground, 1.6)
+          selectionColor: Style.selectionFillFor(root.barForeground, accentColor)
+          selectedTextColor: root.barForeground
+          wrapMode: TextArea.Wrap
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
 
-          onAccepted: {
+          leftPadding: Style.spacing.controlPaddingX + Border.left(borderSpec)
+          rightPadding: Style.spacing.controlPaddingX + Border.right(borderSpec)
+          topPadding: Style.spacing.inputPaddingY + Border.top(borderSpec)
+          bottomPadding: Style.spacing.inputPaddingY + Border.bottom(borderSpec)
+
+          // The lit border is what separates "writing inside a dialog" from
+          // "sending a new prompt": they are different destinations in the
+          // same field.
+          background: BorderSurface {
+            color: Style.controlFill(field.activeFocus, field.hovered,
+                                     root.barForeground, field.accentColor)
+            borderSpec: field.borderSpec
+            radius: Style.cornerRadius
+          }
+
+          Keys.onPressed: function (event) {
+            if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return;
+
+            // Shift+Enter falls through to the TextArea, which inserts the
+            // break and grows the field on its own.
+            if (event.modifiers & Qt.ShiftModifier) return;
+
             if (root.pendingOption) root.sendPending(text);
             else root.send(text);
             text = "";
+            event.accepted = true;
           }
 
           Keys.onEscapePressed: function (event) {
@@ -996,7 +1043,7 @@ Panel {
             id: manualTarget
 
             width: parent.width
-            placeholderText: "outro target_ SSH (user@host, alias do ~/.ssh/config)…"
+            placeholderText: "another SSH target (user@host, an alias from ~/.ssh/config)…"
             foreground: root.barForeground
             accent: root.barForeground
             font.family: root.fontFamily

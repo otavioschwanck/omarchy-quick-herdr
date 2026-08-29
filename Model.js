@@ -278,8 +278,8 @@ function prLabel(row) {
 // nothing to navigate, and a field with no target has nowhere to send.
 function hint(rows, target, writing, underCursor) {
   if (writing) {
-    if (target && target.status === "blocked") return "↵ rejects the request and sends this · esc back to the list";
-    return "↵ send · esc back to the list";
+    if (target && target.status === "blocked") return "↵ rejects the request and sends this · ⇧↵ new line · esc back";
+    return "↵ send · ⇧↵ new line · esc back to the list";
   }
   if (!rows || !rows.length) return "no agents · r refresh";
   if (hasOptions(underCursor)) return "1…9 answer · ↵ go · i write something else";
