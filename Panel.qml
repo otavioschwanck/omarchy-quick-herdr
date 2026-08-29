@@ -23,6 +23,7 @@ Panel {
   ipcTarget: "otavio.quick-herdr"
 
   readonly property string helper: String(Qt.resolvedUrl("bin/herdr-bar")).replace(/^file:\/\//, "")
+  readonly property string janela: String(Qt.resolvedUrl("bin/quick-herdr-tui")).replace(/^file:\/\//, "")
 
   // ------------------------------------------------------------- settings
   // Propriedades simples atualizadas de uma vez, e nao um binding por chave:
@@ -386,6 +387,25 @@ Panel {
     useLocal = !useLocal;
     setConfigJson("local", useLocal ? "true" : "false");
     refresh();
+  }
+
+  // A mesma lista numa janela de terminal de verdade. O painel da barra abre
+  // ancorado, fecha quando perde o foco e cabe no que sobra da tela -- ótimo
+  // para o relance, limitado para sentar e acompanhar. A janela fica aberta,
+  // redimensiona e vai para outro workspace, e a fonte dela é do terminal
+  // (ctrl + e ctrl −), como a de qualquer outra janela sua.
+  function abrirJanela() {
+    if (!bar) return;
+
+    // O "--" e obrigatorio: sem ele o xdg-terminal-exec le o "--local" que vem
+    // depois como opcao dele, engole, e o terminal abre e fecha na hora.
+    var partes = ["omarchy-launch-terminal", "--", bar.shellQuote(root.janela)];
+    if (root.session !== "default") partes.push("--session", bar.shellQuote(root.session));
+    if (root.useLocal) partes.push("--local");
+    for (var i = 0; i < root.machines.length; i++) partes.push("--remote", bar.shellQuote(root.machines[i]));
+
+    bar.run(partes.join(" "));
+    close();
   }
 
   function openPr(url) {
@@ -760,15 +780,39 @@ Panel {
             }
           }
 
-          Text {
+          Row {
             anchors.right: parent.right
             anchors.baseline: header.baseline
             visible: !root.settingsOpen
-            text: Model.tooltip(root.counts)
-            color: (root.counts.blocked || 0) > 0 ? root.urgentColor : root.dimColor
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
+            spacing: Style.space(10)
+
+            Text {
+              text: Model.tooltip(root.counts)
+              color: (root.counts.blocked || 0) > 0 ? root.urgentColor : root.dimColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            // Vira janela de verdade. Fica ao lado das contagens porque é uma
+            // ação sobre o painel inteiro, e não sobre uma linha dele.
+            Text {
+              text: "\uf065"
+              color: root.barForeground
+              opacity: janelaMouse.containsMouse ? 0.9 : 0.45
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+
+              MouseArea {
+                id: janelaMouse
+
+                anchors.fill: parent
+                anchors.margins: -Style.space(5)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.abrirJanela()
+              }
+            }
           }
         }
 

@@ -162,6 +162,34 @@ seria pela rede.
 Quando o conteúdo passa da altura da tela o painel para de crescer e rola.
 Cortar seria perder justamente o fim da conversa, que é a parte nova.
 
+## A janela grande
+
+O `` no canto do painel abre a mesma lista numa **janela de terminal de
+verdade** (`bin/quick-herdr-tui`). O painel da barra é feito para o relance:
+abre ancorado, fecha quando perde o foco e cabe no que sobra da tela. Para
+sentar e acompanhar várias máquinas isso vira limitação — a janela fica
+aberta, redimensiona e vai para outro workspace.
+
+| tecla | |
+|---|---|
+| `↑` `↓` / `j` `k` | navegar |
+| `↵` | ir até o agente |
+| `espaço` | abrir/fechar a conversa |
+| `1`…`9` | responder a alternativa |
+| `i` | escrever para o agente sob o cursor |
+| `*` | marcar o padrão |
+| `r` | atualizar |
+| `q` | sair |
+
+A **fonte é do terminal** — `ctrl +` e `ctrl −` no foot, kitty, alacritty e
+ghostty. Não há sequência de escape para tamanho de fonte: quem manda nisso é
+o emulador, e um `+` nosso que não redimensiona nada seria só um botão morto.
+Apertar `+` ali diz isso em vez de engolir a tecla em silêncio.
+
+Não há lógica duplicada entre as duas telas. Todo dado e toda ação passam pelo
+mesmo `bin/herdr-bar` que o painel usa; a janela é só uma segunda forma de
+olhar e de apertar. O dia em que a leitura de diálogo mudar, muda num lugar só.
+
 ## Quando ele para para perguntar
 
 `◼` é o agente parado num diálogo de aprovação. A linha dele mostra a pergunta

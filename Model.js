@@ -185,13 +185,16 @@ function escaparHtml(texto) {
     .replace(/>/g, "&gt;");
 }
 
-// O recuo vira espaco rigido; o resto continua espaco comum. Assim a
-// indentacao do comando sobrevive ao HTML, que colapsaria os espacos, e a
-// linha comprida ainda quebra no meio -- rigido em tudo travaria a quebra.
-function espacosDaMargem(texto) {
-  var margem = /^ +/.exec(texto);
-  if (!margem) return escaparHtml(texto);
-  return Array(margem[0].length + 1).join("&nbsp;") + escaparHtml(texto.slice(margem[0].length));
+// O HTML colapsa espaco: dois viram um, e os do comeco da linha somem. Isso
+// come justamente a indentacao, que num bloco de codigo e o que o torna
+// legivel. Entao toda corrida de dois ou mais vira espaco rigido, e a do
+// comeco da linha tambem quando e de um so -- espaco isolado no meio continua
+// espaco comum, senao a linha comprida perderia onde quebrar.
+function preservarEspacos(texto, comecoDaLinha) {
+  var escapado = escaparHtml(texto).replace(/ {2,}/g, function (corrida) {
+    return Array(corrida.length + 1).join("&nbsp;");
+  });
+  return comecoDaLinha ? escapado.replace(/^ /, "&nbsp;") : escapado;
 }
 
 // As linhas do dialogo em HTML, com as cores que o terminal ja pintou. O
@@ -206,7 +209,9 @@ function htmlDoContexto(linhas) {
 
     for (var j = 0; j < trechos.length; j++) {
       var trecho = trechos[j];
-      var texto = j === 0 ? espacosDaMargem(trecho.t) : escaparHtml(trecho.t);
+      // Nao so no primeiro trecho: quando a linha e realcada, a indentacao
+      // cai dentro do trecho colorido, e era ali que ela sumia.
+      var texto = preservarEspacos(trecho.t, j === 0);
       var estilo = [];
 
       if (trecho.f) estilo.push("color:" + trecho.f);

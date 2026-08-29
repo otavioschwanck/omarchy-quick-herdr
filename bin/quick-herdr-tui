@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""A lista do Quick Herdr numa janela de terminal de verdade.
+
+O painel da barra e feito para um relance: ele abre ancorado, fecha quando
+perde o foco e cabe no que sobra da tela. Quando voce quer sentar e acompanhar
+varias maquinas, isso vira limitacao -- dai este, que e uma janela como
+qualquer outra: fica aberta, redimensiona, vai para outro workspace.
+
+Nao ha logica duplicada aqui. Todo dado e toda acao passam pelo mesmo
+`herdr-bar` que o painel usa; este arquivo e so uma segunda forma de olhar e de
+apertar. O dia em que a leitura de dialogo mudar, muda num lugar so.
+
+Uso: quick-herdr-tui [--local] [--remote ALVO]... [--session NOME]
+
+Teclas: ↑↓/jk navegar · ↵ ir ate o agente · espaco abrir/fechar
+        1..9 responder · i escrever · r atualizar · q sair
+A fonte e do terminal: ctrl + e ctrl - no foot, kitty, alacritty e ghostty.
+"""
+
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import tty
+
+HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herdr-bar")
+
+INTERVALO = 2.0
+TIMEOUT_ACAO = 30
+
+# Sequencias de terminal. Nomeadas porque "\x1b[?1049h" no meio do codigo nao
+# diz a ninguem que aquilo e a tela alternativa.
+TELA_ALT = "\x1b[?1049h"
+TELA_NORMAL = "\x1b[?1049l"
+CURSOR_OFF = "\x1b[?25l"
+CURSOR_ON = "\x1b[?25h"
+LIMPA = "\x1b[2J\x1b[H"
+RESET = "\x1b[0m"
+NEGRITO = "\x1b[1m"
+FRACO = "\x1b[2m"
+INVERSO = "\x1b[7m"
+
+GLIFOS = {"working": "▶", "blocked": "◼", "done": "✓", "idle": "○", "unknown": "·"}
+VOZES = {"agente": "✳", "voce": ">"}
+
+# Vermelho para o que espera voce, e nada mais: uma tela colorida inteira nao
+# destaca coisa nenhuma.
+URGENTE = "\x1b[38;2;235;110;110m"
+
+
+def cor(hexa):
+    """"#rrggbb" -> SGR de cor de frente. As cores vem do proprio terminal do
+    agente, entao chegam aqui como hex e voltam a ser SGR sem perda."""
+    if not hexa or len(hexa) != 7:
+        return ""
+    return "\x1b[38;2;%d;%d;%dm" % (int(hexa[1:3], 16), int(hexa[3:5], 16), int(hexa[5:7], 16))
+
+
+def cor_fundo(hexa):
+    if not hexa or len(hexa) != 7:
+        return ""
+    return "\x1b[48;2;%d;%d;%dm" % (int(hexa[1:3], 16), int(hexa[3:5], 16), int(hexa[5:7], 16))
+
+
+def largura_visivel(texto):
+    """Colunas que o texto ocupa, ignorando os escapes."""
+    return len(re.sub(r"\x1b\[[0-9;]*m", "", texto))
+
+
+def cortar(texto, limite):
+    """Corta por coluna visivel, sem picar uma sequencia de escape no meio."""
+    if largura_visivel(texto) <= limite:
+        return texto
+
+    saida = []
+    colunas = 0
+    indice = 0
+    while indice < len(texto):
+        if texto[indice] == "\x1b":
+            fim = texto.find("m", indice)
+            if fim < 0:
+                break
+            saida.append(texto[indice:fim + 1])
+            indice = fim + 1
+            continue
+        if colunas >= limite - 1:
+            saida.append("…")
+            break
+        saida.append(texto[indice])
+        colunas += 1
+        indice += 1
+    return "".join(saida) + RESET
+
+
+class Tela:
+    """Estado do que esta na tela e o desenho dela."""
+
+    def __init__(self, alvos):
+        self.alvos = alvos
+        self.linhas = []
+        self.contagens = {}
+        self.maquinas = []
+        self.erro = ""
+        self.cursor = 0
+        self.abertas = set()
+        self.recado = ""
+        self.escrevendo = False
+        self.rascunho = ""
+        # Alternativa escolhida que abriu um campo e espera o texto.
+        self.pendente = None
+
+    # ------------------------------------------------------------- dados
+    def argv(self, extras):
+        return [HELPER] + self.alvos["globais"] + extras
+
+    def buscar(self):
+        argv = self.argv(["all", "--messages"] + self.alvos["lista"])
+        try:
+            saida = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT_ACAO).stdout
+            dados = json.loads(saida)
+        except (OSError, ValueError, subprocess.SubprocessError) as erro:
+            self.erro = str(erro)[:120]
+            return
+
+        self.erro = "" if dados.get("ok") is not False else str(dados.get("error") or "")
+        self.linhas = dados.get("rows") or []
+        self.contagens = dados.get("counts") or {}
+        self.maquinas = dados.get("machines") or []
+        if self.cursor >= len(self.linhas):
+            self.cursor = max(0, len(self.linhas) - 1)
+
+    def linha_atual(self):
+        return self.linhas[self.cursor] if 0 <= self.cursor < len(self.linhas) else None
+
+    def chave(self, linha):
+        return (linha.get("machine") or "") + "\0" + linha["pane_id"]
+
+    def aberta(self, linha):
+        chave = self.chave(linha)
+        if chave in self.abertas:
+            return True
+        # Quem parou numa pergunta ja nasce aberto, como no painel: a pergunta
+        # e o motivo de voce estar olhando.
+        return bool(linha.get("options")) and chave not in self.abertas
+
+    # ------------------------------------------------------------- acoes
+    def acao(self, maquina, extras, entrada=None):
+        globais = list(self.alvos["globais"])
+        if maquina:
+            globais += ["--remote", maquina]
+        try:
+            proc = subprocess.run(
+                [HELPER] + globais + extras,
+                capture_output=True, text=True, timeout=TIMEOUT_ACAO,
+                input=(entrada + "\n") if entrada is not None else None,
+            )
+            dados = json.loads(proc.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError) as erro:
+            self.recado = str(erro)[:100]
+            return None
+        if dados.get("ok") is False:
+            self.recado = str(dados.get("error") or "")[:100]
+        return dados
+
+    # ------------------------------------------------------------ desenho
+    def desenhar(self):
+        largura, altura = shutil.get_terminal_size((100, 30))
+        corpo = []
+
+        contagem = "%s %d   %s %d   %s %d" % (
+            GLIFOS["working"], self.contagens.get("working", 0),
+            GLIFOS["blocked"], self.contagens.get("blocked", 0),
+            GLIFOS["idle"], self.contagens.get("ocioso", 0),
+        )
+        titulo = NEGRITO + "Quick Herdr" + RESET
+        if self.contagens.get("blocked"):
+            contagem = URGENTE + contagem + RESET
+        corpo.append(titulo + " " * max(1, largura - largura_visivel(titulo) - largura_visivel(contagem)) + contagem)
+        corpo.append("")
+
+        if self.erro:
+            corpo.append(URGENTE + self.erro + RESET)
+            corpo.append("")
+
+        for maquina in self.maquinas:
+            if maquina.get("ok") is False:
+                nome = (maquina.get("target") or "aqui").split(".")[0]
+                corpo.append(URGENTE + "  " + nome + ": " + str(maquina.get("error"))[:largura - 8] + RESET)
+
+        varias = len([m for m in self.maquinas if m.get("ok") is not False]) > 1
+        for indice, linha in enumerate(self.linhas):
+            corpo.extend(self.desenhar_linha(linha, indice == self.cursor, varias, largura))
+
+        if not self.linhas and not self.erro:
+            corpo.append(FRACO + "  Nenhum agente." + RESET)
+
+        rodape = self.rodape()
+        vagas = altura - len(rodape) - 1
+        if len(corpo) > vagas:
+            # Rola para manter o cursor a vista; a linha selecionada e a unica
+            # que tem de estar na tela.
+            inicio = min(len(corpo) - vagas, max(0, self.altura_ate(self.cursor, varias, largura) - vagas // 2))
+            corpo = corpo[inicio:inicio + vagas]
+
+        saida = [LIMPA]
+        saida.extend(cortar(l, largura) + "\r\n" for l in corpo[:vagas])
+        saida.append("\x1b[%d;1H" % (altura - len(rodape) + 1))
+        saida.extend(cortar(l, largura) + "\r\n" for l in rodape)
+        sys.stdout.write("".join(saida))
+        sys.stdout.flush()
+
+    def altura_ate(self, indice, varias, largura):
+        total = 2
+        for i, linha in enumerate(self.linhas):
+            if i >= indice:
+                break
+            total += len(self.desenhar_linha(linha, False, varias, largura))
+        return total
+
+    def desenhar_linha(self, linha, sob_cursor, varias, largura):
+        estado = linha.get("status", "unknown")
+        glifo = GLIFOS.get(estado, GLIFOS["unknown"])
+        marca = URGENTE if estado == "blocked" else ""
+        selo = "★" if linha.get("is_default") else " "
+
+        cabeca = "%s%s %s%s %s" % (
+            INVERSO if sob_cursor else "", marca + glifo + RESET + (INVERSO if sob_cursor else ""),
+            NEGRITO + linha.get("project", "") + RESET + (INVERSO if sob_cursor else ""),
+            "  " + FRACO + (linha.get("machine") or "aqui").split(".")[0] + RESET + (INVERSO if sob_cursor else "") if varias else "",
+            FRACO + linha.get("title", "") + RESET,
+        )
+        pr = linha.get("pr_number")
+        if pr:
+            cabeca += "  #%d" % pr
+        cabeca = " " + selo + " " + cabeca + RESET
+
+        saida = [cabeca]
+        aberta = self.aberta(linha)
+
+        for fala in (linha.get("messages") or [])[(0 if aberta else -1):]:
+            voz = VOZES.get(fala.get("who"), VOZES["agente"])
+            saida.append("      " + FRACO + voz + " " + fala.get("text", "") + RESET)
+
+        if aberta:
+            for trechos in linha.get("context") or []:
+                saida.append("      " + "".join(
+                    cor(t.get("f")) + cor_fundo(t.get("g")) + (NEGRITO if t.get("b") else "") + t.get("t", "") + RESET
+                    for t in trechos
+                ))
+            if linha.get("question"):
+                saida.append("      " + NEGRITO + linha["question"] + RESET)
+            for opcao in linha.get("options") or []:
+                cracha = opcao.get("key") or "·"
+                marcado = "❯" if opcao.get("selected") else " "
+                saida.append("       %s %s  %s" % (marcado, NEGRITO + cracha + RESET, opcao.get("label", "")))
+
+        saida.append("")
+        return saida
+
+    def rodape(self):
+        if self.escrevendo:
+            alvo = self.linha_atual()
+            nome = alvo.get("project", "") if alvo else ""
+            return ["", NEGRITO + "para " + nome + ": " + RESET + self.rascunho + "▏",
+                    FRACO + "↵ enviar · esc cancelar" + RESET]
+
+        atalhos = "↑↓ navegar · ↵ ir · espaço abrir · 1…9 responder · i escrever · r atualizar · q sair"
+        fonte = FRACO + "fonte: ctrl + e ctrl −, do próprio terminal" + RESET
+        return ["", (URGENTE + self.recado + RESET) if self.recado else "", FRACO + atalhos + RESET, fonte]
+
+
+def alvos_do_argv(argv):
+    """Traduz os argumentos desta janela para os do herdr-bar."""
+    globais = []
+    lista = []
+    indice = 0
+    while indice < len(argv):
+        if argv[indice] == "--session" and indice + 1 < len(argv):
+            globais += ["--session", argv[indice + 1]]
+            indice += 1
+        elif argv[indice] == "--remote" and indice + 1 < len(argv):
+            lista += ["--remote", argv[indice + 1]]
+            indice += 1
+        elif argv[indice] == "--local":
+            lista.append("--local")
+        indice += 1
+    if not lista:
+        lista = ["--local"]
+    return {"globais": globais, "lista": lista}
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        sys.stdout.write(__doc__)
+        return 0
+
+    # Esta janela desenha em cima do terminal: sem um de verdade nao ha o que
+    # desenhar. Dizer isso e melhor que um traceback de ioctl, que parece defeito
+    # e e so uso fora do lugar -- provavelmente voce queria o `herdr-bar`, que
+    # responde em JSON e nao precisa de tela.
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.stderr.write(
+            "quick-herdr-tui precisa de um terminal.\n"
+            "Para script, use: %s all --messages --local\n" % HELPER
+        )
+        return 2
+
+    tela = Tela(alvos_do_argv(sys.argv[1:]))
+    tela.buscar()
+
+    antes = termios.tcgetattr(sys.stdin)
+    sys.stdout.write(TELA_ALT + CURSOR_OFF)
+    signal.signal(signal.SIGWINCH, lambda *_: None)
+
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        tela.desenhar()
+        while True:
+            pronto, _, _ = select.select([sys.stdin], [], [], INTERVALO)
+            if pronto:
+                if not tratar(tela, sys.stdin.read(1)):
+                    break
+            else:
+                tela.buscar()
+            tela.desenhar()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, antes)
+        sys.stdout.write(TELA_NORMAL + CURSOR_ON)
+        sys.stdout.flush()
+
+    return 0
+
+
+def tratar(tela, tecla):
+    """Devolve False quando e para sair."""
+    if tela.escrevendo:
+        return escrever(tela, tecla)
+
+    if tecla in ("q", "\x03"):
+        return False
+    if tecla == "\x1b":
+        # Pode ser Esc sozinho ou o inicio de uma seta; le o resto sem bloquear.
+        resto = sys.stdin.read(2) if select.select([sys.stdin], [], [], 0.02)[0] else ""
+        if resto.endswith("A"):
+            mover(tela, -1)
+        elif resto.endswith("B"):
+            mover(tela, 1)
+        elif resto.endswith("C"):
+            abrir(tela, True)
+        elif resto.endswith("D"):
+            abrir(tela, False)
+        elif not resto:
+            return False
+        return True
+
+    tela.recado = ""
+    linha = tela.linha_atual()
+
+    if tecla in ("j", "\x0e"):
+        mover(tela, 1)
+    elif tecla in ("k", "\x10"):
+        mover(tela, -1)
+    elif tecla == " ":
+        alternar(tela)
+    elif tecla in ("\r", "\n"):
+        if linha:
+            tela.acao(linha.get("machine"), ["focus", linha["pane_id"]])
+    elif tecla == "r":
+        tela.buscar()
+    elif tecla == "i" and linha:
+        tela.escrevendo = True
+        tela.rascunho = ""
+    elif tecla == "*" and linha:
+        tela.acao("", ["pick", linha.get("machine") or ".", linha["pane_id"], linha.get("cwd", "")])
+        tela.buscar()
+    elif tecla in "123456789" and linha:
+        responder(tela, linha, int(tecla) - 1)
+    elif tecla in ("+", "-", "="):
+        # Nao ha sequencia de escape para tamanho de fonte: quem manda nisso e o
+        # emulador, e dizer isso e mais util que engolir a tecla em silencio.
+        tela.recado = "a fonte é do terminal: ctrl + e ctrl −"
+
+    return True
+
+
+def mover(tela, passo):
+    if not tela.linhas:
+        return
+    tela.cursor = (tela.cursor + passo) % len(tela.linhas)
+
+
+def abrir(tela, sim):
+    linha = tela.linha_atual()
+    if not linha:
+        return
+    chave = tela.chave(linha)
+    if sim and not tela.aberta(linha) or not sim and tela.aberta(linha):
+        alternar(tela)
+
+
+def alternar(tela):
+    linha = tela.linha_atual()
+    if not linha:
+        return
+    chave = tela.chave(linha)
+    if chave in tela.abertas:
+        tela.abertas.discard(chave)
+    else:
+        tela.abertas.add(chave)
+
+
+def responder(tela, linha, posicao):
+    opcoes = linha.get("options") or []
+    if not 0 <= posicao < len(opcoes):
+        return
+    opcao = opcoes[posicao]
+
+    if opcao.get("prompts"):
+        # Alternativa que abre um campo la: pede o texto aqui antes de encostar
+        # no dialogo, como o painel faz.
+        tela.escrevendo = True
+        tela.rascunho = ""
+        tela.pendente = (linha, posicao)
+        return
+
+    tela.acao(linha.get("machine"), ["answer", linha["pane_id"], str(posicao), opcao.get("label", "")])
+    tela.buscar()
+
+
+def escrever(tela, tecla):
+    if tecla == "\x1b":
+        tela.escrevendo = False
+        tela.rascunho = ""
+        tela.pendente = None
+        return True
+    if tecla in ("\x7f", "\b"):
+        tela.rascunho = tela.rascunho[:-1]
+        return True
+    if tecla in ("\r", "\n"):
+        texto = tela.rascunho.strip()
+        tela.escrevendo = False
+        tela.rascunho = ""
+        pendente = getattr(tela, "pendente", None)
+        tela.pendente = None
+        if texto:
+            if pendente:
+                linha, posicao = pendente
+                opcao = (linha.get("options") or [])[posicao]
+                tela.acao(linha.get("machine"),
+                          ["answer", linha["pane_id"], str(posicao), opcao.get("label", ""), "--with-text"],
+                          entrada=texto)
+            else:
+                linha = tela.linha_atual()
+                if linha:
+                    tela.acao(linha.get("machine"), ["send", linha["pane_id"]], entrada=texto)
+        tela.buscar()
+        return True
+    if tecla == "\x03":
+        return False
+    if tecla.isprintable():
+        tela.rascunho += tecla
+    return True
+
+
+if __name__ == "__main__":
+    sys.exit(main())
