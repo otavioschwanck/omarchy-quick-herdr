@@ -1,45 +1,48 @@
 #!/usr/bin/env python3
-"""Ponte entre o widget de barra otavio.quick-herdr e o Herdr.
+"""Bridge between the otavio.quick-herdr bar widget and Herdr.
 
-Imprime uma linha de JSON no stdout para o lado QML ler. Todo comando sai com
-0 e reporta falha dentro desse JSON -- o widget sempre tem algo para desenhar,
-e um servidor do Herdr parado nao pode parecer um helper quebrado.
+Prints one line of JSON on stdout for the QML side to read. Every command
+exits 0 and reports failure inside that JSON -- the widget always has
+something to draw, and a stopped Herdr server must not look like a broken
+helper.
 
-Uso: herdr-bar [--session NOME] [--remote ALVO_SSH] <comando> [args]
+Usage: herdr-bar [--session NAME] [--remote SSH_TARGET] <command> [args]
 
-Comandos:
-  snapshot [--messages]   estado da sessao: contagens, uma linha por agente e,
-                          com --messages, o que cada um falou por ultimo
-  focus <pane_id>         foca o agente no Herdr e a janela que roda o cliente
-  send <pane_id>          manda o texto que vier no stdin para o agente; se ele
-                          estiver num dialogo, recusa com esc antes de mandar
-  answer <pane_id> <n> [rotulo] [--with-text]
-                          escolhe a alternativa <n> do dialogo de um bloqueado;
-                          com --with-text, escreve no campo que ela abrir
-  default <pane_id|->     grava (ou limpa) o alvo padrao do campo de texto
-  prs                     atualiza o cache de PRs (o unico que vai na rede)
-  hosts                   maquinas da Tailscale que servem de alvo --remote
-  config get              a entrada desta instancia no shell.json
-  config set <chave> <v> [--json]
-                          grava uma configuracao desta instancia
+Commands:
+  snapshot [--messages]   one machine's state: counts, a row per agent and,
+                          with --messages, what each one last said
   all [--messages] [--local] [--remote A]...
-                          os agentes de todas as maquinas ligadas, em paralelo
-  pick <maquina|.|-> <pane> [cwd]
-                          escolhe (ou limpa) o alvo do campo de texto
-  disconnect <alvo>       fecha o tunel multiplexado de uma maquina desligada
+                          the agents of every machine that is on, in parallel
+  focus <pane_id>         focus the agent in Herdr and the window running the
+                          client
+  send <pane_id>          send the text arriving on stdin to the agent; when it
+                          is stopped in a dialog, refuse with esc first
+  answer <pane_id> <n> [label] [--with-text]
+                          choose option <n> of a stopped agent's dialog; with
+                          --with-text, write into the field it opens
+  pick <machine|.|-> <pane> [cwd]
+                          set (or clear) the text field's target
+  disconnect <target>     close the multiplexed tunnel of a machine turned off
+  prs                     refresh the PR cache (the only one that hits the net)
+  hosts                   Tailscale machines usable as a --remote target
+  config get              this instance's entry in shell.json
+  config set <key> <value> [--json]
+                          write one setting of this instance
 
-Com --remote, todo comando do Herdr vai por SSH ate aquela maquina, e a janela
-que o `focus` procura e a do cliente local aberto com `herdr --remote ALVO`. A
-conexao e multiplexada (ControlMaster), porque um widget que atualiza a cada
-poucos segundos nao pode pagar um handshake SSH por atualizacao.
+With --remote, every Herdr command travels over SSH to that machine, and the
+window `focus` looks for is the local client opened with `herdr --remote
+TARGET` or `ssh -t TARGET herdr`. The connection is multiplexed
+(ControlMaster), because a widget refreshing every few seconds cannot pay for
+an SSH handshake per refresh.
 
-O texto do `send` vem no stdin e nunca no argv: uma linha, terminada em \\n.
-Prompt nao e segredo, mas argv aparece no `ps` de qualquer processo da maquina
-e prompt de agente costuma carregar caminho, nome de cliente e trecho de codigo.
+The text for `send` comes on stdin and never on argv: one line, newline
+terminated. A prompt is not a secret, but argv shows up in the `ps` of every
+process on the machine, and agent prompts tend to carry paths, client names
+and snippets of code.
 
-`snapshot` nunca vai na rede: ele le o cache que `prs` escreveu. Sao ritmos
-diferentes -- as contagens querem 4 segundos, e uma chamada ao GitHub por
-repositorio nao aguenta esse ritmo nem precisa dele.
+`snapshot` never hits the network: it reads the cache `prs` wrote. They are
+different rhythms -- the counts want 4 seconds, and one GitHub call per
+repository neither survives nor needs that pace.
 """
 
 import json
@@ -51,7 +54,7 @@ import sys
 import threading
 import time
 
-SESSAO_PADRAO = "default"
+DEFAULT_SESSION = "default"
 
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
@@ -62,54 +65,55 @@ STATE_DIR = os.path.join(
     "omarchy-quick-herdr",
 )
 
-# TTL do cache de PR. Um PR nao muda de numero, entao o que expira aqui e o
-# "esse branch ainda nao tem PR" -- o unico caso que vale reperguntar, e o
-# unico motivo do TTL nao ser infinito.
+# TTL for the PR cache. A PR never changes number, so what expires here is
+# "this branch has no PR yet" -- the only case worth asking again, and the
+# only reason the TTL is not infinite.
 PR_TTL = 900
-PR_TTL_VAZIO = 120
+PR_TTL_EMPTY = 120
 GH_TTL = 300
 
-# Tetos em tudo que chega de fora deste processo: resposta do Herdr, resposta
-# do gh, o buffer de um terminal alheio, o cache que outra invocacao escreveu.
-# Um socket que despeja megabytes nao pode inchar a barra, que roda dentro do
-# mesmo processo do resto do desktop.
-MAX_SAIDA = 4 * 1024 * 1024
+# Ceilings on everything arriving from outside this process: the Herdr reply,
+# the gh reply, another terminal's buffer, the cache some other invocation
+# wrote. A socket dumping megabytes must not bloat the bar, which runs inside
+# the same process as the rest of the desktop.
+MAX_OUTPUT = 4 * 1024 * 1024
 MAX_CACHE = 2 * 1024 * 1024
-MAX_TEXTO = 32 * 1024
-MAX_REPOS_POR_VEZ = 12
-MAX_ENTRADAS_CACHE = 200
+MAX_TEXT = 32 * 1024
+MAX_REPOS_PER_RUN = 12
+MAX_CACHE_ENTRIES = 200
 
-# Quantos agentes ganham leitura de terminal numa atualizacao. Cada leitura e
-# uma chamada; local sao microssegundos, mas por SSH sao idas e voltas, e uma
-# sessao com trinta agentes nao pode travar a barra.
-MAX_LEITURAS = 24
-LINHAS_BUFFER = 90
-# Teto de uma fala. Alto de proposito: ele existe para um buffer estranho nao
-# despejar uma tela inteira no painel, e nao para encurtar conversa -- expandida,
-# a linha mostra a frase toda, e cortar no meio dela e pior que ocupar altura.
-MAX_MENSAGEM = 1200
-# Quantas falas cada linha carrega. A lista mostra a ultima; expandir mostra
-# todas, e e por isso que elas ja vem no mesmo pacote.
-MAX_FALAS = 4
-# Quantas linhas de contexto do dialogo sobem junto. Teto porque um diff grande
-# nao pode virar o painel inteiro; as ultimas porque o pedido fica colado na
-# pergunta, e o que esta acima e historico.
-MAX_CONTEXTO = 24
-# A pergunta de um dialogo vai inteira: e sobre ela que voce decide, e o teto
-# aqui existe so para um buffer estranho nao despejar uma tela no painel.
-MAX_PERGUNTA = 600
-# O rotulo de uma alternativa vai inteiro pelo mesmo motivo da pergunta: e nele
-# que mora a decisao. "Yes, and always allow access to /home/..." cortado no
-# meio do caminho vira um "sim" sem objeto, que e exatamente o que voce
-# precisava ler antes de clicar.
-MAX_ROTULO = 240
+# How many agents get a terminal read per refresh. Each read is one call;
+# locally that is microseconds, but over SSH they are round trips, and a
+# session with thirty agents cannot stall the bar.
+MAX_READS = 24
+BUFFER_LINES = 90
+# Ceiling for one message. Deliberately high: it exists so a strange buffer
+# cannot dump a whole screen into the panel, not to shorten conversation --
+# expanded, the row shows the sentence whole, and cutting mid-sentence is
+# worse than spending height.
+MAX_MESSAGE = 1200
+# How many messages each row carries. The list shows the last one; expanding
+# shows them all, which is why they all arrive in the same payload.
+MAX_MESSAGES = 4
+# How many context lines of the dialog come along. A ceiling because a large
+# diff cannot become the whole panel; the last ones because the request sits
+# against the question, and what is further up is history.
+MAX_CONTEXT = 24
+# A dialog's question goes whole: it is what you decide on, and the ceiling
+# here only exists so a strange buffer cannot dump a screen into the panel.
+MAX_QUESTION = 600
+# An option's label goes whole for the same reason as the question: the
+# decision lives in it. "Yes, and always allow access to /home/..." cut
+# mid-path becomes a "yes" with no object, which is exactly what you needed
+# to read before clicking.
+MAX_LABEL = 240
 
-# Um arquivo fixo em /tmp e conveniente e compartilhado: qualquer um pode ter
-# plantado um symlink ali antes. O O_NOFOLLOW recusa seguir um, entao o pior
-# caso e nao registrar nada -- e nunca escrever no arquivo de outra pessoa.
+# A fixed file in /tmp is convenient and shared: anyone could have planted a
+# symlink there first. O_NOFOLLOW refuses to follow one, so the worst case is
+# logging nothing -- and never writing into somebody else's file.
 LOG = "/tmp/omarchy-quick-herdr.log"
 MAX_LOG = 1024 * 1024
-CAUDA_LOG = 256 * 1024
+LOG_TAIL = 256 * 1024
 
 TIMEOUT_HERDR = 5
 TIMEOUT_SSH = 15
@@ -117,135 +121,135 @@ TIMEOUT_GIT = 5
 TIMEOUT_GH = 20
 TIMEOUT_HYPR = 5
 
-# idle e done sao o mesmo estado por baixo: done e o idle de um trabalho que
-# terminou sem ninguem olhando. Contam junto em "ocioso" e so se separam na
-# lista, onde da para marcar o que terminou enquanto voce estava longe.
-STATUS = ("working", "blocked", "idle", "done", "unknown")
+# idle and done are the same state underneath: done is the idle of work that
+# finished with nobody watching. They count together as "idle" and only split
+# in the list, where you can mark what finished while you were away.
+STATUSES = ("working", "blocked", "idle", "done", "unknown")
 
-SESSAO = SESSAO_PADRAO
+SESSION = DEFAULT_SESSION
 
-# A maquina atual e por thread, e nao do modulo: as maquinas sao consultadas em
-# paralelo, e um global seria trocado por uma thread debaixo da outra. Antes
-# isto era um subprocesso por maquina, que dava o mesmo isolamento cobrando um
-# interpretador Python inteiro por maquina a cada atualizacao.
-_ALVO = threading.local()
-
-
-def remoto():
-    return getattr(_ALVO, "remoto", "")
+# The current machine is per thread, not per module: machines are queried in
+# parallel, and a global would be swapped by one thread under another. This
+# used to be a subprocess per machine, which bought the same isolation at the
+# price of a whole Python interpreter per machine on every refresh.
+_TARGET = threading.local()
 
 
-def usar_remoto(alvo):
-    _ALVO.remoto = alvo or ""
+def remote():
+    return getattr(_TARGET, "remote", "")
 
 
-# --------------------------------------------------------------- utilidades
+def use_remote(target):
+    _TARGET.remote = target or ""
 
 
-def responder(**campos):
+# --------------------------------------------------------------- utilities
+
+
+def reply(**campos):
     campos.setdefault("ok", True)
     campos.setdefault("error", "")
     sys.stdout.write(json.dumps(campos, ensure_ascii=False) + "\n")
     sys.exit(0)
 
 
-def falhar(mensagem, **campos):
-    registrar("erro", mensagem=str(mensagem)[:300])
-    responder(ok=False, error=str(mensagem)[:400], **campos)
+def fail(message, **campos):
+    log_event("err", message=str(message)[:300])
+    reply(ok=False, error=str(message)[:400], **campos)
 
 
-def registrar(evento, **campos):
-    """Uma linha no log. Nunca levanta: log e diagnostico, nao funcionalidade."""
-    partes = ["%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), evento)]
-    if remoto():
-        partes.append("remoto=%s" % remoto())
-    for chave, valor in campos.items():
-        if valor not in ("", None):
-            partes.append("%s=%s" % (chave, str(valor).replace("\n", " ")[:300]))
-    linha = " ".join(partes) + "\n"
+def log_event(evento, **campos):
+    """One line in the log. Never raises: a log is diagnosis, not functionality."""
+    parts = ["%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), evento)]
+    if remote():
+        parts.append("remote=%s" % remote())
+    for key, value in campos.items():
+        if value not in ("", None):
+            parts.append("%s=%s" % (key, str(value).replace("\n", " ")[:300]))
+    line = " ".join(parts) + "\n"
 
     try:
         if os.path.exists(LOG) and os.path.getsize(LOG) > MAX_LOG:
-            with open(LOG, "rb") as arquivo:
-                arquivo.seek(-CAUDA_LOG, os.SEEK_END)
-                cauda = arquivo.read()
-            with open(LOG, "wb") as arquivo:
-                arquivo.write(cauda)
-        descritor = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+            with open(LOG, "rb") as fh:
+                fh.seek(-LOG_TAIL, os.SEEK_END)
+                cauda = fh.read()
+            with open(LOG, "wb") as fh:
+                fh.write(cauda)
+        fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
-            os.write(descritor, linha.encode("utf-8", "replace"))
+            os.write(fd, line.encode("utf-8", "replace"))
         finally:
-            os.close(descritor)
+            os.close(fd)
     except OSError:
         pass
 
 
-def rodar(argv, timeout, cwd=None):
-    """Executa argv sem shell. Devolve (codigo, stdout, stderr) e nunca levanta."""
+def run(argv, timeout, cwd=None):
+    """Runs argv with no shell. Returns (code, stdout, stderr) and never raises."""
     try:
         proc = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=timeout, check=False)
     except FileNotFoundError:
-        return (127, "", "%s nao encontrado" % argv[0])
+        return (127, "", "%s not found" % argv[0])
     except subprocess.TimeoutExpired:
-        return (124, "", "%s excedeu %ss" % (argv[0], timeout))
-    except OSError as erro:
-        return (126, "", str(erro))
+        return (124, "", "%s timed out after %ss" % (argv[0], timeout))
+    except OSError as err:
+        return (126, "", str(err))
 
     return (
         proc.returncode,
-        proc.stdout[:MAX_SAIDA].decode("utf-8", "replace"),
+        proc.stdout[:MAX_OUTPUT].decode("utf-8", "replace"),
         proc.stderr[:4096].decode("utf-8", "replace"),
     )
 
 
-def json_de(texto):
+def json_from(text):
     try:
-        return json.loads(texto)
+        return json.loads(text)
     except (ValueError, TypeError):
         return None
 
 
-def ler_json(caminho, teto=MAX_CACHE):
+def read_json(path, teto=MAX_CACHE):
     try:
-        if os.path.getsize(caminho) > teto:
+        if os.path.getsize(path) > teto:
             return {}
-        with open(caminho, "r", encoding="utf-8") as arquivo:
-            valor = json.load(arquivo)
+        with open(path, "r", encoding="utf-8") as fh:
+            value = json.load(fh)
     except (OSError, ValueError):
         return {}
-    return valor if isinstance(valor, dict) else {}
+    return value if isinstance(value, dict) else {}
 
 
-def gravar_json(caminho, valor):
-    """Grava atomico: o widget le esses arquivos a qualquer instante."""
+def write_json(path, value):
+    """Atomic write: the widget reads these files at any moment."""
     try:
-        os.makedirs(os.path.dirname(caminho), exist_ok=True)
-        temporario = "%s.tmp.%d" % (caminho, os.getpid())
-        with open(temporario, "w", encoding="utf-8") as arquivo:
-            json.dump(valor, arquivo, ensure_ascii=False)
-        os.replace(temporario, caminho)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(value, fh, ensure_ascii=False)
+        os.replace(tmp_path, path)
     except OSError:
         pass
 
 
-def escopo():
-    """Sufixo de arquivo que separa local de cada remoto e cada sessao."""
-    alvo = re.sub(r"[^A-Za-z0-9_.@-]", "_", remoto()) if remoto() else "local"
-    return "%s-%s" % (alvo, re.sub(r"[^A-Za-z0-9_.-]", "_", SESSAO))
+def scope():
+    """Filename suffix separating local from each remote and each session."""
+    target = re.sub(r"[^A-Za-z0-9_.@-]", "_", remote()) if remote() else "local"
+    return "%s-%s" % (target, re.sub(r"[^A-Za-z0-9_.-]", "_", SESSION))
 
 
-def caminho_pr():
-    return os.path.join(CACHE_DIR, "prs-%s.json" % escopo())
+def pr_cache_path():
+    return os.path.join(CACHE_DIR, "prs-%s.json" % scope())
 
 
-def caminho_padrao():
-    return os.path.join(STATE_DIR, "default-%s.json" % escopo())
+def default_path():
+    return os.path.join(STATE_DIR, "default-%s.json" % scope())
 
 
 # -------------------------------------------------------------------- herdr
 
 
-def ssh_prefixo():
+def ssh_prefix():
     """Multiplexa a conexao: sem isso, cada atualizacao paga um handshake.
 
     O socket de controle fica no cache e persiste alguns minutos depois da
@@ -262,623 +266,625 @@ def ssh_prefixo():
         "-o", "ControlMaster=auto",
         "-o", "ControlPath=%s/ssh-%%r@%%h-%%p" % CACHE_DIR,
         "-o", "ControlPersist=300",
-        remoto(),
+        remote(),
     ]
 
 
-# `ssh maquina comando` roda um shell nao-interativo e nao-login: ele nao le o
-# .zshrc nem o .bashrc, entao o PATH dele e o minimo do sistema. Um herdr
-# instalado em ~/.local/bin -- que e onde o instalador dele costuma por --
-# simplesmente nao existe desse lado, e o erro sai como "command not found"
-# numa maquina onde o binario esta la, visivel para voce.
+# `ssh machine command` runs a non-interactive, non-login shell: it reads
+# neither .zshrc nor .bashrc, so its PATH is the system minimum. A herdr
+# installed in ~/.local/bin -- which is where its installer tends to put it --
+# simply does not exist on that side, and the error reads "command not found"
+# on a machine where the binary is right there, visible to you.
 #
-# Por isso o caminho absoluto e descoberto uma vez e guardado: pagar um shell
-# de login por atualizacao seria caro, e adivinhar o diretorio seria pior.
-BUSCA_HERDR = (
+# So the absolute path is discovered once and kept: paying for a login shell
+# on every refresh would be expensive, and guessing the directory would be
+# worse.
+HERDR_SEARCH = (
     'command -v herdr 2>/dev/null || '
     'for p in "$HOME/.local/bin/herdr" /usr/bin/herdr /usr/local/bin/herdr "$HOME/bin/herdr"; '
     'do [ -x "$p" ] && printf %s "$p" && break; done'
 )
 
-_HERDR_POR_ALVO = {}
-_TRAVA_HERDR = threading.Lock()
+_HERDR_BY_TARGET = {}
+_HERDR_LOCK = threading.Lock()
 
 
-def caminho_remoto_json():
-    return os.path.join(CACHE_DIR, "remoto-%s.json" % escopo())
+def remote_state_path():
+    return os.path.join(CACHE_DIR, "remote-%s.json" % scope())
 
 
-def descobrir_herdr():
-    """Caminho absoluto do herdr na outra ponta, ou "" se nao houver."""
-    argv = ssh_prefixo() + ['exec "$SHELL" -lc ' + shlex.quote(BUSCA_HERDR)]
-    codigo, saida, _ = rodar(argv, TIMEOUT_SSH)
-    achado = saida.strip().splitlines()[-1].strip() if codigo == 0 and saida.strip() else ""
-    return achado if achado.startswith("/") else ""
+def discover_herdr():
+    """Absolute path of herdr on the other end, or "" when there is none."""
+    argv = ssh_prefix() + ['exec "$SHELL" -lc ' + shlex.quote(HERDR_SEARCH)]
+    code, out, _ = run(argv, TIMEOUT_SSH)
+    found = out.strip().splitlines()[-1].strip() if code == 0 and out.strip() else ""
+    return found if found.startswith("/") else ""
 
 
-def herdr_remoto(redescobrir=False):
-    alvo = remoto()
+def remote_herdr(rediscover=False):
+    target = remote()
 
-    with _TRAVA_HERDR:
-        if redescobrir:
-            _HERDR_POR_ALVO.pop(alvo, None)
-            guardado = ler_json(caminho_remoto_json(), teto=64 * 1024)
-            guardado.pop("herdr", None)
-            gravar_json(caminho_remoto_json(), guardado)
-        elif alvo in _HERDR_POR_ALVO:
-            return _HERDR_POR_ALVO[alvo]
+    with _HERDR_LOCK:
+        if rediscover:
+            _HERDR_BY_TARGET.pop(target, None)
+            stored = read_json(remote_state_path(), teto=64 * 1024)
+            stored.pop("herdr", None)
+            write_json(remote_state_path(), stored)
+        elif target in _HERDR_BY_TARGET:
+            return _HERDR_BY_TARGET[target]
 
-        guardado = ler_json(caminho_remoto_json(), teto=64 * 1024).get("herdr")
-        if isinstance(guardado, str) and guardado.startswith("/"):
-            _HERDR_POR_ALVO[alvo] = guardado
-            return guardado
+        stored = read_json(remote_state_path(), teto=64 * 1024).get("herdr")
+        if isinstance(stored, str) and stored.startswith("/"):
+            _HERDR_BY_TARGET[target] = stored
+            return stored
 
-    achado = descobrir_herdr()
-    if achado:
-        with _TRAVA_HERDR:
-            guardado = ler_json(caminho_remoto_json(), teto=64 * 1024)
-            guardado.update({"herdr": achado, "ts": time.time()})
-            gravar_json(caminho_remoto_json(), guardado)
-            _HERDR_POR_ALVO[alvo] = achado
-        registrar("herdr-remoto-achado", caminho=achado)
-    # Sem descoberta, tenta o nome pelado assim mesmo: se o PATH minimo o
-    # alcancar, funciona; se nao, o erro que volta e o certo.
-    return achado or "herdr"
+    found = discover_herdr()
+    if found:
+        with _HERDR_LOCK:
+            stored = read_json(remote_state_path(), teto=64 * 1024)
+            stored.update({"herdr": found, "ts": time.time()})
+            write_json(remote_state_path(), stored)
+            _HERDR_BY_TARGET[target] = found
+        log_event("herdr-remote-found", path=found)
+    # Without discovery, try the bare name anyway: if the minimum PATH reaches it,
+    # it works; if not, the error that comes back is the right one.
+    return found or "herdr"
 
 
-def chamar_herdr(*args, _retentou=False):
-    """Roda a CLI do Herdr, aqui ou na outra ponta. Devolve (codigo, out, err)."""
-    if not remoto():
-        partes = ["herdr"]
-        if SESSAO != SESSAO_PADRAO:
-            partes += ["--session", SESSAO]
-        return rodar(partes + [str(a) for a in args], TIMEOUT_HERDR)
+def call_herdr(*args, _retentou=False):
+    """Runs the Herdr CLI, here or on the other end. Returns (code, out, err)."""
+    if not remote():
+        parts = ["herdr"]
+        if SESSION != DEFAULT_SESSION:
+            parts += ["--session", SESSION]
+        return run(parts + [str(a) for a in args], TIMEOUT_HERDR)
 
-    partes = [herdr_remoto()]
-    if SESSAO != SESSAO_PADRAO:
-        partes += ["--session", SESSAO]
-    partes += [str(a) for a in args]
+    parts = [remote_herdr()]
+    if SESSION != DEFAULT_SESSION:
+        parts += ["--session", SESSION]
+    parts += [str(a) for a in args]
 
-    # Uma string so: o comando de `ssh` passa por um shell na outra ponta,
-    # entao cada argumento vai citado para chegar inteiro.
-    resultado = rodar(ssh_prefixo() + [" ".join(shlex.quote(p) for p in partes)], TIMEOUT_SSH)
+    # One single string: ssh's command goes through a shell on the other end, so
+    # every argument is quoted to arrive intact.
+    resultado = run(ssh_prefix() + [" ".join(shlex.quote(p) for p in parts)], TIMEOUT_SSH)
 
-    # O caminho guardado pode ter envelhecido -- atualizacao, reinstalacao em
-    # outro prefixo. Uma redescoberta antes de desistir custa um shell de login
-    # e evita um widget que so volta a funcionar limpando cache.
-    baixo = (resultado[1] + resultado[2]).lower()
-    if not _retentou and ("command not found" in baixo or "no such file or directory" in baixo):
-        herdr_remoto(redescobrir=True)
-        return chamar_herdr(*args, _retentou=True)
+    # The stored path can go stale -- an update, a reinstall under another prefix.
+    # One rediscovery before giving up costs a login shell and avoids a widget
+    # that only works again after clearing the cache by hand.
+    lowered = (resultado[1] + resultado[2]).lower()
+    if not _retentou and ("command not found" in lowered or "no such file or directory" in lowered):
+        remote_herdr(rediscover=True)
+        return call_herdr(*args, _retentou=True)
 
     return resultado
 
 
-# Um erro de SSH sozinho e um beco sem saida numa barra de status: ninguem
-# conserta "Host key verification failed" olhando para ele. A dica que vai
-# junto e o comando que resolve.
-DICAS_SSH = (
-    # As duas do Tailscale SSH vem primeiro porque a mensagem dele tambem casa
-    # com agulhas mais genericas abaixo, e a dica especifica e a util.
-    ("additional check", 'ACL do Tailscale em "check": troque para "accept", ou o widget nunca vai passar'),
-    ("login.tailscale.com", 'a Tailscale quer re-autenticacao no navegador; para um widget, use action "accept"'),
-    ("host key verification", "rode `ssh %s` uma vez para aceitar a chave"),
-    # Chave recusada e o sintoma de "achei que o Tailscale SSH estava ligado la":
-    # sem `tailscale up --ssh` no destino, quem atende e o sshd comum.
-    ("permission denied", "`ssh-copy-id %s`, ou `sudo tailscale up --ssh` nessa maquina"),
-    ("could not resolve", "o nome nao resolve — a Tailscale esta ligada?"),
-    ("name or service not known", "o nome nao resolve — a Tailscale esta ligada?"),
-    ("connection timed out", "maquina fora do ar ou fora da tailnet"),
-    ("connection refused", "sem servidor SSH escutando em %s"),
-    # Precisa ser a frase do shell, e nao um "not found" solto: o proprio Herdr
-    # responde "agent target w2:p9 not found", que nao tem nada a ver com onde
-    # o binario esta.
-    ("command not found", "nao achei o herdr la, nem em ~/.local/bin — ele esta instalado?"),
-    ("no such file or directory", "o caminho guardado do herdr remoto nao existe mais"),
-    ("excedeu", "sem resposta a tempo — a maquina esta acordada?"),
+# An SSH error on its own is a dead end in a status bar: nobody fixes
+# "Host key verification failed" by looking at it. The hint that goes with it
+# is the command that resolves it.
+SSH_HINTS = (
+    # The two Tailscale SSH ones come first because its message also matches the
+    # more generic needles below, and the specific hint is the useful one.
+    ("additional check", 'Tailscale ACL on "check": switch it to "accept", or the widget will never get through'),
+    ("login.tailscale.com", 'Tailscale wants browser re-authentication; for a widget, use action "accept"'),
+    ("host key verification", "run `ssh %s` once to accept the host key"),
+    # A rejected key is the symptom of "I thought Tailscale SSH was on there":
+    # without `tailscale up --ssh` on the target, what answers is the plain sshd.
+    ("permission denied", "`ssh-copy-id %s`, ou `sudo tailscale up --ssh` nessa machine"),
+    ("could not resolve", "the name does not resolve — is Tailscale up?"),
+    ("name or service not known", "the name does not resolve — is Tailscale up?"),
+    ("connection timed out", "machine is down or off the tailnet"),
+    ("connection refused", "no SSH server listening on %s"),
+    # It has to be the shell's phrase, not a loose "not found": Herdr itself
+    # answers "agent target w2:p9 not found", which has nothing to do with where
+    # the binary is.
+    ("command not found", "no herdr over there, not even in ~/.local/bin — is it installed?"),
+    ("no such file or directory", "the stored path of the remote herdr no longer exists"),
+    ("timed out", "no answer in time — is the machine awake?"),
 )
 
 
-def erro_de(codigo, saida, erro):
-    mensagem = (erro or saida or "herdr saiu com %d" % codigo).strip()[:200]
-    if not remoto():
-        return mensagem
+def error_from(code, out, err):
+    message = (err or out or "herdr exited with %d" % code).strip()[:200]
+    if not remote():
+        return message
 
-    baixo = mensagem.lower()
-    for agulha, dica in DICAS_SSH:
-        if agulha in baixo:
-            return "%s: %s — %s" % (remoto(), mensagem, dica.replace("%s", remoto()))
-    return "%s: %s" % (remoto(), mensagem)
+    lowered = message.lower()
+    for needle, hint in SSH_HINTS:
+        if needle in lowered:
+            return "%s: %s — %s" % (remote(), message, hint.replace("%s", remote()))
+    return "%s: %s" % (remote(), message)
 
 
-def herdr_texto(*args):
-    """Para os comandos que devolvem texto cru, e nao JSON -- `agent read`."""
-    codigo, saida, erro = chamar_herdr(*args)
-    return ("", erro_de(codigo, saida, erro)) if codigo != 0 else (saida, "")
+def herdr_text(*args):
+    """For commands returning raw text rather than JSON -- `pane read`."""
+    code, out, err = call_herdr(*args)
+    return ("", error_from(code, out, err)) if code != 0 else (out, "")
 
 
 def herdr(*args):
-    """Chama a CLI do Herdr e devolve (payload, mensagem_de_erro)."""
-    codigo, saida, erro = chamar_herdr(*args)
-    corpo = json_de(saida) or json_de(erro) or {}
+    """Calls the Herdr CLI and returns (payload, error_message)."""
+    code, out, err = call_herdr(*args)
+    body = json_from(out) or json_from(err) or {}
 
-    if isinstance(corpo, dict) and isinstance(corpo.get("error"), dict):
-        detalhe = corpo["error"]
-        return (None, detalhe.get("message") or detalhe.get("code") or "erro do herdr")
-    if codigo != 0:
-        return (None, erro_de(codigo, saida, erro))
-    if not isinstance(corpo, dict):
-        return (None, "resposta do herdr nao era JSON")
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        detail = body["error"]
+        return (None, detail.get("message") or detail.get("code") or "err do herdr")
+    if code != 0:
+        return (None, error_from(code, out, err))
+    if not isinstance(body, dict):
+        return (None, "the herdr reply was not JSON")
 
-    return (corpo.get("result") or {}, "")
-
-
-def numeros(valor):
-    """"w2:t10" -> (2, 10). Ordena a lista como o Herdr mostra a sessao."""
-    return tuple(int(n) for n in re.findall(r"\d+", str(valor or ""))) or (0,)
+    return (body.get("result") or {}, "")
 
 
-# --------------------------------------------------------------- mensagens
+def numbers_in(value):
+    """"w2:t10" -> (2, 10). Orders the list the way Herdr shows the session."""
+    return tuple(int(n) for n in re.findall(r"\d+", str(value or ""))) or (0,)
 
 
-# Quem falou. O primeiro conjunto e como os agentes marcam a propria fala
-# (Claude, Codex e parentes); o segundo e como marcam a sua.
-MARCA_AGENTE = "●⏺◍⦿"
-MARCA_VOCE = ">❯»"
+# --------------------------------------------------------------- messages
 
-# Linhas que sao moldura, nao conversa: reguas, caixa de input, rodape de
-# atalhos, contador de tokens, spinner e o recap automatico. Fecham o bloco
-# aberto em vez de entrar nele.
-RE_REGUA = re.compile(r"^[\s─━═╌╍‾_\-]{20,}$")
-RE_MOLDURA = re.compile(r"^[\s\u2500-\u257f]+$")
-RE_RODAPE = re.compile(r"^\s*(⏵|\?\s|esc |ctrl|shift|tab )", re.IGNORECASE)
-RE_ESTADO = re.compile(r"^\s*[✻✽✢✳❉*·⧗⣿]\s")
+
+# Who spoke. The first set is how agents mark their own message (Claude, Codex
+# and relatives); the second is how they mark yours.
+AGENT_MARKS = "●⏺◍⦿"
+YOUR_MARKS = ">❯»"
+
+# Lines that are chrome, not conversation: rules, the input box, the shortcut
+# footer, the token counter, the spinner and the automatic recap. They close
+# the open block instead of entering it.
+RE_RULE = re.compile(r"^[\s─━═╌╍‾_\-]{20,}$")
+RE_BOX = re.compile(r"^[\s\u2500-\u257f]+$")
+RE_FOOTER = re.compile(r"^\s*(⏵|\?\s|esc |ctrl|shift|tab )", re.IGNORECASE)
+RE_SPINNER = re.compile(r"^\s*[✻✽✢✳❉*·⧗⣿]\s")
 RE_RECAP = re.compile(r"^\s*※")
-RE_FERRAMENTA = re.compile(r"^\s*[⎿⧉↳]")
+RE_TOOL = re.compile(r"^\s*[⎿⧉↳]")
 
 
-def e_moldura(linha):
-    if not linha.strip():
+def is_chrome(line):
+    if not line.strip():
         return False
     return bool(
-        RE_REGUA.match(linha)
-        or RE_MOLDURA.match(linha)
-        or RE_RODAPE.match(linha)
-        or RE_ESTADO.match(linha)
-        or RE_RECAP.match(linha)
-        or RE_FERRAMENTA.match(linha)
-        # "❯ 1. Yes" comeca com o mesmo "❯" que marca a sua fala. Sem esta
-        # linha, o dialogo inteiro entra na lista como se fosse a ultima coisa
-        # que voce disse -- e ocupa o lugar do que o agente realmente falou
-        # antes de parar para perguntar.
-        or RE_OPCAO.match(linha)
+        RE_RULE.match(line)
+        or RE_BOX.match(line)
+        or RE_FOOTER.match(line)
+        or RE_SPINNER.match(line)
+        or RE_RECAP.match(line)
+        or RE_TOOL.match(line)
+        # "❯ 1. Yes" starts with the same "❯" that marks your message. Without this
+        # line the whole dialog enters the list as if it were the last thing you
+        # said -- taking the place of what the agent actually said before stopping
+        # to ask.
+        or RE_OPTION.match(line)
     )
 
 
-def marcador(linha):
-    """'agente', 'voce' ou None -- quem comeca a falar nesta linha.
+def speaker(line):
+    """'agent', 'you' or None -- who starts speaking on this line.
 
-    O marcador tem de vir na margem: uma seta ou um bullet no meio de um
-    paragrafo e conteudo, nao o comeco de uma fala nova.
+    The marker has to sit in the margin: an arrow or a bullet in the middle of
+    a paragraph is content, not the start of a new message.
     """
-    sem_recuo = linha.lstrip(" ")
-    if len(linha) - len(sem_recuo) > 2 or not sem_recuo or RE_OPCAO.match(linha):
+    sem_recuo = line.lstrip(" ")
+    if len(line) - len(sem_recuo) > 2 or not sem_recuo or RE_OPTION.match(line):
         return None
-    cabeca = sem_recuo[0]
-    resto = sem_recuo[1:].strip()
-    if cabeca in MARCA_AGENTE:
-        return "agente"
-    # "❯" sozinho e o prompt vazio esperando voce, e nao uma fala.
-    if cabeca in MARCA_VOCE and resto:
-        return "voce"
+    head = sem_recuo[0]
+    rest = sem_recuo[1:].strip()
+    if head in AGENT_MARKS:
+        return "agent"
+    # "❯" alone is the empty prompt waiting for you, not a message.
+    if head in YOUR_MARKS and rest:
+        return "you"
     return None
 
 
-def sem_marcador(linha):
-    return linha.lstrip(" ")[1:].strip()
+def without_speaker(line):
+    return line.lstrip(" ")[1:].strip()
 
 
-def mensagens(bruto, quantas):
-    """As ultimas `quantas` falas visiveis no terminal do agente.
+def messages_from(raw, how_many):
+    """The last `how_many` messages visible in the agent's terminal.
 
-    O que da para ler e o que esta na tela: um agente em tela alternativa nao
-    deixa scrollback, entao pedir mais linhas nao traz mais historia. Isso
-    combina com o proposito -- a lista mostra o que voce veria se focasse a
-    aba, nem mais nem menos.
+    What can be read is what is on screen: an agent on the alternate screen
+    leaves no scrollback, so asking for more lines brings no more history. That
+    matches the purpose -- the list shows what you would see if you focused the
+    tab, no more and no less.
     """
-    blocos = []
-    atual = None
+    blocks = []
+    current = None
 
-    for linha in (bruto or "").splitlines():
-        quem = marcador(linha)
-        if quem:
-            atual = {"who": quem, "linhas": [sem_marcador(linha)]}
-            blocos.append(atual)
-        elif atual is None:
+    for line in (raw or "").splitlines():
+        who = speaker(line)
+        if who:
+            current = {"who": who, "lines": [without_speaker(line)]}
+            blocks.append(current)
+        elif current is None:
             continue
-        elif e_moldura(linha) or not linha.strip():
-            # So o primeiro paragrafo. Depois dele vem o detalhamento -- listas,
-            # tabelas, blocos de codigo -- que numa linha de popup viraria ruido:
-            # a manchete e o que responde "o que esta acontecendo ali".
-            atual = None
+        elif is_chrome(line) or not line.strip():
+            # Only the first paragraph. After it comes the detail -- lists, tables, code
+            # blocks -- which in one popup line would be noise: the headline is what
+            # answers "what is going on over there".
+            current = None
         else:
-            atual["linhas"].append(linha.strip())
+            current["lines"].append(line.strip())
 
-    saida = []
-    for bloco in blocos[-max(1, quantas):]:
-        texto = re.sub(r"\s+", " ", " ".join(bloco["linhas"])).strip()
-        if not texto:
+    out = []
+    for block in blocks[-max(1, how_many):]:
+        text = re.sub(r"\s+", " ", " ".join(block["lines"])).strip()
+        if not text:
             continue
-        if len(texto) > MAX_MENSAGEM:
-            texto = texto[:MAX_MENSAGEM - 1].rstrip() + "…"
-        saida.append({"who": bloco["who"], "text": texto})
+        if len(text) > MAX_MESSAGE:
+            text = text[:MAX_MESSAGE - 1].rstrip() + "…"
+        out.append({"who": block["who"], "text": text})
 
-    return saida
+    return out
 
 
-# Uma alternativa de dialogo: "❯ 1. Yes" / "  2. No, and tell Claude ...".
-RE_OPCAO = re.compile(r"^\s*(?P<cursor>[❯>»])?\s*(?P<chave>\d{1,2})[.)]\s+(?P<rotulo>\S.*?)\s*$")
-# So as barras verticais da caixa, e nunca o recuo: as alternativas sem numero
-# se reconhecem pela coluna em que o texto comeca, e um strip() generico
-# apagaria justamente o que as identifica.
-RE_BORDA_ESQ = re.compile(r"^\s*[│┃┆┇┊┋╎╏║]\s?")
-RE_BORDA_DIR = re.compile(r"\s*[│┃┆┇┊┋╎╏║]\s*$")
+# One dialog option: "❯ 1. Yes" / "  2. No, and tell Claude ...".
+RE_OPTION = re.compile(r"^\s*(?P<cursor>[❯>»])?\s*(?P<key>\d{1,2})[.)]\s+(?P<label>\S.*?)\s*$")
+# Only the box's vertical bars, never the indent: unnumbered options are
+# recognised by the column where their text starts, and a generic strip()
+# would erase exactly what identifies them.
+RE_BORDER_LEFT = re.compile(r"^\s*[│┃┆┇┊┋╎╏║]\s?")
+RE_BORDER_RIGHT = re.compile(r"\s*[│┃┆┇┊┋╎╏║]\s*$")
 
-# Alternativas que nao respondem nada sozinhas: escolher uma abre um campo e
-# fica esperando voce escrever. Apertar a tecla e parar ali deixa o agente
-# travado num input vazio, que e pior que nao ter botao.
-RE_PEDE_TEXTO = re.compile(
+# Options that answer nothing on their own: choosing one opens a field and
+# waits for you to write. Pressing the key and stopping there leaves the agent
+# stuck on an empty input, which is worse than having no button.
+RE_ASKS_TEXT = re.compile(
     r"(?i)(tell claude|tell it|chat about|what to change|what to do differently"
-    r"|add notes|give feedback|explain|escrever|responder)"
+    r"|add notes|give feedback|explain|escrever|reply)"
 )
 
-# Rodape do proprio dialogo: instrucao de teclado, nao pergunta nem alternativa.
-RE_INSTRUCAO = re.compile(
+# The dialog's own footer: keyboard instructions, neither question nor option.
+RE_KEYHINT = re.compile(
     r"(?i)(esc to cancel|enter to (confirm|select|submit)|to navigate|to amend|to explain|for shortcuts)"
 )
 
 
-def desenquadra(linha, estilos=None):
+def unbox(line, styles=None):
     """Tira a moldura da caixa: "│ ❯ 1. Yes        │" -> "❯ 1. Yes".
 
-    Corta o estilo nos mesmos indices do texto: os dois andam caractere a
-    caractere, e um deslocamento de um pinta a linha inteira errado.
+    Corta o style nos mesmos indices do text: os dois andam char a
+    char, e um deslocamento de um pinta a line inteira errado.
     """
-    esquerda = RE_BORDA_ESQ.match(linha)
-    inicio = esquerda.end() if esquerda else 0
-    direita = RE_BORDA_DIR.search(linha, inicio)
-    fim = direita.start() if direita else len(linha)
-    if estilos is None:
-        return linha[inicio:fim]
-    return (linha[inicio:fim], estilos[inicio:fim])
+    esquerda = RE_BORDER_LEFT.match(line)
+    start = esquerda.end() if esquerda else 0
+    direita = RE_BORDER_RIGHT.search(line, start)
+    end = direita.start() if direita else len(line)
+    if styles is None:
+        return line[start:end]
+    return (line[start:end], styles[start:end])
 
 
-def opcoes_numeradas(linhas):
-    """A forma "❯ 1. Yes" / "  2. No": o numero e a propria tecla."""
-    achadas = []
-    for indice, linha in enumerate(linhas):
-        casou = RE_OPCAO.match(linha)
-        if casou and not RE_INSTRUCAO.search(linha):
-            rotulo = casou.group("rotulo")[:MAX_ROTULO]
-            achadas.append((indice, {
-                "key": casou.group("chave"),
+def numbered_options(lines):
+    """The "❯ 1. Yes" / "  2. No" shape: the number is the key itself."""
+    found_options = []
+    for index, line in enumerate(lines):
+        matched = RE_OPTION.match(line)
+        if matched and not RE_KEYHINT.search(line):
+            rotulo = matched.group("label")[:MAX_LABEL]
+            found_options.append((index, {
+                "key": matched.group("key"),
                 "label": rotulo,
-                "selected": casou.group("cursor") is not None,
-                "prompts": bool(RE_PEDE_TEXTO.search(rotulo)),
+                "selected": matched.group("cursor") is not None,
+                "prompts": bool(RE_ASKS_TEXT.search(rotulo)),
             }))
-    return achadas
+    return found_options
 
 
-def opcoes_com_cursor(linhas):
-    """A forma sem numero: um "❯" marca a escolhida e as irmas se alinham a ela.
+def cursor_options(lines):
+    """The unnumbered shape: a "❯" marks the chosen one and its siblings align to it.
 
-    E o dialogo de confianca de pasta do Claude Code, entre outros. Sem numero
-    para digitar, responder e andar com as setas ate a linha e apertar Enter --
-    e por isso as irmas sao reconhecidas pela coluna onde o texto comeca, e nao
-    por um marcador: e a unica coisa que elas tem em comum com a escolhida.
+    This is Claude Code's folder-trust dialog, among others. With no number to
+    type, answering means walking the arrows to the line and pressing Enter --
+    which is why siblings are recognised by the column where their text starts
+    and not by a marker: it is the only thing they share with the chosen one.
     """
     cursor = -1
-    for indice, linha in enumerate(linhas):
-        if re.match(r"^\s*[❯>»]\s+\S", linha) and not RE_INSTRUCAO.search(linha):
-            cursor = indice
+    for index, line in enumerate(lines):
+        if re.match(r"^\s*[❯>»]\s+\S", line) and not RE_KEYHINT.search(line):
+            cursor = index
     if cursor < 0:
         return []
 
-    marcado = re.match(r"^(\s*[❯>»]\s+)(\S.*?)\s*$", linhas[cursor])
-    coluna = len(marcado.group(1))
+    marked = re.match(r"^(\s*[❯>»]\s+)(\S.*?)\s*$", lines[cursor])
+    coluna = len(marked.group(1))
 
-    def irma(linha):
-        if not linha.strip() or RE_INSTRUCAO.search(linha):
+    def irma(line):
+        if not line.strip() or RE_KEYHINT.search(line):
             return None
-        casou = re.match(r"^(\s*)(\S.*?)\s*$", linha)
-        return casou.group(2) if casou and len(casou.group(1)) == coluna else None
+        matched = re.match(r"^(\s*)(\S.*?)\s*$", line)
+        return matched.group(2) if matched and len(matched.group(1)) == coluna else None
 
-    bloco = [(cursor, marcado.group(2), True)]
-    for passo, limite in ((-1, -1), (1, len(linhas))):
-        indice = cursor + passo
-        while indice != limite:
-            texto = irma(linhas[indice])
-            if texto is None:
+    block = [(cursor, marked.group(2), True)]
+    for step, limit in ((-1, -1), (1, len(lines))):
+        index = cursor + step
+        while index != limit:
+            text = irma(lines[index])
+            if text is None:
                 break
-            bloco.append((indice, texto, False))
-            indice += passo
+            block.append((index, text, False))
+            index += step
 
-    bloco.sort()
-    # Menu precisa de escolha: uma linha marcada sem irmas e o prompt esperando
-    # voce, e trata-lo como alternativa faz o painel oferecer um botao que
-    # responde a nada.
-    if len(bloco) < 2:
+    block.sort()
+    # A menu needs a choice: a marked line with no siblings is the prompt waiting
+    # for you, and treating it as an option makes the panel offer a button that
+    # answers nothing.
+    if len(block) < 2:
         return []
     return [
         (
-            indice,
+            index,
             {
                 "key": "",
-                "label": texto[:MAX_ROTULO],
+                "label": text[:MAX_LABEL],
                 "selected": marcada,
-                "prompts": bool(RE_PEDE_TEXTO.search(texto)),
+                "prompts": bool(RE_ASKS_TEXT.search(text)),
             },
         )
-        for indice, texto, marcada in bloco
+        for index, text, marcada in block
     ]
 
 
-def formulario(bruto, quantas_linhas=40):
-    """A pergunta e as alternativas de um agente bloqueado.
+def dialog_form(raw, quantas_linhas=40):
+    """A stopped agent's question and options.
 
-    O Herdr classifica como `blocked` o que reconhece como aprovacao ou
-    pergunta; aqui so se le o que ja esta desenhado na tela para virar botao.
-    Um agente que pergunta de outro jeito -- "[y/n]", texto livre -- nao rende
-    alternativa nenhuma, e sobra o campo, que responde qualquer coisa.
+    Herdr classifies as `blocked` whatever it recognises as an approval or a
+    question; here we only read what is already drawn on screen and turn it
+    into buttons. An agent that asks some other way -- "[y/n]", free text --
+    yields no options at all, and the field is left, which answers anything.
     """
-    pares = [desenquadra(*tokenizar(l)) for l in (bruto or "").splitlines()][-quantas_linhas:]
-    linhas = [t for t, _ in pares]
-    estilos = [e for _, e in pares]
+    pairs = [unbox(*tokenize(l)) for l in (raw or "").splitlines()][-quantas_linhas:]
+    lines = [t for t, _ in pairs]
+    styles = [e for _, e in pairs]
 
-    achadas = opcoes_numeradas(linhas) or opcoes_com_cursor(linhas)
-    if not achadas:
-        # Sem alternativa reconhecivel -- "[y/N]", texto corrido -- ainda ha uma
-        # pergunta na tela, e ela e o que voce precisa ler. Botao nenhum e
-        # honesto; pergunta nenhuma e so esconder o que aconteceu.
-        return {"question": pergunta_de(linhas), "options": [], "context": contexto_de(linhas, estilos)}
+    found_options = numbered_options(lines) or cursor_options(lines)
+    if not found_options:
+        # With no recognisable option -- "[y/N]", running text -- there is still a
+        # question on screen, and it is what you need to read. No button is honest;
+        # no question is just hiding what happened.
+        return {"question": question_from(lines), "options": [], "context": context_from(lines, styles)}
 
-    primeira = achadas[0][0]
-    opcoes = [opcao for _, opcao in achadas][:8]
-    for posicao, opcao in enumerate(opcoes):
-        opcao["index"] = posicao
+    first_option = found_options[0][0]
+    options = [option for _, option in found_options][:8]
+    for position, option in enumerate(options):
+        option["index"] = position
 
     return {
-        "question": pergunta_de(linhas[:primeira]),
-        "options": opcoes,
-        "context": contexto_de(linhas[:primeira], estilos[:primeira]),
+        "question": question_from(lines[:first_option]),
+        "options": options,
+        "context": context_from(lines[:first_option], styles[:first_option]),
     }
 
 
-# --------------------------------------------------------------------- cores
+# --------------------------------------------------------------------- color
 
 
 RE_SGR = re.compile(r"\x1b\[([0-9;]*)m")
-RE_OUTRO_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b[\]P][^\x07\x1b]*(?:\x07|\x1b\\)?")
+RE_OTHER_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b[\]P][^\x07\x1b]*(?:\x07|\x1b\\)?")
 
 
-def tokenizar(linha):
-    """Separa uma linha com ANSI em (texto limpo, estilo de cada caractere).
+def tokenize(line):
+    """Splits an ANSI line into (clean text, style per character).
 
-    O terminal ja pintou o codigo -- o Claude Code realca diff e bloco de
-    comando -- entao a cor certa e a que ja esta la. Reimplementar um
-    highlighter aqui seria adivinhar de novo o que a outra ponta ja sabe.
+    The terminal already painted the code -- Claude Code highlights diffs and
+    command blocks -- so the right color is the one already there.
+    Reimplementing a highlighter here would mean guessing again what the other
+    end already knows.
     """
-    # Fora os SGR, todo escape e movimentacao de cursor e afins: nao pinta nada
-    # e nao ocupa coluna, entao sai antes de contar caractere.
-    limpa = RE_OUTRO_ESCAPE.sub("", linha)
+    # Other than SGR, every escape is cursor movement and the like: it paints
+    # nothing and takes no column, so it goes before counting characters.
+    limpa = RE_OTHER_ESCAPE.sub("", line)
 
-    texto = []
-    estilos = []
-    estilo = {}
+    text = []
+    styles = []
+    style = {}
 
-    # split com um grupo devolve texto e parametros alternados, comecando pelo
-    # texto -- dai o indice par ser conteudo e o impar ser SGR.
-    for indice, pedaco in enumerate(RE_SGR.split(limpa)):
-        if indice % 2:
-            estilo = aplicar_sgr(estilo, pedaco)
+    # split with one group returns text and params alternating, starting with
+    # text -- hence even index is content and odd is SGR.
+    for index, pedaco in enumerate(RE_SGR.split(limpa)):
+        if index % 2:
+            style = apply_sgr(style, pedaco)
         else:
-            texto.append(pedaco)
-            estilos.extend([estilo] * len(pedaco))
+            text.append(pedaco)
+            styles.extend([style] * len(pedaco))
 
-    return ("".join(texto), estilos)
-
-
-def aplicar_sgr(estilo, parametros):
-    """Um SGR sobre o estilo corrente. So o que muda a leitura: cor, negrito, fraco."""
-    codigos = [c for c in parametros.split(";") if c != ""] or ["0"]
-    novo = dict(estilo)
-    indice = 0
-
-    while indice < len(codigos):
-        codigo = codigos[indice]
-        if codigo == "0":
-            novo = {}
-        elif codigo == "1":
-            novo["b"] = True
-        elif codigo == "2":
-            novo["d"] = True
-        elif codigo in ("22", "21"):
-            novo.pop("b", None)
-            novo.pop("d", None)
-        elif codigo in ("39", "49"):
-            novo.pop("f" if codigo == "39" else "g", None)
-        elif codigo in ("38", "48") and indice + 4 < len(codigos) and codigos[indice + 1] == "2":
-            chave = "f" if codigo == "38" else "g"
-            novo[chave] = "#%02x%02x%02x" % tuple(min(255, int(c or 0)) for c in codigos[indice + 2:indice + 5])
-            indice += 4
-        indice += 1
-
-    return novo
+    return ("".join(text), styles)
 
 
-def em_trechos(texto, estilos):
-    """Junta caracteres vizinhos de mesmo estilo, para o JSON nao virar um por letra."""
-    trechos = []
-    for caractere, estilo in zip(texto, estilos):
-        if trechos and trechos[-1][1] == estilo:
-            trechos[-1][0] += caractere
+def apply_sgr(style, params):
+    """One SGR over the current style. Only what changes reading: color, bold, dim."""
+    codes = [c for c in params.split(";") if c != ""] or ["0"]
+    updated = dict(style)
+    index = 0
+
+    while index < len(codes):
+        code = codes[index]
+        if code == "0":
+            updated = {}
+        elif code == "1":
+            updated["b"] = True
+        elif code == "2":
+            updated["d"] = True
+        elif code in ("22", "21"):
+            updated.pop("b", None)
+            updated.pop("d", None)
+        elif code in ("39", "49"):
+            updated.pop("f" if code == "39" else "g", None)
+        elif code in ("38", "48") and index + 4 < len(codes) and codes[index + 1] == "2":
+            key = "f" if code == "38" else "g"
+            updated[key] = "#%02x%02x%02x" % tuple(min(255, int(c or 0)) for c in codes[index + 2:index + 5])
+            index += 4
+        index += 1
+
+    return updated
+
+
+def into_runs(text, styles):
+    """Merges neighbouring characters of equal style, so the JSON is not one per letter."""
+    runs = []
+    for char, style in zip(text, styles):
+        if runs and runs[-1][1] == style:
+            runs[-1][0] += char
         else:
-            trechos.append([caractere, estilo])
-    return [dict(estilo, t=texto) for texto, estilo in trechos]
+            runs.append([char, style])
+    return [dict(style, t=text) for text, style in runs]
 
 
-def contexto_de(acima, estilos):
-    """Tudo que o dialogo mostra antes da pergunta, como esta na tela.
+def context_from(above, styles):
+    """Everything the dialog shows before the question, as it is on screen.
 
-    E o comando que ele quer rodar, o diff que quer aplicar, o "Tip:" que muda
-    o que voce escolheria. Antes so a pergunta subia, e "Do you want to
-    proceed?" sozinho nao e uma pergunta -- e a metade dela que nao informa
-    nada. As linhas vem separadas, e nao coladas num paragrafo: um bloco de
-    comando com as quebras desfeitas fica ilegivel.
+    It is the command it wants to run, the diff it wants to apply, the "Tip:"
+    that changes what you would choose. Before, only the question came up, and
+    "Do you want to proceed?" on its own is not a question -- it is the half of
+    it that informs nothing. Lines come separated, not glued into a paragraph:
+    a command block with its breaks undone is unreadable.
     """
-    inicio, _ = faixa_da_pergunta(acima)
-    corte = inicio if inicio >= 0 else len(acima)
+    start, _ = question_span(above)
+    corte = start if start >= 0 else len(above)
 
-    uteis = [(t.rstrip(), e[:len(t.rstrip())]) for t, e in zip(acima[:corte], estilos[:corte]) if util(t)]
-    # As de baixo sao as que importam: o comando fica colado na pergunta, e o
-    # que esta muito acima e historico da conversa, nao o pedido.
-    uteis = uteis[-MAX_CONTEXTO:]
-    if not uteis:
+    useful = [(t.rstrip(), e[:len(t.rstrip())]) for t, e in zip(above[:corte], styles[:corte]) if is_text(t)]
+    # The bottom ones are what matter: the command sits against the question, and
+    # what is far above is conversation history, not the request.
+    useful = useful[-MAX_CONTEXT:]
+    if not useful:
         return []
 
-    # Tira o recuo comum e mantem o relativo: a caixa do dialogo ja empurrava
-    # tudo para dentro, e repetir isso aqui so gastaria largura -- mas a
-    # indentacao interna do comando e o que o torna legivel.
-    recuo = min(len(t) - len(t.lstrip(" ")) for t, _ in uteis)
+    # Strip the common indent and keep the relative one: the dialog box already
+    # pushed everything inward, and repeating that here would only cost width --
+    # but the command's internal indentation is what makes it readable.
+    indent = min(len(t) - len(t.lstrip(" ")) for t, _ in useful)
     return [
-        em_trechos(t[recuo:][:MAX_MENSAGEM], e[recuo:][:MAX_MENSAGEM])
-        for t, e in uteis
+        into_runs(t[indent:][:MAX_MESSAGE], e[indent:][:MAX_MESSAGE])
+        for t, e in useful
     ]
 
 
-def util(linha):
-    """Linha que conta como texto da pergunta: nem vazia, nem moldura.
+def is_text(line):
+    """A line that counts as question text: neither empty nor chrome.
 
-    Sem descartar a moldura, uma regua entre a pergunta e a caixa de input
-    entraria no paragrafo e o "texto" da pergunta viria com um traco de
-    oitenta caracteres no meio.
+    Without discarding chrome, a rule between the question and the input box
+    would enter the paragraph and the question's "text" would come with an
+    eighty-character dash through the middle.
     """
-    return bool(linha.strip()) and not RE_INSTRUCAO.search(linha) and not e_moldura(linha)
+    return bool(line.strip()) and not RE_KEYHINT.search(line) and not is_chrome(line)
 
 
-def faixa_da_pergunta(acima):
-    """(inicio, fim) do paragrafo da pergunta, ou (-1, -1) se nao houver.
+def question_span(above):
+    """(start, end) of the question paragraph, or (-1, -1) when there is none.
 
-    A ancora e a linha com "?" mais proxima do bloco -- em qualquer posicao dela,
-    e nao no fim, porque uma pergunta longa quebra em varias linhas e o "?" cai
-    no meio da primeira. Dali o paragrafo inteiro: mostrar meia pergunta e pior
-    que nao mostrar nenhuma, porque a metade que sobra parece a pergunta toda e
-    voce responde a outra coisa.
+    The anchor is the line with "?" nearest the option block -- anywhere in it,
+    not at the end, because a long question wraps across lines and the "?"
+    lands in the middle of the first. From there the whole paragraph: showing
+    half a question is worse than showing none, because the half that survives
+    looks like the whole question and you answer something else.
     """
-    # Texto de dialogo nunca vem atribuido a alguem: uma linha que comeca com
-    # "●" ou "❯" e fala, e uma fala com "?" no meio e so uma pergunta que
-    # alguem fez na conversa -- nao a que a tela esta esperando resposta.
-    alvo = -1
-    for indice in range(len(acima) - 1, max(-1, len(acima) - 13), -1):
-        if util(acima[indice]) and "?" in acima[indice] and not marcador(acima[indice]):
-            alvo = indice
+    # Dialog text is never attributed to anyone: a line starting with "●" or "❯"
+    # is speech, and speech with a "?" in it is just a question someone asked in
+    # the conversation -- not the one the screen is waiting on.
+    target = -1
+    for index in range(len(above) - 1, max(-1, len(above) - 13), -1):
+        if is_text(above[index]) and "?" in above[index] and not speaker(above[index]):
+            target = index
             break
-    # Sem "?" em lugar nenhum nao ha pergunta. Antes daqui saia a ultima linha
-    # de texto qualquer, e num pane que o Herdr marcou como bloqueado por
-    # engano isso virava uma "pergunta" feita de conversa solta -- um palpite
-    # que parece informacao.
-    if alvo < 0:
+    # With no "?" anywhere there is no question. This used to fall back to the
+    # last line of any text, and on a pane Herdr marked blocked by mistake that
+    # became a "question" made of loose conversation -- a guess that looks like
+    # information.
+    if target < 0:
         return (-1, -1)
 
-    inicio = alvo
-    while inicio > 0 and util(acima[inicio - 1]) and not marcador(acima[inicio - 1]):
-        inicio -= 1
-    fim = alvo
-    while fim + 1 < len(acima) and util(acima[fim + 1]) and not marcador(acima[fim + 1]):
-        fim += 1
-    return (inicio, fim)
+    start = target
+    while start > 0 and is_text(above[start - 1]) and not speaker(above[start - 1]):
+        start -= 1
+    end = target
+    while end + 1 < len(above) and is_text(above[end + 1]) and not speaker(above[end + 1]):
+        end += 1
+    return (start, end)
 
 
-def pergunta_de(acima):
-    inicio, fim = faixa_da_pergunta(acima)
-    if inicio < 0:
+def question_from(above):
+    start, end = question_span(above)
+    if start < 0:
         return ""
-    junto = " ".join(linha.strip() for linha in acima[inicio:fim + 1])
-    return re.sub(r"\s+", " ", junto).strip()[:MAX_PERGUNTA]
+    joined = " ".join(line.strip() for line in above[start:end + 1])
+    return re.sub(r"\s+", " ", joined).strip()[:MAX_QUESTION]
 
 
-def ler_terminal(pane, quantas, bloqueado):
-    """Uma leitura por agente: dela saem as falas e, se parado, o dialogo."""
-    # `agent read` e a excecao entre os comandos: cospe o buffer do terminal no
-    # stdout, sem envelope JSON.
-    # `pane read --format ansi` em vez de `agent read`: e a mesma tela, mas com
-    # as cores que o terminal ja pintou. O Claude Code realca diff e bloco de
-    # comando, e essa e a unica forma de o painel mostrar codigo realcado sem
-    # reimplementar um highlighter -- adivinhando de novo o que a outra ponta
-    # ja sabe. O texto limpo sai da mesma leitura, entao nao custa uma segunda.
-    bruto, erro = herdr_texto(
+def read_terminal(pane, how_many, blocked_):
+    """One read per agent: from it come the messages and, if stopped, the dialog."""
+    # `pane read --format ansi` rather than `agent read`: same screen, but with
+    # the colors the terminal already painted. Claude Code highlights diffs and
+    # command blocks, and this is the only way for the panel to show highlighted
+    # code without reimplementing a highlighter -- guessing again what the other
+    # end already knows. The clean text comes out of the same read, so it costs
+    # no second call.
+    raw, err = herdr_text(
         "pane", "read", pane, "--source", "recent-unwrapped",
-        "--lines", str(LINHAS_BUFFER), "--format", "ansi"
+        "--lines", str(BUFFER_LINES), "--format", "ansi"
     )
-    if erro:
+    if err:
         return ([], {"question": "", "options": [], "context": []})
-    vazio = {"question": "", "options": [], "context": []}
-    limpo = RE_SGR.sub("", RE_OUTRO_ESCAPE.sub("", bruto))
-    return (mensagens(limpo, quantas), formulario(bruto) if bloqueado else vazio)
+    empty = {"question": "", "options": [], "context": []}
+    clean = RE_SGR.sub("", RE_OTHER_ESCAPE.sub("", raw))
+    return (messages_from(clean, how_many), dialog_form(raw) if blocked_ else empty)
 
 
-# ------------------------------------------------------------------ agentes
+# ------------------------------------------------------------------ agents
 
 
-def rotulos_de_aba(instantaneo):
-    """tab_id -> rotulo, apenas quando renomeada.
+def tab_labels(instantaneo):
+    """tab_id -> label, only when the tab was renamed.
 
-    Aba sem nome vem rotulada com o proprio numero ("1", "2"), o que nao
-    identifica nada numa lista -- vale menos que o basename do cwd.
+    An unnamed tab comes labelled with its own number ("1", "2"), which
+    identifies nothing in a list -- worth less than the cwd's basename.
     """
     mapa = {}
-    for aba in instantaneo.get("tabs") or []:
-        rotulo = str(aba.get("label") or "").strip()
+    for tab in instantaneo.get("tabs") or []:
+        rotulo = str(tab.get("label") or "").strip()
         if rotulo and not rotulo.isdigit():
-            mapa[aba.get("tab_id")] = rotulo
+            mapa[tab.get("tab_id")] = rotulo
     return mapa
 
 
-def nome_curto(cwd):
-    """Nome de projeto a partir do cwd. O home vira "~".
+def short_name(cwd):
+    """Project name from the cwd. Home becomes "~".
 
-    Um agente rodando no home apareceria como "otavio", que nao diz nada e
-    ainda passa por nome de projeto numa lista onde todo o resto e um.
+    An agent running in home would show up as your username, which says nothing
+    and still passes for a project name in a list where everything else is one.
     """
     if not cwd:
         return ""
-    if not remoto() and os.path.normpath(cwd) == os.path.normpath(os.path.expanduser("~")):
+    if not remote() and os.path.normpath(cwd) == os.path.normpath(os.path.expanduser("~")):
         return "~"
     return os.path.basename(cwd.rstrip("/"))
 
 
-def linha_de_agente(agente, abas, prs):
-    cwd = str(agente.get("cwd") or "")
-    titulo = str(agente.get("terminal_title_stripped") or agente.get("terminal_title") or "").strip()
-    projeto = abas.get(agente.get("tab_id")) or nome_curto(cwd)
+def agent_row(agent, tabs, prs):
+    cwd = str(agent.get("cwd") or "")
+    title = str(agent.get("terminal_title_stripped") or agent.get("terminal_title") or "").strip()
+    project = tabs.get(agent.get("tab_id")) or short_name(cwd)
 
-    status = str(agente.get("agent_status") or "unknown")
-    if status not in STATUS:
+    status = str(agent.get("agent_status") or "unknown")
+    if status not in STATUSES:
         status = "unknown"
 
     pr = prs.get(cwd) or {}
 
     return {
-        "pane_id": str(agente.get("pane_id") or ""),
-        "tab_id": str(agente.get("tab_id") or ""),
-        "workspace_id": str(agente.get("workspace_id") or ""),
-        "kind": str(agente.get("agent") or ""),
+        "pane_id": str(agent.get("pane_id") or ""),
+        "tab_id": str(agent.get("tab_id") or ""),
+        "workspace_id": str(agent.get("workspace_id") or ""),
+        "kind": str(agent.get("agent") or ""),
         "status": status,
         "cwd": cwd,
-        "project": projeto,
-        # O titulo repetiria o projeto quando a aba nao foi renomeada e o agente
-        # nao mexeu no titulo; uma coluna que repete a outra so gasta largura.
-        "title": "" if titulo == projeto else titulo,
+        "project": project,
+        # The title would repeat the project when the tab was not renamed and the
+        # agent did not touch the title; a column that repeats another only spends
+        # width.
+        "title": "" if title == project else title,
         "pr_number": int(pr.get("number") or 0),
         "pr_url": str(pr.get("url") or ""),
         "pr_title": str(pr.get("title") or ""),
@@ -890,875 +896,876 @@ def linha_de_agente(agente, abas, prs):
     }
 
 
-def prs_por_cwd(cache):
-    """cwd -> entrada de PR, sem tocar em git nem na rede.
+def prs_by_cwd(cache):
+    """cwd -> PR entry, touching neither git nor the network.
 
-    O cache guarda o cwd que gerou cada entrada justamente para isso: achar a
-    chave (repositorio, branch) custa dois `git rev-parse`, e o snapshot roda a
-    cada poucos segundos com o popup aberto.
+    The cache stores the cwd that produced each entry precisely for this:
+    finding the (repository, branch) key costs two `git rev-parse` calls, and
+    the snapshot runs every few seconds while the popup is open.
     """
     mapa = {}
-    for chave, entrada in cache.items():
-        if chave.startswith("_") or not isinstance(entrada, dict):
+    for key, entry in cache.items():
+        if key.startswith("_") or not isinstance(entry, dict):
             continue
-        cwd = entrada.get("cwd")
+        cwd = entry.get("cwd")
         if cwd:
-            mapa[cwd] = entrada
+            mapa[cwd] = entry
     return mapa
 
 
-def montar_snapshot():
-    resultado, erro = herdr("api", "snapshot")
-    if erro:
-        return (None, erro)
+def build_snapshot():
+    resultado, err = herdr("api", "snapshot")
+    if err:
+        return (None, err)
 
     instantaneo = (resultado or {}).get("snapshot") or {}
-    abas = rotulos_de_aba(instantaneo)
-    cache = ler_json(caminho_pr())
-    prs = prs_por_cwd(cache)
+    tabs = tab_labels(instantaneo)
+    cache = read_json(pr_cache_path())
+    prs = prs_by_cwd(cache)
 
-    linhas = [linha_de_agente(a, abas, prs) for a in instantaneo.get("agents") or []]
-    linhas.sort(key=lambda l: (numeros(l["workspace_id"]), numeros(l["tab_id"]), numeros(l["pane_id"])))
+    lines = [agent_row(a, tabs, prs) for a in instantaneo.get("agents") or []]
+    lines.sort(key=lambda l: (numbers_in(l["workspace_id"]), numbers_in(l["tab_id"]), numbers_in(l["pane_id"])))
 
-    contagens = {chave: 0 for chave in STATUS}
-    for linha in linhas:
-        contagens[linha["status"]] += 1
-    contagens["total"] = len(linhas)
-    contagens["ocioso"] = contagens["idle"] + contagens["done"]
+    counts = {key: 0 for key in STATUSES}
+    for line in lines:
+        counts[line["status"]] += 1
+    counts["total"] = len(lines)
+    counts["ocioso"] = counts["idle"] + counts["done"]
 
     gh = cache.get("_gh")
     return (
         {
             "version": str(instantaneo.get("version") or ""),
-            "counts": contagens,
-            "rows": linhas,
+            "counts": counts,
+            "rows": lines,
             "gh": str(gh.get("state")) if isinstance(gh, dict) else "",
         },
         "",
     )
 
 
-# ---------------------------------------------------------------- alvo padrao
+# ----------------------------------------------------------- default target
 
 
-def resolver_padrao(linhas):
-    """Qual linha o campo de texto usa.
+def resolve_default(lines):
+    """Which row the text field uses.
 
-    Casa pelo pane_id, e como segunda tentativa pelo cwd. Um pane movido para
-    outro workspace ganha um pane_id novo, e o alvo padrao nao pode se perder
-    numa reorganizacao de layout -- e o mesmo agente, no mesmo projeto.
+    Matches on pane_id, and as a second try on cwd. A pane moved to another
+    workspace gets a new pane_id, and the default target must not be lost in a
+    layout reshuffle -- it is the same agent, in the same project.
     """
-    gravado = ler_json(caminho_padrao(), teto=64 * 1024)
-    pane = str(gravado.get("pane_id") or "")
-    cwd = str(gravado.get("cwd") or "")
+    saved = read_json(default_path(), teto=64 * 1024)
+    pane = str(saved.get("pane_id") or "")
+    cwd = str(saved.get("cwd") or "")
 
     if not pane and not cwd:
-        return ("", "vazio")
+        return ("", "empty")
 
-    for linha in linhas:
-        if linha["pane_id"] == pane:
-            return (linha["pane_id"], "pane")
-    for linha in linhas:
-        if cwd and linha["cwd"] == cwd:
-            return (linha["pane_id"], "cwd")
+    for line in lines:
+        if line["pane_id"] == pane:
+            return (line["pane_id"], "pane")
+    for line in lines:
+        if cwd and line["cwd"] == cwd:
+            return (line["pane_id"], "cwd")
 
     return ("", "morto")
 
 
-# ------------------------------------------------------------ janela do herdr
+# ------------------------------------------------------------ herdr window
 
 
 def cmdline(pid):
     try:
-        with open("/proc/%d/cmdline" % pid, "rb") as arquivo:
-            bruto = arquivo.read(8192)
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read(8192)
     except OSError:
         return []
-    return [parte.decode("utf-8", "replace") for parte in bruto.split(b"\0") if parte]
+    return [parte.decode("utf-8", "replace") for parte in raw.split(b"\0") if parte]
 
 
 def ppid(pid):
     try:
-        with open("/proc/%d/stat" % pid, "rb") as arquivo:
-            bruto = arquivo.read(4096).decode("utf-8", "replace")
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            raw = fh.read(4096).decode("utf-8", "replace")
     except OSError:
         return 0
-    # comm vem entre parenteses e pode conter espacos e parenteses; o unico
-    # corte seguro e depois do ultimo ")".
-    fim = bruto.rfind(")")
-    if fim < 0:
+    # comm comes in parentheses and can contain spaces and parentheses; the only
+    # safe cut is after the last ")".
+    end = raw.rfind(")")
+    if end < 0:
         return 0
-    campos = bruto[fim + 2:].split()
+    campos = raw[end + 2:].split()
     try:
         return int(campos[1])
     except (IndexError, ValueError):
         return 0
 
 
-def valores(args, nome):
-    """Todos os valores de uma opcao repetida: --remote a --remote b."""
-    saida = []
-    for indice, arg in enumerate(args):
-        if arg == nome and indice + 1 < len(args):
-            saida.append(args[indice + 1])
-    return saida
+def values_of(args, name):
+    """Todos os values_of de uma option repetida: --remote a --remote b."""
+    out = []
+    for index, arg in enumerate(args):
+        if arg == name and index + 1 < len(args):
+            out.append(args[index + 1])
+    return out
 
 
-def opcao(resto, nome):
-    """Valor de "--nome valor" ou "--nome=valor" numa lista de argumentos."""
-    for indice, arg in enumerate(resto):
-        if arg == nome and indice + 1 < len(resto):
-            return resto[indice + 1]
-        if arg.startswith(nome + "="):
+def option(rest, name):
+    """Valor de "--name value" ou "--name=value" numa lista de argumentos."""
+    for index, arg in enumerate(rest):
+        if arg == name and index + 1 < len(rest):
+            return rest[index + 1]
+        if arg.startswith(name + "="):
             return arg.split("=", 1)[1]
     return None
 
 
-# Opcoes do ssh que consomem o argumento seguinte. Sem essa lista, o "yes" de
-# um "-o BatchMode=yes" passaria por nome de maquina.
-SSH_COM_VALOR = frozenset(
+# ssh options that consume the next argument. Without this list, the "yes" of
+# an "-o BatchMode=yes" would pass for a machine name.
+SSH_TAKES_VALUE = frozenset(
     "-b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w".split()
 )
 
 
-def alvo_do_ssh(argv):
-    """(sessao, maquina) de um `ssh [opcoes] maquina .../herdr [--session x]`."""
-    maquina = ""
-    resto = []
+def ssh_target(argv):
+    """(sessao, machine) de um `ssh [options] machine .../herdr [--session x]`."""
+    machine = ""
+    rest = []
     pular = False
 
-    for indice, arg in enumerate(argv[1:], start=1):
+    for index, arg in enumerate(argv[1:], start=1):
         if pular:
             pular = False
             continue
-        if arg in SSH_COM_VALOR:
+        if arg in SSH_TAKES_VALUE:
             pular = True
             continue
         if arg.startswith("-"):
             continue
-        if not maquina:
-            maquina = arg
+        if not machine:
+            machine = arg
             continue
-        # Primeiro argumento depois da maquina: o comando remoto. So interessa
-        # se for o herdr -- um `ssh maquina htop` nao e janela de sessao.
+        # First argument after the machine: the remote command. It only matters if it
+        # is herdr -- an `ssh machine htop` is not a session window.
         if os.path.basename(arg) != "herdr":
             return None
-        resto = argv[indice + 1:]
+        rest = argv[index + 1:]
         break
     else:
-        # Saiu sem achar comando nenhum: `ssh maquina` abre um shell, nao o Herdr.
+        # Ran out without finding a command: `ssh machine` opens a shell, not Herdr.
         return None
 
-    return (opcao(resto, "--session") or SESSAO_PADRAO, maquina) if maquina else None
+    return (option(rest, "--session") or DEFAULT_SESSION, machine) if machine else None
 
 
-def alvo_do_cliente(argv):
-    """(sessao, remoto) de um cliente do Herdr, ou None se o processo nao for um.
+def client_target(argv):
+    """(session, remote) of a Herdr client, or None when the process is not one.
 
-    Tres formas contam como janela desta sessao:
+    Three shapes count as a window of this session:
 
-      herdr                       o cliente local
-      herdr --remote alvo         o cliente daqui, atracado la
-      ssh [-t] alvo .../herdr     o cliente de la, que e o que este widget abre
+      herdr                      the local client
+      herdr --remote target      the client from here, attached over there
+      ssh [-t] target .../herdr  the client from over there, which this
+                                 widget opens
 
-    O servidor nao tem janela e sai fora. Ignorar qualquer uma das outras faria
-    o widget abrir um terminal novo em cima de um que ja esta ali.
+    The server has no window and drops out. Ignoring any of the others would
+    make the widget open a new terminal on top of one already sitting there.
     """
     if not argv:
         return None
 
     if os.path.basename(argv[0]) == "ssh":
-        return alvo_do_ssh(argv)
+        return ssh_target(argv)
 
     if os.path.basename(argv[0]) != "herdr":
         return None
 
-    resto = argv[1:]
-    if "server" in resto:
+    rest = argv[1:]
+    if "server" in rest:
         return None
 
-    sessao = opcao(resto, "--session")
+    sessao = option(rest, "--session")
     if sessao is None:
-        for indice, arg in enumerate(resto):
-            if arg == "attach" and indice > 0 and resto[indice - 1] == "session" and indice + 1 < len(resto):
-                sessao = resto[indice + 1]
+        for index, arg in enumerate(rest):
+            if arg == "attach" and index > 0 and rest[index - 1] == "session" and index + 1 < len(rest):
+                sessao = rest[index + 1]
                 break
-    # "--remote-keybindings" nao e "--remote"; opcao() casa o nome inteiro.
-    return (sessao or SESSAO_PADRAO, opcao(resto, "--remote") or "")
+    # "--remote-keybindings" is not "--remote"; option() matches the whole name.
+    return (sessao or DEFAULT_SESSION, option(rest, "--remote") or "")
 
 
-def pids_de_cliente():
+def client_pids():
     encontrados = []
     try:
-        entradas = os.listdir("/proc")
+        entries = os.listdir("/proc")
     except OSError:
         return encontrados
 
-    for entrada in entradas:
-        if entrada.isdigit() and alvo_do_cliente(cmdline(int(entrada))) == (SESSAO, remoto()):
-            encontrados.append(int(entrada))
+    for entry in entries:
+        if entry.isdigit() and client_target(cmdline(int(entry))) == (SESSION, remote()):
+            encontrados.append(int(entry))
     return encontrados
 
 
-def janela_do_cliente():
-    """Endereco da janela do Hyprland que hospeda um cliente desta sessao.
+def client_window():
+    """Address of the Hyprland window hosting a client of this session.
 
-    O cliente do Herdr e neto do emulador de terminal (terminal -> shell ->
-    herdr), entao a ligacao vem de subir a cadeia de ppid ate cair num pid que
-    o compositor conheca. Isso vale para qualquer terminal, o que casar por
-    class nao faria, e nao se deixa enganar por uma janela que so ficou com o
-    titulo "herdr" depois que o herdr dela morreu. Um terminal em modo
-    servidor, com uma unica janela para todas as abas, e o caso que isso nao
-    resolve.
+    The Herdr client is the terminal emulator's grandchild (terminal -> shell
+    -> herdr), so the link comes from walking the ppid chain until it lands on
+    a pid the compositor knows. That holds for any terminal, which matching on
+    class would not, and it is not fooled by a window that merely kept the
+    title "herdr" after its herdr died. A terminal in server mode, with a
+    single window for every tab, is the case this does not solve.
     """
-    codigo, saida, _ = rodar(["hyprctl", "-j", "clients"], TIMEOUT_HYPR)
-    janelas = json_de(saida) if codigo == 0 else None
-    if not isinstance(janelas, list):
+    code, out, _ = run(["hyprctl", "-j", "clients"], TIMEOUT_HYPR)
+    windows = json_from(out) if code == 0 else None
+    if not isinstance(windows, list):
         return ""
 
-    por_pid = {}
-    for janela in janelas:
+    by_pid = {}
+    for janela in windows:
         pid = janela.get("pid")
         if isinstance(pid, int) and pid > 0 and janela.get("mapped") is not False:
-            por_pid.setdefault(pid, janela)
+            by_pid.setdefault(pid, janela)
 
-    candidatas = []
-    for pid in pids_de_cliente():
-        atual = pid
+    candidates = []
+    for pid in client_pids():
+        current = pid
         for _ in range(20):
-            if atual in por_pid:
-                candidatas.append(por_pid[atual])
+            if current in by_pid:
+                candidates.append(by_pid[current])
                 break
-            pai = ppid(atual)
-            if pai <= 1 or pai == atual:
+            parent = ppid(current)
+            if parent <= 1 or parent == current:
                 break
-            atual = pai
+            current = parent
 
-    if not candidatas:
+    if not candidates:
         return ""
 
-    # focusHistoryID cresce com o tempo desde o ultimo foco: 0 e a janela atual.
-    # Com mais de um cliente aberto, a que voce usou por ultimo e a que quer.
-    candidatas.sort(key=lambda janela: janela.get("focusHistoryID", 1 << 30))
-    return str(candidatas[0].get("address") or "")
+    # focusHistoryID grows with time since last focus: 0 is the current window.
+    # With more than one client open, the one you used last is the one you want.
+    candidates.sort(key=lambda janela: janela.get("focusHistoryID", 1 << 30))
+    return str(candidates[0].get("address") or "")
 
 
 # ----------------------------------------------------------------------- prs
 
 
-def estado_do_gh():
-    codigo, _, _ = rodar(["gh", "auth", "status"], TIMEOUT_GH)
-    if codigo == 127:
+def gh_state():
+    code, _, _ = run(["gh", "auth", "status"], TIMEOUT_GH)
+    if code == 127:
         return "missing"
-    return "ok" if codigo == 0 else "unauthenticated"
+    return "ok" if code == 0 else "unauthenticated"
 
 
-def repo_e_branch(cwd):
+def repo_and_branch(cwd):
     if not cwd or not os.path.isdir(cwd):
         return ("", "")
-    codigo, raiz, _ = rodar(["git", "-C", cwd, "rev-parse", "--show-toplevel"], TIMEOUT_GIT)
-    if codigo != 0:
+    code, root_, _ = run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], TIMEOUT_GIT)
+    if code != 0:
         return ("", "")
-    codigo, branch, _ = rodar(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], TIMEOUT_GIT)
-    if codigo != 0:
+    code, branch, _ = run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], TIMEOUT_GIT)
+    if code != 0:
         return ("", "")
-    raiz, branch = raiz.strip(), branch.strip()
-    return (raiz, branch) if raiz and branch and branch != "HEAD" else ("", "")
+    root_, branch = root_.strip(), branch.strip()
+    return (root_, branch) if root_ and branch and branch != "HEAD" else ("", "")
 
 
-def reivindicar(cache, chave, cwd):
-    """Faz `chave` ser a unica entrada que responde por `cwd`.
+def claim_cwd(cache, key, cwd):
+    """Makes `key` the only entry answering for `cwd`.
 
-    Trocar de branch dentro do mesmo diretorio cria uma segunda entrada com o
-    mesmo cwd, e o snapshot devolveria a primeira que achasse -- o PR do branch
-    anterior, num numero que parece certo e nao e.
+    Switching branch inside the same directory creates a second entry with the
+    same cwd, and the snapshot would return whichever it found first -- the
+    previous branch's PR, in a number that looks right and is not.
     """
-    for outra, entrada in cache.items():
-        if outra != chave and isinstance(entrada, dict) and entrada.get("cwd") == cwd:
-            entrada.pop("cwd", None)
-    cache[chave]["cwd"] = cwd
+    for outra, entry in cache.items():
+        if outra != key and isinstance(entry, dict) and entry.get("cwd") == cwd:
+            entry.pop("cwd", None)
+    cache[key]["cwd"] = cwd
 
 
-def podar(cache):
-    if len(cache) <= MAX_ENTRADAS_CACHE:
+def prune(cache):
+    if len(cache) <= MAX_CACHE_ENTRIES:
         return cache
-    entradas = [(c, e) for c, e in cache.items() if not c.startswith("_") and isinstance(e, dict)]
-    entradas.sort(key=lambda par: float(par[1].get("ts") or 0), reverse=True)
-    podado = dict(entradas[:MAX_ENTRADAS_CACHE])
+    entries = [(c, e) for c, e in cache.items() if not c.startswith("_") and isinstance(e, dict)]
+    entries.sort(key=lambda par: float(par[1].get("ts") or 0), reverse=True)
+    podado = dict(entries[:MAX_CACHE_ENTRIES])
     if "_gh" in cache:
         podado["_gh"] = cache["_gh"]
     return podado
 
 
-# ------------------------------------------------------------------ comandos
+# ------------------------------------------------------------------ commands
 
 
 def cmd_snapshot(args):
-    dados, erro = montar_snapshot()
-    if erro:
-        vazio = {chave: 0 for chave in list(STATUS) + ["total", "ocioso"]}
-        falhar(erro, counts=vazio, rows=[], default="", default_state="vazio", gh="")
+    data, err = build_snapshot()
+    if err:
+        empty = {key: 0 for key in list(STATUSES) + ["total", "ocioso"]}
+        fail(err, counts=empty, rows=[], default="", default_state="empty", gh="")
 
-    alvo, motivo = resolver_padrao(dados["rows"])
-    for linha in dados["rows"]:
-        linha["is_default"] = linha["pane_id"] == alvo
+    target, reason = resolve_default(data["rows"])
+    for line in data["rows"]:
+        line["is_default"] = line["pane_id"] == target
 
     if "--messages" in args:
-        # Tres falas para o alvo do campo e uma para o resto: e nele que voce
-        # vai responder, e para responder precisa da conversa, nao da manchete.
-        for linha in dados["rows"][:MAX_LEITURAS]:
-            falas, forma = ler_terminal(
-                linha["pane_id"],
-                3 if linha["is_default"] else 1,
-                linha["status"] == "blocked",
+        # Three messages for the field's target and one for the rest: it is the one
+        # you will reply to, and replying needs the conversation, not the headline.
+        for line in data["rows"][:MAX_READS]:
+            messages, forma = read_terminal(
+                line["pane_id"],
+                3 if line["is_default"] else 1,
+                line["status"] == "blocked",
             )
-            linha["messages"] = falas
-            linha["question"] = forma["question"]
-            linha["options"] = forma["options"]
-            linha["context"] = forma["context"]
+            line["messages"] = messages
+            line["question"] = forma["question"]
+            line["options"] = forma["options"]
+            line["context"] = forma["context"]
 
-    responder(default=alvo, default_state=motivo, **dados)
+    reply(default=target, default_state=reason, **data)
 
 
 def cmd_focus(args):
     if not args:
-        falhar("focus precisa de um pane_id")
+        fail("focus needs a pane_id")
 
-    # O foco vai para o servidor antes de a janela existir, de proposito:
-    # quando nao ha cliente aberto, o terminal novo ja sobe renderizando a aba
-    # certa, e nao ha corrida entre o attach e um focus que chegaria depois.
-    _, erro = herdr("agent", "focus", args[0])
-    if erro:
-        falhar(erro)
+    # Focus goes to the server before the window exists, deliberately: when no
+    # client is open, the new terminal comes up already rendering the right tab,
+    # and there is no race between the attach and a focus arriving after it.
+    _, err = herdr("agent", "focus", args[0])
+    if err:
+        fail(err)
 
-    endereco = janela_do_cliente()
+    endereco = client_window()
     if endereco:
-        # Este Hyprland interpreta o argumento do dispatch como Lua; a forma
-        # antiga "focuswindow address:0x..." vira erro de sintaxe.
-        rodar(
+        # This Hyprland reads the dispatch argument as Lua; the old
+        # "focuswindow address:0x..." form becomes a syntax error.
+        run(
             ["hyprctl", "dispatch", 'hl.dsp.focus({ window = "address:%s" })' % endereco],
             TIMEOUT_HYPR,
         )
-        registrar("focus", pane=args[0], janela=endereco)
-        responder(action="focused", address=endereco)
+        log_event("focus", pane=args[0], janela=endereco)
+        reply(action="focused", address=endereco)
 
-    if remoto():
-        # `ssh -t` e nao `herdr --remote`: aquele roda o cliente de la, que e da
-        # mesma versao do servidor de la, entao nao ha o que comparar. O
-        # `--remote` traz o cliente daqui, e quando as versoes divergem ele abre
-        # num "[y/N] Install ... and stop the remote server now?" -- um terminal
-        # que para numa pergunta nao e "ir ate o agente". Alinhar as versoes
-        # resolveria, mas nem sempre da: um build com self-update desativado
-        # nunca vai alinhar, e ai a pergunta seria para sempre.
+    if remote():
+        # `ssh -t` rather than `herdr --remote`: the former runs the client from over
+        # there, which is the same version as the server over there, so there is
+        # nothing to compare. `--remote` brings the client from here, and when the
+        # versions differ it opens on a "[y/N] Install ... and stop the remote server
+        # now?" -- a terminal stopping on a question is not "go to the agent".
+        # Aligning versions would also fix it, but not always: a build with
+        # self-update disabled will never align, and then the question is forever.
         #
-        # O preco e o que o --remote gerencia sozinho: keepalive, multiplexacao
-        # e o paste de imagem. Quem quiser isso abre `herdr --remote` a mao --
-        # a janela e reconhecida do mesmo jeito.
-        comando_remoto = [herdr_remoto()]
-        if SESSAO != SESSAO_PADRAO:
-            comando_remoto += ["--session", SESSAO]
-        lancamento = ["omarchy-launch-terminal", "ssh", "-t", remoto()] + comando_remoto
+        # The price is what --remote manages on its own: keepalive, multiplexing and
+        # image paste. Whoever wants those opens `herdr --remote` by hand -- the
+        # window is recognised just the same.
+        comando_remoto = [remote_herdr()]
+        if SESSION != DEFAULT_SESSION:
+            comando_remoto += ["--session", SESSION]
+        launch = ["omarchy-launch-terminal", "ssh", "-t", remote()] + comando_remoto
     else:
-        lancamento = ["omarchy-launch-terminal", "herdr"]
-        if SESSAO != SESSAO_PADRAO:
-            lancamento += ["--session", SESSAO]
-    # Solto, e nao esperado: abrir terminal e pedir para uma janela existir, nao
-    # rodar um comando cuja saida interessa. O `omarchy-launch-terminal` passa
-    # por uwsm e leva o tempo que levar; esperar por ele so daria um timeout que
-    # mata o lancamento no meio -- que foi exatamente o que acontecia.
+        launch = ["omarchy-launch-terminal", "herdr"]
+        if SESSION != DEFAULT_SESSION:
+            launch += ["--session", SESSION]
+    # Detached, not awaited: opening a terminal is asking for a window to exist,
+    # not running a command whose output matters. `omarchy-launch-terminal` goes
+    # through uwsm and takes as long as it takes; waiting on it only produced a
+    # timeout that killed the launch halfway -- which is exactly what happened.
     try:
-        with open(LOG, "a") as saida:
+        with open(LOG, "a") as out:
             subprocess.Popen(
-                lancamento,
+                launch,
                 stdin=subprocess.DEVNULL,
-                stdout=saida,
-                stderr=saida,
+                stdout=out,
+                stderr=out,
                 start_new_session=True,
             )
-    except OSError as erro:
-        falhar("nao consegui abrir o terminal: %s" % erro, action="launch")
+    except OSError as err:
+        fail("could not open the terminal: %s" % err, action="launch")
 
-    registrar("terminal-aberto", pane=args[0], comando=" ".join(lancamento))
-    responder(action="launched")
+    log_event("terminal-aberto", pane=args[0], command=" ".join(launch))
+    reply(action="launched")
 
 
 def cmd_answer(args):
-    """Escolhe uma alternativa do dialogo, do jeito que aquele dialogo aceita.
+    """Chooses a dialog option, the way that dialog accepts it.
 
-    Recebe a posicao e o rotulo que estavam na tela quando voce clicou, e
-    reconfere os dois no buffer de agora antes de apertar qualquer tecla. Um
-    dialogo pode ter mudado entre o desenho da lista e o clique, e mandar
-    "para baixo, para baixo, Enter" num dialogo diferente aprova outra coisa.
+    Takes the position and the label that were on screen when you clicked, and
+    rechecks both against the current buffer before pressing any key. A dialog
+    can have changed between drawing the list and the click, and sending
+    "down, down, Enter" into a different dialog approves something else.
     """
-    com_texto = "--with-text" in args
+    with_text = "--with-text" in args
     args = [a for a in args if a != "--with-text"]
 
     if len(args) < 2:
-        falhar("answer precisa de um pane_id e de uma posição")
+        fail("answer needs a pane_id and a position")
 
     try:
-        posicao = int(args[1])
+        position = int(args[1])
     except ValueError:
-        falhar("posição inválida: %s" % args[1][:16])
-    esperado = args[2] if len(args) > 2 else ""
+        fail("invalid position: %s" % args[1][:16])
+    expected = args[2] if len(args) > 2 else ""
 
-    bruto, erro = herdr_texto(
-        "agent", "read", args[0], "--source", "detection", "--lines", str(LINHAS_BUFFER)
+    raw, err = herdr_text(
+        "agent", "read", args[0], "--source", "detection", "--lines", str(BUFFER_LINES)
     )
-    if erro:
-        falhar(erro)
+    if err:
+        fail(err)
 
-    opcoes = formulario(bruto)["options"]
-    if not 0 <= posicao < len(opcoes):
-        falhar("o diálogo mudou — abra o agente e responda por lá")
+    options = dialog_form(raw)["options"]
+    if not 0 <= position < len(options):
+        fail("the dialog changed — open the agent and answer there")
 
-    escolhida = opcoes[posicao]
-    if esperado and escolhida["label"] != esperado:
-        falhar("o diálogo mudou — agora essa opção é “%s”" % escolhida["label"][:60])
+    chosen = options[position]
+    if expected and chosen["label"] != expected:
+        fail("the dialog changed — that option is now “%s”" % chosen["label"][:60])
 
-    if escolhida["key"]:
-        # Alternativa numerada: o numero e a propria tecla, como voce digitaria.
-        teclas = [escolhida["key"]]
+    if chosen["key"]:
+        # Numbered option: the number is the key itself, as you would type it.
+        keys = [chosen["key"]]
     else:
-        # Lista com cursor: anda ate a linha e confirma.
-        atual = next((i for i, o in enumerate(opcoes) if o["selected"]), 0)
-        passo = "down" if posicao > atual else "up"
-        teclas = [passo] * abs(posicao - atual) + ["enter"]
+        # Cursor list: walk to the line and confirm.
+        current = next((i for i, o in enumerate(options) if o["selected"]), 0)
+        step = "down" if position > current else "up"
+        keys = [step] * abs(position - current) + ["enter"]
 
-    _, erro = herdr("agent", "send-keys", args[0], *teclas)
-    if erro:
-        falhar(erro)
+    _, err = herdr("agent", "send-keys", args[0], *keys)
+    if err:
+        fail(err)
 
-    if not com_texto:
-        registrar("respondeu", pane=args[0], opcao=escolhida["label"][:60])
-        responder(answered=escolhida["label"], keys=teclas, pane_id=args[0])
+    if not with_text:
+        log_event("respondeu", pane=args[0], option=chosen["label"][:60])
+        reply(answered=chosen["label"], keys=keys, pane_id=args[0])
 
-    texto = sys.stdin.readline(MAX_TEXTO).strip()
-    if not texto:
-        falhar("escolhi “%s”, mas não veio texto para escrever" % escolhida["label"][:60])
+    text = sys.stdin.readline(MAX_TEXT).strip()
+    if not text:
+        fail("chose “%s”, but no text came to write" % chosen["label"][:60])
 
-    # A alternativa foi escolhida; agora o agente esta desenhando o campo. Sem
-    # esperar isso, o texto seria digitado no dialogo que ainda esta na tela --
-    # e as letras viram atalho de menu em vez de virar frase.
-    if not esperou_reagir(args[0], bruto):
-        falhar("escolhi “%s”, mas a tela não mudou a tempo — o texto não foi enviado"
-               % escolhida["label"][:60])
+    # The option was chosen; the agent is now drawing the field. Without waiting
+    # for that, the text would be typed into the dialog still on screen -- and
+    # letters become menu shortcuts instead of a sentence.
+    if not waited_for_redraw(args[0], raw):
+        fail("chose “%s”, but the screen did not change in time — the text was not sent"
+               % chosen["label"][:60])
 
-    _, erro = herdr("pane", "send-text", args[0], texto)
-    if erro:
-        falhar(erro)
-    _, erro = herdr("pane", "send-keys", args[0], "enter")
-    if erro:
-        falhar(erro)
+    _, err = herdr("pane", "send-text", args[0], text)
+    if err:
+        fail(err)
+    _, err = herdr("pane", "send-keys", args[0], "enter")
+    if err:
+        fail(err)
 
-    registrar("respondeu-escrevendo", pane=args[0], opcao=escolhida["label"][:60])
-    responder(answered=escolhida["label"], keys=teclas, wrote=True, pane_id=args[0])
+    log_event("respondeu-escrevendo", pane=args[0], option=chosen["label"][:60])
+    reply(answered=chosen["label"], keys=keys, wrote=True, pane_id=args[0])
 
 
-def esperou_reagir(pane, antes, limite_ms=3000, passo_ms=150):
-    """Espera a tela do agente mudar depois de uma tecla.
+def waited_for_redraw(pane, antes, limite_ms=3000, passo_ms=150):
+    """Waits for the agent's screen to change after a keypress.
 
-    O sinal e o buffer inteiro mudar, e nao o desaparecimento das alternativas:
-    ha telas que mantem a lista e abrem o campo ao lado. Um agente bloqueado
-    tem tela parada, entao qualquer mudanca ali e a resposta a tecla -- o que
-    nao valeria para um agente trabalhando, cujo spinner muda sozinho.
+    The signal is the whole buffer changing, not the options disappearing:
+    some screens keep the list and open the field beside it. A stopped agent
+    has a still screen, so any change there is the answer to the key -- which
+    would not hold for a working agent, whose spinner changes on its own.
     """
-    gasto = 0
-    while gasto < limite_ms:
+    spent = 0
+    while spent < limite_ms:
         time.sleep(passo_ms / 1000.0)
-        gasto += passo_ms
-        agora, erro = herdr_texto(
-            "agent", "read", pane, "--source", "detection", "--lines", str(LINHAS_BUFFER)
+        spent += passo_ms
+        now, err = herdr_text(
+            "agent", "read", pane, "--source", "detection", "--lines", str(BUFFER_LINES)
         )
-        if erro:
+        if err:
             return False
-        if agora != antes:
+        if now != antes:
             return True
     return False
 
 
 def cmd_send(args):
     if not args:
-        falhar("send precisa de um pane_id")
+        fail("send needs a pane_id")
 
-    texto = sys.stdin.readline(MAX_TEXTO).strip()
-    if not texto:
-        falhar("nada para mandar")
+    text = sys.stdin.readline(MAX_TEXT).strip()
+    if not text:
+        fail("nothing to send")
 
-    resultado, erro = herdr("agent", "prompt", args[0], texto)
-    if not erro:
-        registrar("prompt", pane=args[0])
-        responder(sent=True, pane_id=args[0], result=resultado)
+    resultado, err = herdr("agent", "prompt", args[0], text)
+    if not err:
+        log_event("prompt", pane=args[0])
+        reply(sent=True, pane_id=args[0], result=resultado)
 
-    # Um agente parado num dialogo recusa prompt com agent_blocked, e nao ha
-    # como testar antes sem uma corrida: entre o snapshot e o envio ele pode ter
-    # travado. Entao o caminho e tentar, e so destravar quando levar o nao.
-    if "blocked" not in erro.lower():
-        falhar(erro)
+    # An agent stopped in a dialog refuses a prompt with agent_blocked, and there
+    # is no way to test first without a race: between the snapshot and the send it
+    # may have stopped. So the path is to try, and only unblock on the refusal.
+    if "blocked" not in err.lower():
+        fail(err)
 
-    # Esc e a propria saida que o dialogo oferece -- o Claude Code rotula a
-    # ultima alternativa como "No, and tell Claude what to do differently
-    # (esc)". Recusa o que estava pedindo e devolve o prompt, que e exatamente
-    # o que "responder outra coisa" quer dizer.
+    # Esc is the way out the dialog itself offers -- Claude Code labels the last
+    # option "No, and tell Claude what to do differently (esc)". It refuses what
+    # was being asked and hands back the prompt, which is exactly what "reply
+    # something else" means.
     _, erro_esc = herdr("agent", "send-keys", args[0], "esc")
     if erro_esc:
-        falhar(erro_esc)
+        fail(erro_esc)
 
     _, erro_espera = herdr("agent", "wait", args[0], "--until", "idle", "--timeout", "4000")
     if erro_espera:
-        falhar("recusei o pedido, mas o agente não voltou ao prompt a tempo — o texto não foi enviado")
+        fail("refused the request, but the agent did not return to the prompt in time — the text was not sent")
 
-    resultado, erro = herdr("agent", "prompt", args[0], texto)
-    if erro:
-        falhar(erro)
+    resultado, err = herdr("agent", "prompt", args[0], text)
+    if err:
+        fail(err)
 
-    registrar("prompt-apos-recusa", pane=args[0])
-    responder(sent=True, pane_id=args[0], result=resultado, rejected=True)
+    log_event("prompt-apos-recusa", pane=args[0])
+    reply(sent=True, pane_id=args[0], result=resultado, rejected=True)
 
 
 def cmd_default(args):
     if not args:
-        falhar("default precisa de um pane_id ou de -")
+        fail("default needs a pane_id or -")
 
     if args[0] == "-":
-        gravar_json(caminho_padrao(), {})
-        responder(default="")
+        write_json(default_path(), {})
+        reply(default="")
 
-    dados, erro = montar_snapshot()
-    if erro:
-        falhar(erro)
+    data, err = build_snapshot()
+    if err:
+        fail(err)
 
-    for linha in dados["rows"]:
-        if linha["pane_id"] == args[0]:
-            gravar_json(caminho_padrao(), {"pane_id": linha["pane_id"], "cwd": linha["cwd"]})
-            responder(default=linha["pane_id"])
+    for line in data["rows"]:
+        if line["pane_id"] == args[0]:
+            write_json(default_path(), {"pane_id": line["pane_id"], "cwd": line["cwd"]})
+            reply(default=line["pane_id"])
 
-    falhar("nao ha agente em %s" % args[0])
+    fail("no agent in %s" % args[0])
 
 
 def cmd_prs(_args):
-    # Um Herdr remoto tem os repositorios na outra ponta: os caminhos que ele
-    # devolve nao existem aqui, e rodar git neles daria numero de PR errado ou
-    # nenhum. Melhor nao ter coluna do que ter uma que mente.
-    if remoto():
-        responder(queried=0, gh="remote")
+    # A remote Herdr has its repositories on the other end: the paths it returns
+    # do not exist here, and running git on them would give the wrong PR number,
+    # or none. Better no column than one that lies.
+    if remote():
+        reply(queried=0, gh="remote")
 
-    dados, erro = montar_snapshot()
-    if erro:
-        falhar(erro)
+    data, err = build_snapshot()
+    if err:
+        fail(err)
 
-    cache = ler_json(caminho_pr())
-    agora = time.time()
+    cache = read_json(pr_cache_path())
+    now = time.time()
 
     gh = cache.get("_gh") if isinstance(cache.get("_gh"), dict) else {}
-    if agora - float(gh.get("ts") or 0) >= GH_TTL:
-        gh = {"state": estado_do_gh(), "ts": agora}
+    if now - float(gh.get("ts") or 0) >= GH_TTL:
+        gh = {"state": gh_state(), "ts": now}
         cache["_gh"] = gh
 
-    consultados = 0
-    for linha in dados["rows"]:
-        raiz, branch = repo_e_branch(linha["cwd"])
-        if not raiz:
+    queried = 0
+    for line in data["rows"]:
+        root_, branch = repo_and_branch(line["cwd"])
+        if not root_:
             continue
-        chave = "%s\n%s" % (raiz, branch)
+        key = "%s\n%s" % (root_, branch)
 
-        entrada = cache.get(chave)
-        if isinstance(entrada, dict):
-            ttl = PR_TTL if entrada.get("number") else PR_TTL_VAZIO
-            if agora - float(entrada.get("ts") or 0) < ttl:
-                # Mesmo fresca, a entrada precisa apontar para o cwd de agora:
-                # e por ele que o snapshot a encontra.
-                reivindicar(cache, chave, linha["cwd"])
+        entry = cache.get(key)
+        if isinstance(entry, dict):
+            ttl = PR_TTL if entry.get("number") else PR_TTL_EMPTY
+            if now - float(entry.get("ts") or 0) < ttl:
+                # Even when fresh, the entry has to point at the cwd of now: that is how the
+                # snapshot finds it.
+                claim_cwd(cache, key, line["cwd"])
                 continue
 
-        if consultados >= MAX_REPOS_POR_VEZ or gh.get("state") != "ok":
+        if queried >= MAX_REPOS_PER_RUN or gh.get("state") != "ok":
             break
-        consultados += 1
+        queried += 1
 
-        codigo, saida, _ = rodar(
+        code, out, _ = run(
             ["gh", "pr", "view", "--json", "number,url,title,state"],
             TIMEOUT_GH,
-            cwd=linha["cwd"],
+            cwd=line["cwd"],
         )
-        corpo = json_de(saida) if codigo == 0 else None
-        if not isinstance(corpo, dict):
-            corpo = {}
+        body = json_from(out) if code == 0 else None
+        if not isinstance(body, dict):
+            body = {}
 
-        cache[chave] = {
-            "ts": agora,
-            "number": int(corpo["number"]) if isinstance(corpo.get("number"), int) else 0,
-            "url": str(corpo.get("url") or ""),
-            "title": str(corpo.get("title") or ""),
-            "state": str(corpo.get("state") or ""),
+        cache[key] = {
+            "ts": now,
+            "number": int(body["number"]) if isinstance(body.get("number"), int) else 0,
+            "url": str(body.get("url") or ""),
+            "title": str(body.get("title") or ""),
+            "state": str(body.get("state") or ""),
         }
-        reivindicar(cache, chave, linha["cwd"])
+        claim_cwd(cache, key, line["cwd"])
 
-    gravar_json(caminho_pr(), podar(cache))
-    responder(queried=consultados, gh=gh.get("state") or "")
+    write_json(pr_cache_path(), prune(cache))
+    reply(queried=queried, gh=gh.get("state") or "")
 
 
-# ------------------------------------------------------------- configuracao
+# ------------------------------------------------------------ configuration
 
 
 SHELL_JSON = os.path.expanduser("~/.config/omarchy/shell.json")
 PLUGIN_ID = "otavio.quick-herdr"
 
 
-def minha_entrada():
-    """(secao, indice, entrada) desta instancia no shell.json.
+def my_entry():
+    """(section, index, entry) of this instance in shell.json.
 
-    O bar entrega ao widget so `bar`, `moduleName` e `settings` -- nao a
-    posicao dele na barra, que e o que o `setBarWidget` precisa. Entao ela e
-    reencontrada aqui: um plugin com allowMultiple pode ter varias entradas, e
-    o que distingue a minha das outras e justamente o `remote` que eu recebi.
+    The bar hands the widget only `bar`, `moduleName` and `settings` -- not its
+    position on the bar, which is what `setBarWidget` needs. So it is found
+    again here: a plugin with allowMultiple can have several entries, and what
+    tells mine apart from the others is exactly the `remote` I was given.
     """
-    config = ler_json(SHELL_JSON, teto=4 * 1024 * 1024)
+    config = read_json(SHELL_JSON, teto=4 * 1024 * 1024)
     layout = ((config.get("bar") or {}).get("layout") or {})
 
-    candidatas = []
-    for secao in ("left", "center", "right"):
-        for indice, entrada in enumerate(layout.get(secao) or []):
-            if isinstance(entrada, dict) and entrada.get("id") == PLUGIN_ID:
-                candidatas.append((secao, indice, entrada))
+    candidates = []
+    for section in ("left", "center", "right"):
+        for index, entry in enumerate(layout.get(section) or []):
+            if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
+                candidates.append((section, index, entry))
 
-    if not candidatas:
-        return (None, "esta instância não está no shell.json")
-    if len(candidatas) == 1:
-        return (candidatas[0], "")
+    if not candidates:
+        return (None, "this instance is not in shell.json")
+    if len(candidates) == 1:
+        return (candidates[0], "")
 
-    iguais = [c for c in candidatas if str(c[2].get("remote") or "") == remoto()]
-    if len(iguais) == 1:
-        return (iguais[0], "")
+    same = [c for c in candidates if str(c[2].get("remote") or "") == remote()]
+    if len(same) == 1:
+        return (same[0], "")
 
-    return (None, "há %d cópias deste widget com a mesma máquina — edite o shell.json" % len(candidatas))
+    return (None, "there are %d copies of this widget on the same machine — edit shell.json" % len(candidates))
 
 
 def cmd_config(args):
-    achado, erro = minha_entrada()
-    if erro:
-        falhar(erro)
-    secao, indice, entrada = achado
+    found, err = my_entry()
+    if err:
+        fail(err)
+    section, index, entry = found
 
     if not args or args[0] == "get":
-        responder(section=secao, index=indice, settings=entrada)
+        reply(section=section, index=index, settings=entry)
 
     if args[0] != "set" or len(args) < 3:
-        falhar("uso: config get | config set <chave> <valor> [--json]")
+        fail("usage: config get | config set <key> <value> [--json]")
 
-    chave, bruto = args[1], args[2]
-    # Com --json o valor ja vem estruturado: a lista de maquinas e o "esta
-    # maquina" nao sao texto, e mandar "[\"a\"]" como string gravaria a string.
+    key, raw = args[1], args[2]
+    # With --json the value arrives structured: the machine list and the "this
+    # machine" flag are not text, and sending "[\"a\"]" as a string would store
+    # the string.
     if "--json" in args[3:]:
-        valor = json_de(bruto)
-        if valor is None:
-            falhar("valor nao e JSON: %s" % bruto[:80])
+        value = json_from(raw)
+        if value is None:
+            fail("value is not JSON: %s" % raw[:80])
     else:
-        valor = bruto
-    placement = json.dumps({"section": secao, "index": indice})
+        value = raw
+    placement = json.dumps({"section": section, "index": index})
 
-    # Quem escreve o shell.json e o shell, e nao este processo: ele e o dono do
-    # arquivo e recarrega sozinho depois. Escrever por fora atropelaria uma
-    # gravacao concorrente dele.
-    codigo, saida, stderr = rodar(
-        ["omarchy-shell", "shell", "setBarWidget", PLUGIN_ID, chave, json.dumps(valor), placement],
+    # The shell writes shell.json, not this process: it owns the file and reloads
+    # on its own afterwards. Writing from outside would trample a concurrent
+    # write of its own.
+    code, out, stderr = run(
+        ["omarchy-shell", "shell", "setBarWidget", PLUGIN_ID, key, json.dumps(value), placement],
         TIMEOUT_HERDR,
     )
-    resposta = (saida or stderr).strip()
-    if codigo != 0 or resposta != "ok":
-        falhar(resposta or "setBarWidget falhou")
+    answer = (out or stderr).strip()
+    if code != 0 or answer != "ok":
+        fail(answer or "setBarWidget failed")
 
-    registrar("config", chave=chave, valor=valor)
-    responder(section=secao, index=indice, key=chave, value=valor)
-
-
-def resolve(nome):
-    """O nome curto chega a algum lugar? Sem MagicDNS no search, so o FQDN vai."""
-    return rodar(["getent", "hosts", nome], 3)[0] == 0
+    log_event("config", key=key, value=value)
+    reply(section=section, index=index, key=key, value=value)
 
 
-# ------------------------------------------------------- varias maquinas
+def resolves(name):
+    """O name short_ chega a algum lugar? Sem MagicDNS no search, so o FQDN vai."""
+    return run(["getent", "hosts", name], 3)[0] == 0
 
 
-def caminho_padrao_global():
-    """O alvo do campo e um so para todas as maquinas, entao mora fora do escopo."""
+# ------------------------------------------------------- several machines
+
+
+def global_default_path():
+    """O target do campo e um so para todas as machines, entao mora fora do scope."""
     return os.path.join(STATE_DIR, "default.json")
 
 
-def um_snapshot(alvo, com_mensagens):
-    """O estado de uma maquina, na thread dela.
+def one_snapshot(target, with_messages):
+    """One machine's state, on its own thread.
 
-    Roda no mesmo processo que as outras: o alvo mora num thread-local, entao
-    duas maquinas em paralelo nao se atrapalham. A versao anterior isolava com
-    um subprocesso por maquina, o que custava um interpretador Python inteiro
-    por maquina a cada atualizacao -- mais caro que o dado que ele buscava.
+    Runs in the same process as the others: the target lives in a thread-local,
+    so two machines in parallel do not trip over each other. The previous
+    version isolated with a subprocess per machine, which cost a whole Python
+    interpreter per machine on every refresh -- more than the data it fetched.
     """
-    usar_remoto(alvo)
-    dados, erro = montar_snapshot()
-    if erro:
-        return {"ok": False, "error": erro}
+    use_remote(target)
+    data, err = build_snapshot()
+    if err:
+        return {"ok": False, "error": err}
 
-    if com_mensagens:
-        # Tres falas para o alvo do campo e uma para o resto: e nele que voce
-        # vai responder, e para responder precisa da conversa, nao da manchete.
-        for linha in dados["rows"][:MAX_LEITURAS]:
-            # Sempre as quatro ultimas, e nao so a que vai aparecer: ler o
-            # terminal e uma chamada, e extrair quatro falas dela custa o mesmo
-            # que extrair uma. Assim expandir uma linha e instantaneo, em vez
-            # de uma ida e volta -- por SSH, uma ida e volta pela rede.
-            falas, forma = ler_terminal(linha["pane_id"], MAX_FALAS, linha["status"] == "blocked")
-            linha["messages"] = falas
-            linha["question"] = forma["question"]
-            linha["options"] = forma["options"]
-            linha["context"] = forma["context"]
+    if with_messages:
+        # Three messages for the field's target and one for the rest: it is the one
+        # you will reply to, and replying needs the conversation, not the headline.
+        for line in data["rows"][:MAX_READS]:
+            # Always the last four, not just the one that will show: reading the terminal
+            # is one call, and pulling four messages out of it costs the same as pulling
+            # one. So expanding a row is instant instead of a round trip -- over SSH, a
+            # round trip across the network.
+            messages, forma = read_terminal(line["pane_id"], MAX_MESSAGES, line["status"] == "blocked")
+            line["messages"] = messages
+            line["question"] = forma["question"]
+            line["options"] = forma["options"]
+            line["context"] = forma["context"]
 
-    dados["ok"] = True
-    return dados
+    data["ok"] = True
+    return data
 
 
 def cmd_all(args):
-    """Uma lista so, com os agentes de todas as maquinas ligadas.
+    """One single list, with the agents of every machine that is on.
 
-    As maquinas sao consultadas em paralelo: com quatro ligadas, esperar uma de
-    cada vez faria a barra andar no ritmo da mais lenta somada as outras.
+    Machines are queried in parallel: with four on, waiting for one at a time
+    would make the bar move at the speed of their sum.
     """
     import concurrent.futures
 
-    com_mensagens = "--messages" in args
-    alvos = valores(args, "--remote")
+    with_messages = "--messages" in args
+    targets = values_of(args, "--remote")
     if "--local" in args:
-        alvos.insert(0, "")
-    if not alvos:
-        alvos = [""]
+        targets.insert(0, "")
+    if not targets:
+        targets = [""]
 
-    if len(alvos) == 1:
-        # Uma maquina so nao paga thread nenhuma.
-        respostas = [(alvos[0], um_snapshot(alvos[0], com_mensagens))]
+    if len(targets) == 1:
+        # A single machine pays for no thread at all.
+        answers = [(targets[0], one_snapshot(targets[0], with_messages))]
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(alvos)) as piscina:
-            respostas = list(piscina.map(lambda a: (a, um_snapshot(a, com_mensagens)), alvos))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+            answers = list(pool.map(lambda a: (a, one_snapshot(a, with_messages)), targets))
 
-    linhas = []
-    maquinas = []
-    contagens = {chave: 0 for chave in list(STATUS) + ["total", "ocioso"]}
+    lines = []
+    machines = []
+    counts = {key: 0 for key in list(STATUSES) + ["total", "ocioso"]}
     gh = ""
 
-    for alvo, dados in respostas:
-        maquinas.append({
-            "target": alvo,
-            "ok": dados.get("ok") is not False,
-            "error": str(dados.get("error") or ""),
+    for target, data in answers:
+        machines.append({
+            "target": target,
+            "ok": data.get("ok") is not False,
+            "error": str(data.get("error") or ""),
         })
-        if dados.get("ok") is False:
+        if data.get("ok") is False:
             continue
-        for chave, valor in (dados.get("counts") or {}).items():
-            if chave in contagens:
-                contagens[chave] += int(valor or 0)
-        for linha in dados.get("rows") or []:
-            linha["machine"] = alvo
-            linhas.append(linha)
-        # A coluna de PR e local por natureza; um remoto responde "remote" e nao
-        # tem o que dizer sobre repositorios daqui.
-        if not alvo:
-            gh = str(dados.get("gh") or "")
+        for key, value in (data.get("counts") or {}).items():
+            if key in counts:
+                counts[key] += int(value or 0)
+        for line in data.get("rows") or []:
+            line["machine"] = target
+            lines.append(line)
+        # The PR column is local by nature; a remote answers "remote" and has nothing
+        # to say about repositories over here.
+        if not target:
+            gh = str(data.get("gh") or "")
 
-    alvo_padrao, motivo = resolver_padrao_global(linhas)
-    for linha in linhas:
-        linha["is_default"] = (linha["machine"], linha["pane_id"]) == alvo_padrao
+    alvo_padrao, reason = resolve_global_default(lines)
+    for line in lines:
+        line["is_default"] = (line["machine"], line["pane_id"]) == alvo_padrao
 
-    responder(
-        counts=contagens,
-        rows=linhas,
-        machines=maquinas,
+    reply(
+        counts=counts,
+        rows=lines,
+        machines=machines,
         gh=gh,
         default=alvo_padrao[1],
         default_machine=alvo_padrao[0],
-        default_state=motivo,
+        default_state=reason,
     )
 
 
-def resolver_padrao_global(linhas):
-    """(maquina, pane) do alvo do campo, casando por pane e depois por cwd."""
-    gravado = ler_json(caminho_padrao_global(), teto=64 * 1024)
-    maquina = str(gravado.get("machine") or "")
-    pane = str(gravado.get("pane_id") or "")
-    cwd = str(gravado.get("cwd") or "")
+def resolve_global_default(lines):
+    """(machine, pane) do target do campo, casando por pane e depois por cwd."""
+    saved = read_json(global_default_path(), teto=64 * 1024)
+    machine = str(saved.get("machine") or "")
+    pane = str(saved.get("pane_id") or "")
+    cwd = str(saved.get("cwd") or "")
 
     if not pane and not cwd:
-        return (("", ""), "vazio")
+        return (("", ""), "empty")
 
-    for linha in linhas:
-        if linha["machine"] == maquina and linha["pane_id"] == pane:
-            return ((maquina, pane), "pane")
-    for linha in linhas:
-        if cwd and linha["machine"] == maquina and linha["cwd"] == cwd:
-            return ((maquina, linha["pane_id"]), "cwd")
+    for line in lines:
+        if line["machine"] == machine and line["pane_id"] == pane:
+            return ((machine, pane), "pane")
+    for line in lines:
+        if cwd and line["machine"] == machine and line["cwd"] == cwd:
+            return ((machine, line["pane_id"]), "cwd")
 
     return (("", ""), "morto")
 
 
 def cmd_pick(args):
-    """Grava o alvo do campo, que agora precisa dizer tambem de qual maquina."""
+    """Grava o target do campo, que now precisa dizer tambem de qual machine."""
     if not args or args[0] == "-":
-        gravar_json(caminho_padrao_global(), {})
-        registrar("padrao-limpo")
-        responder(default="", default_machine="")
+        write_json(global_default_path(), {})
+        log_event("padrao-clean")
+        reply(default="", default_machine="")
 
-    maquina = args[0] if args[0] != "." else ""
+    machine = args[0] if args[0] != "." else ""
     if len(args) < 2:
-        falhar("pick precisa da maquina e do pane_id")
+        fail("pick needs the machine and the pane_id")
 
-    gravar_json(caminho_padrao_global(), {"machine": maquina, "pane_id": args[1], "cwd": args[2] if len(args) > 2 else ""})
-    registrar("padrao", maquina=maquina or "local", pane=args[1])
-    responder(default=args[1], default_machine=maquina)
+    write_json(global_default_path(), {"machine": machine, "pane_id": args[1], "cwd": args[2] if len(args) > 2 else ""})
+    log_event("padrao", machine=machine or "local", pane=args[1])
+    reply(default=args[1], default_machine=machine)
 
 
 def cmd_disconnect(args):
-    """Fecha o tunel multiplexado de uma maquina desligada na lista.
+    """Closes the multiplexed tunnel of a machine turned off in the list.
 
-    Sem isto o ControlPersist segura a conexao por mais alguns minutos depois de
-    voce desmarcar a maquina -- e "desliguei" tem de significar "desconectou",
-    nao "vai desconectar quando der".
+    Without this, ControlPersist holds the connection for a few more minutes
+    after you untick the machine -- and "I turned it off" has to mean "it
+    disconnected", not "it will disconnect eventually".
     """
     if not args:
-        falhar("disconnect precisa de um alvo")
+        fail("disconnect needs a target")
 
-    usar_remoto(args[0])
-    codigo, _, erro = rodar(ssh_prefixo()[:-1] + ["-O", "exit", args[0]], TIMEOUT_HERDR)
-    registrar("desconectado", alvo=args[0], codigo=codigo)
-    # Sair com erro aqui e o caso normal: nao havia tunel aberto.
-    responder(target=args[0], closed=codigo == 0, detail=erro.strip()[:120])
+    use_remote(args[0])
+    code, _, err = run(ssh_prefix()[:-1] + ["-O", "exit", args[0]], TIMEOUT_HERDR)
+    log_event("desconectado", target=args[0], code=code)
+    # Exiting with an error here is the normal case: there was no tunnel open.
+    reply(target=args[0], closed=code == 0, detail=err.strip()[:120])
 
 
 def cmd_hosts(_args):
-    """Candidatos a `remote`, tirados da Tailscale.
+    """Candidates for `remote`, taken from Tailscale.
 
-    A Tailscale e a resposta certa aqui porque o alvo tem de continuar valendo
-    de qualquer rede: um IP de LAN no shell.json quebra na primeira vez que
-    voce abre o notebook em outro lugar. Qualquer alvo que o seu ~/.ssh/config
-    entenda tambem serve -- isto e uma sugestao, nao a unica porta.
+    Tailscale is the right answer here because the target has to keep working
+    from any network: a LAN IP in shell.json breaks the first time you open the
+    laptop somewhere else. Any target your ~/.ssh/config understands works too
+    -- this is a suggestion, not the only door.
     """
-    codigo, saida, erro = rodar(["tailscale", "status", "--json"], TIMEOUT_HERDR)
-    if codigo == 127:
-        falhar("tailscale nao instalado", hosts=[])
-    corpo = json_de(saida)
-    if codigo != 0 or not isinstance(corpo, dict):
-        falhar((erro or "tailscale status falhou").strip()[:200], hosts=[])
+    code, out, err = run(["tailscale", "status", "--json"], TIMEOUT_HERDR)
+    if code == 127:
+        fail("tailscale is not installed", hosts=[])
+    body = json_from(out)
+    if code != 0 or not isinstance(body, dict):
+        fail((err or "tailscale status failed").strip()[:200], hosts=[])
 
     hosts = []
-    for par in (corpo.get("Peer") or {}).values():
+    for par in (body.get("Peer") or {}).values():
         if not isinstance(par, dict):
             continue
         dns = str(par.get("DNSName") or "").rstrip(".")
         if not dns:
             continue
-        curto = dns.split(".")[0]
+        short_ = dns.split(".")[0]
         hosts.append({
-            # O nome curto quando o MagicDNS o resolve, que e o caso normal com
-            # a Tailscale ligada. "desktop" e um alvo que voce le, confere e
-            # digita; "desktop.tailnet-abc123.ts.net" e um que voce copia e cola
-            # torcendo para nao ter errado uma letra do meio.
-            "target": curto if resolve(curto) else dns,
-            "short": curto,
+            # The short name when MagicDNS resolves it, which is the normal case with
+            # Tailscale up. "desktop" is a target you read, check and type;
+            # "desktop.tailnet-abc123.ts.net" is one you copy and paste hoping you did
+            # not get a letter wrong in the middle.
+            "target": short_ if resolves(short_) else dns,
+            "short": short_,
             "fqdn": dns,
             "name": str(par.get("HostName") or ""),
             "os": str(par.get("OS") or ""),
@@ -1766,10 +1773,10 @@ def cmd_hosts(_args):
         })
 
     hosts.sort(key=lambda h: (not h["online"], h["short"]))
-    responder(hosts=hosts)
+    reply(hosts=hosts)
 
 
-COMANDOS = {
+COMMANDS = {
     "snapshot": cmd_snapshot,
     "focus": cmd_focus,
     "send": cmd_send,
@@ -1785,21 +1792,21 @@ COMANDOS = {
 
 
 def main():
-    global SESSAO
+    global SESSION
 
     argv = sys.argv[1:]
     while len(argv) >= 2 and argv[0] in ("--session", "--remote"):
         if argv[0] == "--session":
-            SESSAO = argv[1]
+            SESSION = argv[1]
         else:
-            usar_remoto(argv[1])
+            use_remote(argv[1])
         argv = argv[2:]
 
-    if not argv or argv[0] not in COMANDOS:
+    if not argv or argv[0] not in COMMANDS:
         sys.stderr.write(__doc__)
         return 2
 
-    COMANDOS[argv[0]](argv[1:])
+    COMMANDS[argv[0]](argv[1:])
     return 0
 
 

@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "otavio.quick-herdr",
   "name": "Quick Herdr",
-  "version": "3.1.0",
+  "version": "4.0.0",
   "author": "otavio",
-  "description": "Agentes do Herdr de várias máquinas na barra: quantos rodam, param e esperam; a conversa de cada um; e as alternativas de quem parou para perguntar",
+  "description": "Herdr agents from every machine in the Omarchy bar: what they are doing, what they last said, and the prompts they are waiting on.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,14 +13,15 @@
   },
   "barWidget": {
     "displayName": "Quick Herdr",
-    "description": "Agentes do Herdr, locais e por SSH; clicar leva até a aba, o botão direito abre a conversa, e o campo manda um prompt",
+    "description": "Herdr agents, local and over SSH; click to go to the tab, right click to open the conversation, and the field sends a prompt without focusing",
     "category": "Info",
     "allowMultiple": true,
     "defaultSection": "right",
     "defaults": {
-      "session": "default",
-      "remote": "",
+      "machines": "",
+      "local": true,
       "label": "",
+      "session": "default",
       "interval": 4,
       "prInterval": 180,
       "maxRows": 20,
@@ -28,39 +29,44 @@
     },
     "schema": [
       {
-        "key": "remote",
+        "key": "machines",
         "type": "string",
-        "label": "Herdr de outra máquina por SSH (vazio = esta); `bin/herdr-bar hosts` lista as da Tailscale"
+        "label": "SSH targets, space separated (empty = only this machine); `bin/herdr-bar hosts` lists the Tailscale ones"
+      },
+      {
+        "key": "local",
+        "type": "boolean",
+        "label": "Include this machine's agents"
       },
       {
         "key": "label",
         "type": "string",
-        "label": "Rótulo na barra (para distinguir instâncias)"
+        "label": "Label on the bar, to tell instances apart"
       },
       {
         "key": "session",
         "type": "string",
-        "label": "Sessão do Herdr"
+        "label": "Herdr session"
       },
       {
         "key": "interval",
         "type": "number",
-        "label": "Atualização das contagens (segundos)"
+        "label": "Seconds between count refreshes"
       },
       {
         "key": "prInterval",
         "type": "number",
-        "label": "Atualização dos PRs (segundos, só com a lista aberta)"
+        "label": "Seconds between PR lookups (only with the list open)"
       },
       {
         "key": "maxRows",
         "type": "number",
-        "label": "Linhas na lista"
+        "label": "Rows in the list"
       },
       {
         "key": "hideWhenEmpty",
         "type": "boolean",
-        "label": "Sumir da barra quando não houver agente"
+        "label": "Hide from the bar when there is no agent"
       }
     ]
   },

@@ -1,11 +1,11 @@
-// Rotulos, glifos e ordenacao do widget do Herdr. Fora do QML porque e tudo
-// string e aritmetica de contagem: aqui da para testar com node.
+// Labels, glyphs and ordering for the Herdr widget. Kept out of the QML
+// because it is all strings and counting: here it can be tested with node.
 
-// idle e done sao o mesmo estado por baixo -- done e o idle de um trabalho que
-// terminou sem ninguem olhando. A barra conta os dois como ocioso; a lista os
-// separa, porque "terminou enquanto voce estava longe" e a linha que voce quer
-// abrir primeiro.
-var GLIFOS = {
+// idle and done are the same state underneath -- done is the idle of work that
+// finished with nobody watching. The bar counts both as idle; the list keeps
+// them apart, because "finished while you were away" is the row you want to
+// open first.
+var GLYPHS = {
   working: "▶",
   blocked: "◼",
   done:    "✓",
@@ -13,275 +13,270 @@ var GLIFOS = {
   unknown: "·"
 };
 
-var PALAVRAS = {
-  working: "rodando",
-  blocked: "bloqueado",
-  done:    "terminou",
-  idle:    "ocioso",
-  unknown: "indefinido"
+var WORDS = {
+  working: "working",
+  blocked: "blocked",
+  done:    "done",
+  idle:    "idle",
+  unknown: "unknown"
 };
 
-// Quem falou. O "" e o glifo de pessoa da Nerd Font, que a barra do Omarchy
-// ja usa; o "✳" e a marca que o proprio Claude Code desenha no terminal, entao
-// a lista fala a mesma lingua da aba para onde ela leva.
-var VOZES = {
-  agente: "✳",
-  voce:   "\uf007"
+// Who spoke. The "" is the Nerd Font person glyph the Omarchy bar already
+// uses; the "✳" is the mark Claude Code itself draws in the terminal, so the
+// list speaks the same language as the tab it takes you to.
+var VOICES = {
+  agent: "✳",
+  you:   ""
 };
 
-function glifo(status) {
-  return GLIFOS[status] || GLIFOS.unknown;
+function glyph(status) {
+  return GLYPHS[status] || GLYPHS.unknown;
 }
 
-function palavra(status) {
-  return PALAVRAS[status] || PALAVRAS.unknown;
+function word(status) {
+  return WORDS[status] || WORDS.unknown;
 }
 
-function voz(quem) {
-  return VOZES[quem] || VOZES.agente;
+function voice(who) {
+  return VOICES[who] || VOICES.agent;
 }
 
-// Os tres numeros da barra, sempre os tres. Esconder um zero encolheria o
-// widget e empurraria o resto da barra a cada agente que comeca ou para --
-// largura estavel vale mais que dois caracteres.
+// The bar's three numbers, always all three. Hiding a zero would shrink the
+// widget and shove the rest of the bar every time an agent starts or stops --
+// stable width is worth more than two characters.
 //
-// O glifo e o numero levam um espaco entre si, e os grupos levam dois: colados,
-// "▶2◼1○3" vira uma mancha que voce tem de parar para decifrar, e a barra e
-// feita para ser lida de relance.
+// Glyph and number take one space between them, groups take two: crammed
+// together, "▶2◼1○3" is a smudge you have to stop and decode, and the bar is
+// made to be read at a glance.
 function barText(counts, label, vertical) {
   var c = counts || {};
-  var partes = [
-    GLIFOS.working + " " + (c.working || 0),
-    GLIFOS.blocked + " " + (c.blocked || 0),
-    GLIFOS.idle + " " + (c.ocioso || 0)
+  var parts = [
+    GLYPHS.working + " " + (c.working || 0),
+    GLYPHS.blocked + " " + (c.blocked || 0),
+    GLYPHS.idle + " " + (c.ocioso || 0)
   ];
 
-  if (vertical) return (label ? label + "\n" : "") + partes.join("\n");
-  return (label ? label + "  " : "") + partes.join("  ");
+  if (vertical) return (label ? label + "\n" : "") + parts.join("\n");
+  return (label ? label + "  " : "") + parts.join("  ");
 }
 
 function tooltip(counts) {
   var c = counts || {};
-  return (c.working || 0) + " rodando · " +
-         (c.blocked || 0) + " bloqueado · " +
-         (c.ocioso || 0) + " ocioso";
+  return (c.working || 0) + " working · " +
+         (c.blocked || 0) + " blocked · " +
+         (c.ocioso || 0) + " idle";
 }
 
-// Titulo do painel. Uma maquina so ganha nome; varias viram contagem, porque
-// listar quatro hostnames no cabecalho custaria a largura da lista inteira.
-function titulo(label, maquinas, comLocal) {
+// Panel title. One machine gets a name; several become a count, because
+// listing four hostnames in the header would cost the width of the whole list.
+function title(label, machines, withLocal) {
   if (label) return "Quick Herdr · " + label;
 
-  var lista = maquinas || [];
-  if (lista.length === 0) return "Quick Herdr";
-  if (lista.length === 1 && !comLocal) return "Quick Herdr · " + String(lista[0]).split(".")[0];
-  return "Quick Herdr · " + (lista.length + (comLocal ? 1 : 0)) + " máquinas";
+  var list = machines || [];
+  if (list.length === 0) return "Quick Herdr";
+  if (list.length === 1 && !withLocal) return "Quick Herdr · " + String(list[0]).split(".")[0];
+  return "Quick Herdr · " + (list.length + (withLocal ? 1 : 0)) + " machines";
 }
 
-// Nome curto de uma linha, para o placeholder do campo e para as mensagens.
-function nomeDe(linha) {
-  if (!linha) return "";
-  return linha.project || linha.title || linha.pane_id || "";
+// A row's short name, for the field placeholder and the status notices.
+function nameOf(row) {
+  if (!row) return "";
+  return row.project || row.title || row.pane_id || "";
 }
 
-function acharPane(rows, paneId) {
-  var lista = rows || [];
-  for (var i = 0; i < lista.length; i++) {
-    if (lista[i].pane_id === paneId) return lista[i];
+function findPane(rows, paneId) {
+  var list = rows || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].pane_id === paneId) return list[i];
   }
   return null;
 }
 
-// Com varias maquinas na mesma lista, o pane_id sozinho deixou de identificar:
-// "w2:p1" existe em todas elas.
-function acharLinha(rows, maquina, paneId) {
-  var lista = rows || [];
-  for (var i = 0; i < lista.length; i++) {
-    if (lista[i].pane_id === paneId && (lista[i].machine || "") === (maquina || "")) return lista[i];
+// With several machines in one list, pane_id alone stopped identifying
+// anything: "w2:p1" exists on every one of them.
+function findRow(rows, machine, paneId) {
+  var list = rows || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].pane_id === paneId && (list[i].machine || "") === (machine || "")) return list[i];
   }
   return null;
 }
 
-// Placeholder do campo de texto. Ele e o unico lugar que diz para onde o texto
-// vai, entao precisa dizer tambem quando nao vai para lugar nenhum -- e quando
-// mandar custa recusar o que o agente esta pedindo.
-function placeholder(padrao, temAgentes) {
-  if (padrao && padrao.status === "blocked") return "responder a " + nomeDe(padrao) + " — recusa o pedido…";
-  if (padrao) return "mandar para " + nomeDe(padrao) + "…";
-  if (!temAgentes) return "nenhum agente no Herdr";
-  return "escolha um padrão na lista (★)";
+// The text field's placeholder. It is the only place that says where the text
+// goes, so it also has to say when it goes nowhere -- and when sending costs
+// you the request the agent is waiting on.
+function placeholder(target, hasAgents) {
+  if (target && target.status === "blocked") return "reply to " + nameOf(target) + " — rejects the request…";
+  if (target) return "send to " + nameOf(target) + "…";
+  if (!hasAgents) return "no agents in Herdr";
+  return "pick a default in the list (★)";
 }
 
-// O que aparece no cracha de uma alternativa. Vazio nas listas sem numero: ali
-// nao ha tecla para digitar, o widget anda com as setas por voce, e um numero
-// inventado so ensinaria um atalho que nao existe.
-function badge(opcao) {
-  return opcao && opcao.key ? opcao.key : "";
+// What shows on an option's badge. Empty on the unnumbered lists: there is no
+// key to type there, the widget walks the arrows for you, and an invented
+// number would only teach a shortcut that does not exist.
+function badge(option) {
+  return option && option.key ? option.key : "";
 }
 
-// A lista de maquinas ligadas. Vem como string separada por espaco, que e como
-// o widget grava: a IPC do shell interpreta um argumento "[...]" como lista de
-// argumentos, entao array de verdade nao atravessa ela. Nome de host nao tem
-// espaco, entao a separacao e sem ambiguidade -- e quem editar o shell.json a
-// mao pode escrever um array, que tambem e aceito aqui.
-function maquinasDe(valor) {
-  if (Array.isArray(valor)) return valor.map(String).filter(function (m) { return m !== ""; });
-  return String(valor || "").split(/[\s,]+/).filter(function (m) { return m !== ""; });
+// The list of machines that are on. It arrives as a space-separated string,
+// which is how the widget writes it: the shell's IPC reads a "[...]" argument
+// as an argument list, so a real array cannot cross it. Hostnames have no
+// spaces, so the split is unambiguous -- and anyone editing shell.json by hand
+// can write an array, which is accepted here too.
+function machinesFrom(value) {
+  if (Array.isArray(value)) return value.map(String).filter(function (m) { return m !== ""; });
+  return String(value || "").split(/[\s,]+/).filter(function (m) { return m !== ""; });
 }
 
-function juntarMaquinas(lista) {
-  return (lista || []).join(" ");
+function joinMachines(list) {
+  return (list || []).join(" ");
 }
 
-function temMaquina(lista, alvo) {
-  return (lista || []).indexOf(alvo) >= 0;
+function hasMachine(list, target) {
+  return (list || []).indexOf(target) >= 0;
 }
 
-// Etiqueta da maquina numa linha da lista. So aparece quando ha mais de uma
-// ligada: com uma so, a coluna repetiria a mesma palavra em todas as linhas.
-function badgeMaquina(maquina, varias) {
-  if (!varias) return "";
-  return maquina ? String(maquina).split(".")[0] : "aqui";
+// A machine tag on a list row. Only shows when more than one is on: with a
+// single machine the column would repeat the same word on every row.
+function machineBadge(machine, several) {
+  if (!several) return "";
+  return machine ? String(machine).split(".")[0] : "here";
 }
 
-// O erro de uma maquina especifica, para aparecer na linha dela.
-function erroDaMaquina(estados, alvo) {
-  var lista = estados || [];
-  for (var i = 0; i < lista.length; i++) {
-    if ((lista[i].target || "") === (alvo || "")) return lista[i].ok === false ? String(lista[i].error || "") : "";
+// One machine's error, to show on that machine's own row.
+function machineError(states, target) {
+  var list = states || [];
+  for (var i = 0; i < list.length; i++) {
+    if ((list[i].target || "") === (target || "")) return list[i].ok === false ? String(list[i].error || "") : "";
   }
   return "";
 }
 
-// Maquinas ligadas que nao vieram da Tailscale: alvo digitado a mao, apelido do
-// ~/.ssh/config. Sem lista-las, ficariam ligadas e invisiveis -- sem gesto para
-// desligar.
-function maquinasSoltas(maquinas, hosts) {
-  var conhecidas = (hosts || []).map(function (h) { return h.target; });
-  return (maquinas || []).filter(function (m) { return conhecidas.indexOf(m) < 0; });
+// Machines that are on but did not come from Tailscale: a target typed by
+// hand, an alias from ~/.ssh/config. Without listing them they would stay on
+// and invisible -- with no gesture to turn them off.
+function unlistedMachines(machines, hosts) {
+  var known = (hosts || []).map(function (h) { return h.target; });
+  return (machines || []).filter(function (m) { return known.indexOf(m) < 0; });
 }
 
-// As maquinas que falharam, para o rodape dizer qual e por que.
-function falhasDe(maquinas) {
-  var ruins = (maquinas || []).filter(function (m) { return m && m.ok === false; });
-  return ruins.map(function (m) {
-    return (m.target ? String(m.target).split(".")[0] : "aqui") + ": " + m.error;
-  });
+// The messages a row shows: the last one when collapsed, all of them when
+// expanded. They all arrived in the same payload, so expanding costs no round
+// trip.
+function visibleMessages(row, expanded) {
+  var messages = (row && row.messages) || [];
+  return expanded ? messages : messages.slice(-1);
 }
 
-// As falas que a linha mostra: a ultima quando fechada, todas quando aberta.
-// Elas ja vieram todas no mesmo pacote, entao expandir nao custa ida e volta.
-function falasVisiveis(linha, expandida) {
-  var falas = (linha && linha.messages) || [];
-  return expandida ? falas : falas.slice(-1);
-}
+// ------------------------------------------------------------------ colors
 
-// ------------------------------------------------------------------- cores
-
-function escaparHtml(texto) {
-  return String(texto)
+function escapeHtml(text) {
+  return String(text)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
 
-// O HTML colapsa espaco: dois viram um, e os do comeco da linha somem. Isso
-// come justamente a indentacao, que num bloco de codigo e o que o torna
-// legivel. Entao toda corrida de dois ou mais vira espaco rigido, e a do
-// comeco da linha tambem quando e de um so -- espaco isolado no meio continua
-// espaco comum, senao a linha comprida perderia onde quebrar.
-function preservarEspacos(texto, comecoDaLinha) {
-  var escapado = escaparHtml(texto).replace(/ {2,}/g, function (corrida) {
-    return Array(corrida.length + 1).join("&nbsp;");
+// HTML collapses whitespace: two spaces become one, and the ones starting a
+// line vanish. That eats exactly the indentation, which in a code block is
+// what makes it readable. So every run of two or more becomes a hard space,
+// and so does a single one at the start of a line -- a lone space in the
+// middle stays ordinary, or a long line would lose where to wrap.
+function keepSpaces(text, lineStart) {
+  var escaped = escapeHtml(text).replace(/ {2,}/g, function (run) {
+    return Array(run.length + 1).join("&nbsp;");
   });
-  return comecoDaLinha ? escapado.replace(/^ /, "&nbsp;") : escapado;
+  return lineStart ? escaped.replace(/^ /, "&nbsp;") : escaped;
 }
 
-// As linhas do dialogo em HTML, com as cores que o terminal ja pintou. O
-// Claude Code realca diff e bloco de comando; aproveitar isso e mais fiel (e
-// muito mais barato) que reimplementar um highlighter aqui.
-function htmlDoContexto(linhas) {
-  var saida = [];
+// The dialog's lines as HTML, in the colors the terminal already painted.
+// Claude Code highlights diffs and command blocks; reusing that is more
+// faithful (and far cheaper) than reimplementing a highlighter here.
+function contextHtml(lines) {
+  var out = [];
 
-  for (var i = 0; i < (linhas || []).length; i++) {
-    var trechos = linhas[i] || [];
-    var partes = [];
+  for (var i = 0; i < (lines || []).length; i++) {
+    var runs = lines[i] || [];
+    var parts = [];
 
-    for (var j = 0; j < trechos.length; j++) {
-      var trecho = trechos[j];
-      // Nao so no primeiro trecho: quando a linha e realcada, a indentacao
-      // cai dentro do trecho colorido, e era ali que ela sumia.
-      var texto = preservarEspacos(trecho.t, j === 0);
-      var estilo = [];
+    for (var j = 0; j < runs.length; j++) {
+      var run = runs[j];
+      // Not only on the first run: when the line is highlighted the
+      // indentation falls inside the colored run, and that is where it used
+      // to disappear.
+      var text = keepSpaces(run.t, j === 0);
+      var style = [];
 
-      if (trecho.f) estilo.push("color:" + trecho.f);
-      if (trecho.g) estilo.push("background-color:" + trecho.g);
-      if (trecho.b) estilo.push("font-weight:bold");
+      if (run.f) style.push("color:" + run.f);
+      if (run.g) style.push("background-color:" + run.g);
+      if (run.b) style.push("font-weight:bold");
 
-      partes.push(estilo.length ? '<span style="' + estilo.join(";") + '">' + texto + "</span>" : texto);
+      parts.push(style.length ? '<span style="' + style.join(";") + '">' + text + "</span>" : text);
     }
 
-    saida.push(partes.join(""));
+    out.push(parts.join(""));
   }
 
-  return saida.join("<br>");
+  return out.join("<br>");
 }
 
-function temOpcoes(linha) {
-  return !!(linha && linha.options && linha.options.length);
+function hasOptions(row) {
+  return !!(row && row.options && row.options.length);
 }
 
-// O comando dentro das crases de uma dica de erro. As dicas do helper trazem o
-// conserto entre crases justamente para o painel poder oferecer o texto para
-// copiar: um comando que voce tem de redigitar de um popup nao e uma dica.
-function comandoDe(texto) {
-  var achado = /`([^`]+)`/.exec(String(texto || ""));
-  return achado ? achado[1] : "";
+// The command inside the backticks of an error hint. The helper's hints carry
+// the fix in backticks precisely so the panel can offer it for copying: a
+// command you have to retype out of a popup is not a hint.
+function commandFrom(text) {
+  var found = /`([^`]+)`/.exec(String(text || ""));
+  return found ? found[1] : "";
 }
 
-// Placeholder quando o campo esta escrevendo dentro de uma alternativa, e nao
-// mandando um prompt novo. Diz o rotulo porque sao destinos diferentes e a
-// unica diferenca visivel entre eles e este texto.
-function placeholderOpcao(opcao) {
-  return "escrever em “" + String((opcao && opcao.label) || "").replace(/\s*\(esc\)\s*$/, "") + "”…";
+// Placeholder for when the field is writing inside an option rather than
+// sending a new prompt. It names the option because these are different
+// destinations, and this text is the only visible difference between them.
+function optionPlaceholder(option) {
+  return "write in “" + String((option && option.label) || "").replace(/\s*\(esc\)\s*$/, "") + "”…";
 }
 
-function rotuloHost(host) {
+function hostLabel(host) {
   if (!host) return "";
-  var nome = host.short || host.target || "";
-  return host.name && host.name !== nome ? nome + "  " + host.name : nome;
+  var name = host.short || host.target || "";
+  return host.name && host.name !== name ? name + "  " + host.name : name;
 }
 
-function ajudaConfig(hosts) {
-  if (!hosts || !hosts.length) return "sem máquinas na Tailscale · use o campo abaixo";
-  return "clique para ligar e desligar · esc volta para a lista";
+function settingsHint(hosts) {
+  if (!hosts || !hosts.length) return "no Tailscale machines · use the field below";
+  return "click to turn on and off · esc goes back to the list";
 }
 
-// Por que a coluna de PR esta vazia. Sem isso, "nenhum PR" e indistinguivel de
-// "o gh nunca foi autenticado nesta maquina", e so um dos dois tem conserto.
-function avisoGh(gh) {
-  if (gh === "missing") return "gh não instalado — sem números de PR";
-  if (gh === "unauthenticated") return "gh não autenticado — rode `gh auth login`";
-  // Os repositorios estao na outra ponta: rodar git nos caminhos que o Herdr
-  // remoto devolve daria numero errado ou nenhum.
-  if (gh === "remote") return "sessão remota — sem números de PR";
+// Why the PR column is empty. Without this, "no PR" is indistinguishable from
+// "gh was never authenticated on this machine", and only one of those has a
+// fix.
+function ghNotice(gh) {
+  if (gh === "missing") return "gh not installed — no PR numbers";
+  if (gh === "unauthenticated") return "gh not authenticated — run `gh auth login`";
+  // The repositories live on the other end: running git on the paths a remote
+  // Herdr returns would give the wrong number, or none.
+  if (gh === "remote") return "remote session — no PR numbers";
   return "";
 }
 
-function rotuloPr(linha) {
-  if (!linha || !linha.pr_number) return "";
-  return "#" + linha.pr_number;
+function prLabel(row) {
+  if (!row || !row.pr_number) return "";
+  return "#" + row.pr_number;
 }
 
-// O texto de ajuda muda com o que da para fazer agora: uma lista vazia nao tem
-// o que navegar, e um campo sem alvo nao tem para onde mandar.
-function ajuda(rows, padrao, escrevendo, sobCursor) {
-  if (escrevendo) {
-    if (padrao && padrao.status === "blocked") return "↵ recusa o pedido e manda isto · esc volta para a lista";
-    return "↵ enviar · esc voltar para a lista";
+// The help text changes with what you can do right now: an empty list has
+// nothing to navigate, and a field with no target has nowhere to send.
+function hint(rows, target, writing, underCursor) {
+  if (writing) {
+    if (target && target.status === "blocked") return "↵ rejects the request and sends this · esc back to the list";
+    return "↵ send · esc back to the list";
   }
-  if (!rows || !rows.length) return "nenhum agente · r atualizar";
-  if (temOpcoes(sobCursor)) return "1…9 responder · ↵ ir · i escrever outra coisa";
-  if (padrao) return "↑↓ navegar · ↵ ir · ★ padrão · i escrever";
-  return "↑↓ navegar · ↵ ir · ★ escolher o padrão";
+  if (!rows || !rows.length) return "no agents · r refresh";
+  if (hasOptions(underCursor)) return "1…9 answer · ↵ go · i write something else";
+  if (target) return "↑↓ move · ↵ go · ★ default · i write";
+  return "↑↓ move · ↵ go · ★ pick the default";
 }

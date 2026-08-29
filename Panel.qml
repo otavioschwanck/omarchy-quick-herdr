@@ -6,29 +6,28 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Widget de barra: quantos agentes do Herdr estao rodando, parados numa
-// pergunta e ociosos -- de quantas maquinas voce ligar -- e uma lista para ler
-// a conversa de cada um, ir ate ele ou responder sem sair da barra.
+// Bar widget: how many Herdr agents are running, stopped on a question and
+// idle -- across as many machines as you turn on -- and a list to read each
+// one's conversation, go to it, or answer without leaving the bar.
 //
-// Todo o trafego passa por bin/herdr-bar, que devolve uma linha de JSON. O
-// helper existe porque um clique aqui vira varias chamadas encadeadas -- foco
-// no Herdr, descoberta da janela do compositor, dispatch do Hyprland -- e
-// encadear Process em QML e como se escreve callback hell.
+// All traffic goes through bin/herdr-bar, which returns one line of JSON. The
+// helper exists because one click here becomes several chained calls -- focus
+// in Herdr, finding the compositor's window, a Hyprland dispatch -- and
+// chaining Process in QML is how callback hell gets written.
 Panel {
   id: root
 
   moduleName: "otavio.quick-herdr"
-  // Alvo de IPC para quem preferir uma tecla a um clique:
+  // IPC target for anyone who prefers a key to a click:
   //   omarchy-shell otavio.quick-herdr toggle
   ipcTarget: "otavio.quick-herdr"
 
   readonly property string helper: String(Qt.resolvedUrl("bin/herdr-bar")).replace(/^file:\/\//, "")
-  readonly property string janela: String(Qt.resolvedUrl("bin/quick-herdr-tui")).replace(/^file:\/\//, "")
 
   // ------------------------------------------------------------- settings
-  // Propriedades simples atualizadas de uma vez, e nao um binding por chave:
-  // uma cadeia de bindings derivados que sujam todos na mesma mudanca reentra
-  // em si mesma, e o Qt reporta isso como binding loop.
+  // Plain properties updated in one go, not a binding per key: a chain of
+  // derived bindings that all dirty on the same change re-enters itself, and
+  // Qt reports that as a binding loop.
   property string session: "default"
   property var machines: []
   property bool useLocal: true
@@ -42,19 +41,20 @@ Panel {
     session = String(setting("session", "default") || "default");
     label = String(setting("label", "") || "").trim();
 
-    // "remote" era o formato antigo, de uma maquina so por widget. Continua
-    // valendo como uma entrada da lista: quem ja tinha o widget configurado
-    // nao pode ver a barra esvaziar por causa de uma troca de formato.
-    var lista = Model.maquinasDe(setting("machines", ""));
-    var antigo = String(setting("remote", "") || "").trim();
-    if (antigo !== "" && !Model.temMaquina(lista, antigo)) lista = [antigo].concat(lista);
-    machines = lista;
-    useLocal = setting("local", lista.length === 0) !== false;
+    // "remote" was the old format, one machine per widget. It still counts as one
+    // entry in the list: anyone who already had the widget configured must not
+    // watch the bar empty out because of a format change.
+    var list = Model.machinesFrom(setting("machines", ""));
+    var legacy = String(setting("remote", "") || "").trim();
+    if (legacy !== "" && !Model.hasMachine(list, legacy)) list = [legacy].concat(list);
+    machines = list;
+    useLocal = setting("local", list.length === 0) !== false;
 
-    // Por SSH cada atualizacao e uma ida e volta pela rede; o piso maior evita
-    // que o padrao local vire uma enxurrada de conexoes na outra ponta.
-    var minimo = lista.length > 0 ? 5 : 2;
-    refreshSeconds = Math.max(minimo, Number(setting("interval", lista.length > 0 ? 8 : 4)) || minimo);
+    // Over SSH every refresh is a round trip across the network; the higher floor
+    // keeps the local default from becoming a flood of connections on the other
+    // end.
+    var floor = list.length > 0 ? 5 : 2;
+    refreshSeconds = Math.max(floor, Number(setting("interval", list.length > 0 ? 8 : 4)) || floor);
     prSeconds = Math.max(30, Number(setting("prInterval", 180)) || 180);
     maxRows = Math.max(1, Number(setting("maxRows", 20)) || 20);
     hideWhenEmpty = setting("hideWhenEmpty", false) === true;
@@ -64,26 +64,26 @@ Panel {
   onSettingsChanged: applySettings()
   Component.onCompleted: applySettings()
 
-  // O bar dimensiona o slot pelo implicitWidth do item que carrega. Sem
-  // repassar o do botao, o widget existe, roda e nao ocupa espaco nenhum.
+  // The bar sizes the slot by the implicitWidth of the item it carries. Without
+  // passing the button's through, the widget exists, runs and takes up no space.
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  // Convencao dos paineis nativos: as cores de realce saem do tema.
+  // Native panel convention: highlight colors come from the theme.
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color urgentColor: bar ? bar.urgent : Color.urgent
   readonly property color dimColor: Qt.darker(barForeground, 1.5)
   readonly property color fadeColor: Qt.darker(barForeground, 1.8)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  // ---------------------------------------------------------------- estado
+  // ---------------------------------------------------------------- state
   property var counts: ({})
   property var rows: []
-  // Recuo progressivo com a lista fechada. O tick custa ~60ms de CPU, dos quais
-  // 5ms sao o dado -- o resto e partida de interpretador, paga de novo a cada
-  // atualizacao. Numa sessao parada isso e puro desperdicio, entao cada ciclo
-  // sem novidade dobra a espera ate o teto; qualquer mudanca nas contagens, ou
-  // abrir a lista, volta ao piso na hora.
+  // Progressive backoff while the list is closed. A tick costs ~60ms of CPU, of
+  // which 5ms is the data -- the rest is interpreter startup, paid again on
+  // every refresh. In a quiet session that is pure waste, so each cycle with no
+  // news doubles the wait up to the ceiling; any change in the counts, or
+  // opening the list, drops back to the floor at once.
   property int quietTicks: 0
   readonly property int maxQuietTicks: 3
   property string lastCounts: ""
@@ -92,49 +92,50 @@ Panel {
     opened ? refreshSeconds * 1000
            : Math.min(refreshSeconds * 1000 * Math.pow(2, quietTicks), 60000)
 
-  // Linhas abertas, por (maquina, pane). Uma linha aberta mostra as ultimas
-  // falas em vez de so a ultima; quem esta parado numa pergunta ja nasce
-  // aberto, porque a pergunta e o motivo de voce ter aberto a lista.
-  property var expandidas: ({})
+  // Open rows, by (machine, pane). An open row shows the last messages instead
+  // of only the last one; whoever stopped on a question is born open, because
+  // the question is why you opened the list.
+  property var expandedRows: ({})
 
-  function chaveDe(linha) {
-    return (linha.machine || "") + "\u0000" + linha.pane_id;
+  function keyOf(row_) {
+    return (row_.machine || "") + "\u0000" + row_.pane_id;
   }
 
-  function estaExpandida(linha) {
-    var chave = chaveDe(linha);
-    if (chave in expandidas) return expandidas[chave] === true;
-    // Quem parou numa pergunta ja nasce aberto: a pergunta e o motivo de voce
-    // ter aberto a lista. Um clique no chevron ainda fecha, porque a chave
-    // passa a existir com "false".
-    return !!(linha.options && linha.options.length);
+  function isExpanded(row_) {
+    var key = keyOf(row_);
+    if (key in expandedRows) return expandedRows[key] === true;
+    // Whoever stopped on a question is born open: the question is why you opened
+    // the list. A click on the chevron still closes it, because the key then
+    // exists with "false".
+    return !!(row_.options && row_.options.length);
   }
 
-  function alternarExpansao(linha) {
-    // Reatribuir o objeto inteiro, e nao mexer numa chave: o QML so reavalia
-    // os bindings quando a propriedade em si muda.
-    var novo = {};
-    for (var k in expandidas) novo[k] = expandidas[k];
-    novo[chaveDe(linha)] = !estaExpandida(linha);
-    expandidas = novo;
+  function toggleExpanded(row_) {
+    // Reassigning the whole object rather than touching one key: QML only
+    // re-evaluates bindings when the property itself changes.
+    var next_ = {};
+    for (var k in expandedRows) next_[k] = expandedRows[k];
+    next_[keyOf(row_)] = !isExpanded(row_);
+    expandedRows = next_;
   }
 
   property string defaultPane: ""
   property string defaultMachine: ""
-  // Uma entrada por maquina consultada, com o erro dela quando falhou: com
-  // varias ligadas, "deu erro" sem dizer qual nao ajuda ninguem.
+  // One entry per machine queried, with its error when it failed: with several
+  // on, "something failed" without saying which helps nobody.
   property var machineStates: []
   property string ghState: ""
   property string helperError: ""
 
-  // Pagina de configuracao, aberta com o botao direito na barra. Mora no mesmo
-  // popup porque e a mesma pergunta ("qual Herdr e este?") vista de outro lado.
+  // Settings page, opened with a right click on the bar. It lives in the same
+  // popup because it is the same question ("which Herdr is this?") from the
+  // other side.
   property bool settingsOpen: false
   property var hosts: []
 
-  // Alternativa escolhida que abriu um campo em vez de responder sozinha, e o
-  // agente dela. Enquanto isso estiver preenchido, o campo do painel escreve
-  // ali dentro, e nao um prompt novo.
+  // The chosen option that opened a field instead of answering on its own, and
+  // its agent. While this is set, the panel's field writes in there rather than
+  // sending a new prompt.
   property var pendingOption: null
   property string pendingPane: ""
   property string pendingMachine: ""
@@ -145,26 +146,26 @@ Panel {
     pendingMachine = "";
   }
 
-  // O comando que a dica de erro sugere, pronto para a área de transferência.
-  // Vale para o erro persistente e para o recado passageiro: os dois vêm do
-  // mesmo helper e trazem a saída entre crases pelo mesmo motivo.
-  readonly property string errorCommand: Model.comandoDe(
+  // The command the error hint suggests, ready for the clipboard. It covers both
+  // the persistent error and the passing notice: both come from the same helper
+  // and carry the fix in backticks for the same reason.
+  readonly property string errorCommand: Model.commandFrom(
     helperError !== "" ? helperError : (statusIsError ? status : "")
   )
   property bool copied: false
 
-  // O bar expoe `run`, mas nao `shellQuote` -- confiar nela dava
-  // "Property 'shellQuote' is not a function" e engolia a acao inteira, em
-  // silencio para quem clicava. Citar aqui nao depende de API de terceiro.
-  function shq(valor) {
-    return "'" + String(valor === undefined || valor === null ? "" : valor).replace(/'/g, "'\\''") + "'";
+  // The bar exposes `run` but not `shellQuote` -- trusting it gave
+  // "Property 'shellQuote' is not a function" and swallowed the whole action,
+  // silently for whoever clicked. Quoting here depends on nobody else's API.
+  function shq(value) {
+    return "'" + String(value === undefined || value === null ? "" : value).replace(/'/g, "'\\''") + "'";
   }
 
-  function copyCommand(comando) {
-    if (!comando || !bar) return;
-    // printf e não echo: o comando pode ter barra invertida, e echo a
-    // interpretaria antes de o texto chegar na área de transferência.
-    bar.run("printf %s " + root.shq(comando) + " | wl-copy");
+  function copyCommand(command) {
+    if (!command || !bar) return;
+    // printf and not echo: the command can contain a backslash, and echo would
+    // interpret it before the text reached the clipboard.
+    bar.run("printf %s " + root.shq(command) + " | wl-copy");
     copied = true;
     copiedTimer.restart();
   }
@@ -175,13 +176,13 @@ Panel {
     onTriggered: root.copied = false
   }
 
-  // Mensagem passageira embaixo do campo ("enviado para bot", "bloqueado").
+  // Passing notice under the field ("sent to bot", "blocked").
   property string status: ""
   property bool statusIsError: false
 
-  function note(texto, erro) {
-    status = texto;
-    statusIsError = erro === true;
+  function note(text, isError) {
+    status = text;
+    statusIsError = isError === true;
     statusTimer.restart();
   }
 
@@ -197,24 +198,24 @@ Panel {
     onTriggered: if (root.opened) keyCatcher.forceActiveFocus()
   }
 
-  // Comandos que valem para o widget inteiro: a lista agregada, o alvo do
-  // campo, a configuracao. Nao levam maquina.
+  // Commands that apply to the whole widget: the aggregated list, the field's
+  // target, the settings. They take no machine.
   function argv(args) {
-    var base = [root.helper];
-    if (root.session !== "default") base = base.concat(["--session", root.session]);
-    return base.concat(args);
+    var bottom = [root.helper];
+    if (root.session !== "default") bottom = bottom.concat(["--session", root.session]);
+    return bottom.concat(args);
   }
 
-  // Comandos que agem sobre um agente, e por isso precisam saber de que
-  // maquina ele e. Cada linha da lista carrega a sua.
-  function argvPara(maquina, args) {
-    var base = argv([]);
-    if (maquina) base = base.concat(["--remote", maquina]);
-    return base.concat(args);
+  // Commands acting on one agent, which therefore need to know which machine it
+  // is on. Every row in the list carries its own.
+  function argvFor(machine_, args) {
+    var bottom = argv([]);
+    if (machine_) bottom = bottom.concat(["--remote", machine_]);
+    return bottom.concat(args);
   }
 
-  // As mensagens custam uma leitura de terminal por agente, e so aparecem na
-  // lista: com o popup fechado a barra quer as contagens e mais nada.
+  // Messages cost one terminal read per agent, and only show in the list: with
+  // the popup closed the bar wants the counts and nothing else.
   function refresh() {
     if (snapshotProc.running) return;
 
@@ -227,9 +228,10 @@ Panel {
     snapshotProc.running = true;
   }
 
-  // Os PRs tem ritmo proprio: o snapshot le so o cache, e quem vai ao GitHub e
-  // este comando. Rodar os dois no mesmo timer poria uma chamada de rede por
-  // repositorio a cada poucos segundos, para um numero que quase nunca muda.
+  // PRs have their own rhythm: the snapshot reads only the cache, and this is
+  // the command that goes to GitHub. Running both on the same timer would put
+  // one network call per repository every few seconds, for a number that almost
+  // never changes.
   function refreshPrs() {
     if (!prsProc.running) {
       prsProc.command = argv(["prs"]);
@@ -238,113 +240,114 @@ Panel {
   }
 
   function apply(payload) {
-    var dados;
+    var data;
     try {
-      dados = JSON.parse(payload);
+      data = JSON.parse(payload);
     } catch (e) {
-      helperError = "resposta ilegível do helper";
+      helperError = "unreadable reply from the helper";
       return;
     }
 
-    helperError = dados.ok === false ? String(dados.error || "erro no helper") : "";
-    counts = dados.counts || ({});
-    ghState = String(dados.gh || "");
-    defaultPane = String(dados.default || "");
-    defaultMachine = String(dados.default_machine || "");
-    machineStates = dados.machines || [];
+    helperError = data.ok === false ? String(data.error || "helper error") : "";
+    counts = data.counts || ({});
+    ghState = String(data.gh || "");
+    defaultPane = String(data.default || "");
+    defaultMachine = String(data.default_machine || "");
+    machineStates = data.machines || [];
 
-    var lista = dados.rows || [];
-    rows = lista.slice(0, maxRows);
+    var list = data.rows || [];
+    rows = list.slice(0, maxRows);
 
-    // A digital sao as contagens, e nao as linhas: com a lista fechada e so
-    // isso que a barra desenha, e um titulo de terminal que muda sozinho nao
-    // e motivo para voltar a atualizar de quatro em quatro segundos.
+    // The fingerprint is the counts, not the rows: with the list closed that is
+    // all the bar draws, and a terminal title changing on its own is no reason to
+    // go back to refreshing every four seconds.
     var digital = JSON.stringify(counts);
     if (digital === lastCounts) quietTicks = Math.min(quietTicks + 1, maxQuietTicks);
     else { quietTicks = 0; lastCounts = digital; }
   }
 
-  // -------------------------------------------------------------- acoes
-  // Cada acao tem seu Process: um Process so roda um comando por vez, e mandar
-  // texto enquanto o snapshot esta no ar e o caso normal, nao o excepcional.
+  // -------------------------------------------------------------- actions
+  // Each action has its own Process: a Process runs one command at a time, and
+  // sending text while the snapshot is in flight is the normal case, not the
+  // exception.
 
-  function goTo(linha) {
-    if (!linha) return;
-    focusProc.command = argvPara(linha.machine, ["focus", linha.pane_id]);
+  function goTo(row_) {
+    if (!row_) return;
+    focusProc.command = argvFor(row_.machine, ["focus", row_.pane_id]);
     focusProc.running = true;
     close();
   }
 
-  function setDefault(linha) {
-    if (!linha) return;
-    // Clicar na estrela do alvo atual desmarca: e o unico gesto que sobra para
-    // voltar a nao ter padrao, e o campo precisa desse estado para dizer que
-    // nao tem para onde mandar.
+  function setDefault(row_) {
+    if (!row_) return;
+    // Clicking the star of the current target unmarks it: it is the only gesture
+    // left for going back to having no default, and the field needs that state to
+    // say it has nowhere to send.
     //
-    // "." e a maquina local: um argumento vazio no argv seria indistinguivel
-    // de argumento nenhum.
-    var atual = linha.pane_id === root.defaultPane && linha.machine === root.defaultMachine;
+    // "." is the local machine: an empty argument in argv would be
+    // indistinguishable from no argument at all.
+    var atual = row_.pane_id === root.defaultPane && row_.machine === root.defaultMachine;
     defaultProc.command = argv(
-      atual ? ["pick", "-"] : ["pick", linha.machine || ".", linha.pane_id, linha.cwd || ""]
+      atual ? ["pick", "-"] : ["pick", row_.machine || ".", row_.pane_id, row_.cwd || ""]
     );
     defaultProc.running = true;
 
-    // Marcar o alvo e escrever para ele sao o mesmo gesto partido em dois, e o
-    // segundo era um clique perdido. Desmarcar nao foca nada: o campo acabou de
-    // ficar sem destino.
+    // Marking the target and writing to it are the same gesture split in two, and
+    // the second was a wasted click. Unmarking focuses nothing: the field has just
+    // lost its destination.
     if (!atual) field.forceActiveFocus();
   }
 
-  function send(texto) {
-    var alvo = root.defaultPane;
-    if (!alvo) {
-      note("escolha um padrão na lista (★)", true);
+  function send(text) {
+    var target_ = root.defaultPane;
+    if (!target_) {
+      note("pick a default in the list (★)", true);
       return;
     }
-    if (!texto || !texto.trim()) return;
+    if (!text || !text.trim()) return;
 
-    sendProc.payload = texto.trim();
-    sendProc.command = argvPara(root.defaultMachine, ["send", alvo]);
+    sendProc.payload = text.trim();
+    sendProc.command = argvFor(root.defaultMachine, ["send", target_]);
     sendProc.running = true;
   }
 
-  // Responder um dialogo aperta a alternativa e mantem o painel aberto: o
-  // agente vai mudar de estado em seguida, e ver isso acontecer e metade da
-  // razao de responder daqui em vez de ir ate a aba.
-  function answer(linha, opcao) {
-    if (!linha || !opcao) return;
-    answerProc.command = argvPara(linha.machine, ["answer", linha.pane_id, String(opcao.index), String(opcao.label)]);
+  // Answering a dialog presses the option and keeps the panel open: the agent
+  // will change state next, and watching that happen is half the reason to
+  // answer from here instead of going to the tab.
+  function answer(row_, option) {
+    if (!row_ || !option) return;
+    answerProc.command = argvFor(row_.machine, ["answer", row_.pane_id, String(option.index), String(option.label)]);
     answerProc.running = true;
   }
 
-  // Uma alternativa como "No, and tell Claude what to do differently" ou "Chat
-  // about this" nao responde nada sozinha: ela abre um campo e fica esperando.
-  // Apertar a tecla e parar ali deixaria o agente travado num input vazio,
-  // entao o painel pede o texto antes de encostar no dialogo.
-  function pickOption(linha, opcao) {
-    if (!linha || !opcao) return;
-    if (opcao.prompts === true) {
-      pendingOption = opcao;
-      pendingPane = linha.pane_id;
-      pendingMachine = linha.machine || "";
+  // An option like "No, and tell Claude what to do differently" or "Chat about
+  // this" answers nothing on its own: it opens a field and waits. Pressing the
+  // key and stopping there would leave the agent stuck on an empty input, so the
+  // panel asks for the text before touching the dialog.
+  function pickOption(row_, option) {
+    if (!row_ || !option) return;
+    if (option.prompts === true) {
+      pendingOption = option;
+      pendingPane = row_.pane_id;
+      pendingMachine = row_.machine || "";
       field.text = "";
       field.forceActiveFocus();
       return;
     }
-    answer(linha, opcao);
+    answer(row_, option);
   }
 
-  function sendPending(texto) {
-    if (!pendingOption || !texto || !texto.trim()) return;
-    answerTextProc.payload = texto.trim();
-    answerTextProc.command = argvPara(pendingMachine, [
+  function sendPending(text) {
+    if (!pendingOption || !text || !text.trim()) return;
+    answerTextProc.payload = text.trim();
+    answerTextProc.command = argvFor(pendingMachine, [
       "answer", pendingPane, String(pendingOption.index), String(pendingOption.label), "--with-text"
     ]);
     answerTextProc.running = true;
     cancelPending();
   }
 
-  // ------------------------------------------------------------ configuracao
+  // ------------------------------------------------------------ configuration
   function loadHosts() {
     if (!hostsProc.running) {
       hostsProc.command = argv(["hosts"]);
@@ -352,40 +355,40 @@ Panel {
     }
   }
 
-  function setConfig(chave, valor) {
-    configProc.command = argv(["config", "set", String(chave), String(valor)]);
+  function setConfig(key, value) {
+    configProc.command = argv(["config", "set", String(key), String(value)]);
     configProc.running = true;
   }
 
-  // Para o que nao e texto -- o booleano de "esta maquina".
-  function setConfigJson(chave, bruto) {
-    configJsonProc.command = argv(["config", "set", String(chave), String(bruto), "--json"]);
+  // For what is not text -- the boolean of "this machine".
+  function setConfigJson(key, raw) {
+    configJsonProc.command = argv(["config", "set", String(key), String(raw), "--json"]);
     configJsonProc.running = true;
   }
 
-  // Ligar e desligar uma maquina na lista. Desligar fecha o tunel na hora, em
-  // vez de deixar o ControlPersist segurando por mais alguns minutos:
-  // "desliguei" tem de significar "desconectou", nao "vai desconectar quando
-  // der".
-  function toggleMachine(alvo) {
-    var lista = root.machines.slice();
-    var onde = lista.indexOf(alvo);
+  // Turning a machine on and off in the list. Turning off closes the tunnel at
+  // once rather than leaving ControlPersist holding it for a few more minutes:
+  // "I turned it off" has to mean "it disconnected", not "it will disconnect
+  // eventually".
+  function toggleMachine(target_) {
+    var list = root.machines.slice();
+    var at = list.indexOf(target_);
 
-    if (onde >= 0) {
-      lista.splice(onde, 1);
-      disconnectProc.command = argv(["disconnect", alvo]);
+    if (at >= 0) {
+      list.splice(at, 1);
+      disconnectProc.command = argv(["disconnect", target_]);
       disconnectProc.running = true;
     } else {
-      lista.push(alvo);
+      list.push(target_);
     }
 
-    // O array vai como string separada por espaco porque a IPC do shell le um
-    // argumento "[...]" como lista de argumentos -- array de verdade nao
-    // atravessa ela. Nome de host nao tem espaco, entao nao ha ambiguidade.
-    machines = lista;
-    setConfig("machines", Model.juntarMaquinas(lista));
-    // A chave antiga guardava uma maquina so; deixa-la para tras faria ela
-    // reaparecer na lista a cada leitura de configuracao.
+    // The array goes as a space-separated string because the shell's IPC reads a
+    // "[...]" argument as an argument list -- a real array cannot cross it.
+    // Hostnames have no spaces, so there is no ambiguity.
+    machines = list;
+    setConfig("machines", Model.joinMachines(list));
+    // The old key held a single machine; leaving it behind would make it reappear
+    // in the list on every settings read.
     setConfig("remote", "");
     refresh();
   }
@@ -396,32 +399,13 @@ Panel {
     refresh();
   }
 
-  // A mesma lista numa janela de terminal de verdade. O painel da barra abre
-  // ancorado, fecha quando perde o foco e cabe no que sobra da tela -- ótimo
-  // para o relance, limitado para sentar e acompanhar. A janela fica aberta,
-  // redimensiona e vai para outro workspace, e a fonte dela é do terminal
-  // (ctrl + e ctrl −), como a de qualquer outra janela sua.
-  function abrirJanela() {
-    if (!bar) return;
-
-    // O "--" e obrigatorio: sem ele o xdg-terminal-exec le o "--local" que vem
-    // depois como opcao dele, engole, e o terminal abre e fecha na hora.
-    var partes = ["omarchy-launch-terminal", "--", root.shq(root.janela)];
-    if (root.session !== "default") partes.push("--session", root.shq(root.session));
-    if (root.useLocal) partes.push("--local");
-    for (var i = 0; i < root.machines.length; i++) partes.push("--remote", root.shq(root.machines[i]));
-
-    bar.run(partes.join(" "));
-    close();
-  }
-
   function openPr(url) {
     if (!url) return;
     if (bar) bar.run("omarchy-launch-webapp " + root.shq(url));
     close();
   }
 
-  // ------------------------------------------------------------- processos
+  // ------------------------------------------------------------- processes
   Process {
     id: snapshotProc
     stdout: StdioCollector {
@@ -429,7 +413,7 @@ Panel {
       onStreamFinished: root.apply(text)
     }
     onExited: function (code) {
-      if (code !== 0 && code !== null) root.helperError = "helper saiu com " + code;
+      if (code !== 0 && code !== null) root.helperError = "helper exited with " + code;
     }
   }
 
@@ -446,10 +430,10 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (!dados) return;
-        if (dados.ok === false) root.note(String(dados.error), true);
-        root.hosts = dados.hosts || [];
+        var data = root.parse(text);
+        if (!data) return;
+        if (data.ok === false) root.note(String(data.error), true);
+        root.hosts = data.hosts || [];
       }
     }
   }
@@ -467,8 +451,8 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (dados && dados.ok === false) root.note(String(dados.error), true);
+        var data = root.parse(text);
+        if (data && data.ok === false) root.note(String(data.error), true);
       }
     }
   }
@@ -478,14 +462,14 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (dados && dados.ok === false) root.note(String(dados.error), true);
+        var data = root.parse(text);
+        if (data && data.ok === false) root.note(String(data.error), true);
       }
     }
   }
 
-  // O texto vai pelo stdin pelo mesmo motivo do envio normal: argv aparece no
-  // `ps` de qualquer processo da maquina.
+  // The text goes on stdin for the same reason as a normal send: argv shows up
+  // in the `ps` of every process on the machine.
   Process {
     id: answerTextProc
 
@@ -499,10 +483,10 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (!dados) return;
-        if (dados.ok === false) root.note(String(dados.error), true);
-        else root.note("escrevi em “" + String(dados.answered) + "”", false);
+        var data = root.parse(text);
+        if (!data) return;
+        if (data.ok === false) root.note(String(data.error), true);
+        else root.note("wrote in “" + String(data.answered) + "”", false);
         root.refresh();
       }
     }
@@ -513,10 +497,10 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (!dados) return;
-        if (dados.ok === false) root.note(String(dados.error), true);
-        else root.note("respondi “" + String(dados.answered) + "”", false);
+        var data = root.parse(text);
+        if (!data) return;
+        if (data.ok === false) root.note(String(data.error), true);
+        else root.note("answered “" + String(data.answered) + "”", false);
         root.refresh();
       }
     }
@@ -527,8 +511,8 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (dados && dados.ok === false) root.note(String(dados.error), true);
+        var data = root.parse(text);
+        if (data && data.ok === false) root.note(String(data.error), true);
       }
     }
   }
@@ -538,16 +522,16 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (dados && dados.ok === false) root.note(String(dados.error), true);
+        var data = root.parse(text);
+        if (data && data.ok === false) root.note(String(data.error), true);
         root.refresh();
       }
     }
   }
 
-  // O prompt vai pelo stdin e nunca pelo argv: argv aparece no `ps` de qualquer
-  // processo da maquina, e prompt de agente costuma carregar caminho, nome de
-  // cliente e trecho de codigo.
+  // The prompt goes on stdin and never on argv: argv shows up in the `ps` of
+  // every process on the machine, and an agent prompt tends to carry paths,
+  // client names and snippets of code.
   Process {
     id: sendProc
 
@@ -561,18 +545,18 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var dados = root.parse(text);
-        if (!dados) return;
-        if (dados.ok === false) root.note(String(dados.error), true);
-        else root.note("enviado para " + Model.nomeDe(Model.acharPane(root.rows, String(dados.pane_id || ""))), false);
+        var data = root.parse(text);
+        if (!data) return;
+        if (data.ok === false) root.note(String(data.error), true);
+        else root.note("sent to " + Model.nameOf(Model.findPane(root.rows, String(data.pane_id || ""))), false);
         root.refresh();
       }
     }
   }
 
-  function parse(texto) {
+  function parse(text) {
     try {
-      return JSON.parse(texto);
+      return JSON.parse(text);
     } catch (e) {
       return null;
     }
@@ -588,8 +572,8 @@ Panel {
 
   Timer {
     interval: root.prSeconds * 1000
-    // Rede so enquanto a lista esta a vista: fechado, o numero do PR nao
-    // aparece em lugar nenhum e a chamada seria puro desperdicio.
+    // Network only while the list is in view: closed, the PR number appears
+    // nowhere and the call would be pure waste.
     running: root.opened
     repeat: true
     onTriggered: root.refreshPrs()
@@ -604,9 +588,10 @@ Panel {
       cursor = rows.length ? 0 : -1;
       field.text = "";
       cancelPending();
-      // O painel prima o proprio foco quando mapeia, e um QQC TextField visivel
-      // o toma nesse instante. Reivindicar a lista depois disso e o que faz o
-      // popup abrir navegavel: escrever e um gesto a mais ("i"), nao o padrao.
+      // The panel primes its own keyboard focus when it maps, and a visible QQC
+      // TextField takes it at that instant. Claiming the list back afterwards is
+      // what makes the popup open navigable: writing is one extra gesture ("i"),
+      // not the default.
       claimList.restart();
     } else {
       status = "";
@@ -622,22 +607,22 @@ Panel {
 
     bar: root.bar
     text: Model.barText(root.counts, root.label, button.vertical)
-    // Bloqueado e o unico estado que pede voce agora. O botao inteiro vira
-    // urgente porque a barra e vista de relance, e nao lida numero a numero.
+    // Blocked is the only state that asks for you now. The whole button turns
+    // urgent because the bar is read at a glance, not number by number.
     active: (root.counts.blocked || 0) > 0
     concealed: root.hideWhenEmpty && (root.counts.total || 0) === 0
     tooltipText: root.helperError !== ""
                  ? root.helperError
-                 : Model.titulo(root.label, root.machines, root.useLocal) + " — " + Model.tooltip(root.counts)
+                 : Model.title(root.label, root.machines, root.useLocal) + " — " + Model.tooltip(root.counts)
 
     onPressed: function (mouseButton) {
       if (mouseButton === Qt.MiddleButton) {
         root.refresh();
         return;
       }
-      // Botao direito abre a mesma gaveta na pagina de configuracao. Configurar
-      // um widget e coisa que se procura nele, e nao num arquivo cujo caminho
-      // voce tem de lembrar.
+      // Right click opens the same drawer on the settings page. Configuring a widget
+      // is something you look for in it, not in a file whose path you have to
+      // remember.
       if (mouseButton === Qt.RightButton) {
         root.settingsOpen = true;
         if (!root.opened) root.open();
@@ -657,35 +642,35 @@ Panel {
       cursor = -1;
       return;
     }
-    var proximo = cursor + delta;
-    if (proximo < 0) proximo = rows.length - 1;
-    if (proximo >= rows.length) proximo = 0;
-    cursor = proximo;
+    var nxt = cursor + delta;
+    if (nxt < 0) nxt = rows.length - 1;
+    if (nxt >= rows.length) nxt = 0;
+    cursor = nxt;
   }
 
   onRowsChanged: if (cursor >= rows.length) cursor = rows.length - 1
 
-  // Com a lista rolando, navegar de seta podia levar o cursor para fora da
-  // vista: a linha ficava selecionada num pedaco do painel que ninguem estava
-  // vendo. Rola o minimo para trazer a linha inteira de volta, e nao a
-  // centraliza -- centralizar mexeria na lista mesmo quando a linha ja esta
-  // visivel, e uma lista que se move sozinha e dificil de acompanhar.
-  function revelarCursor() {
-    if (!rolagem.interactive || cursor < 0) return;
+  // With the list scrolling, arrow navigation could take the cursor out of view:
+  // the row stayed selected in a piece of the panel nobody was looking at. It
+  // scrolls the minimum to bring the whole row back, and does not centre it --
+  // centring would move the list even when the row is already visible, and a
+  // list that moves on its own is hard to follow.
+  function revealCursor() {
+    if (!scroller.interactive || cursor < 0) return;
 
-    var item = listaLinhas.itemAt(cursor);
+    var item = rowsRepeater.itemAt(cursor);
     if (!item) return;
 
-    var topo = item.mapToItem(column, 0, 0).y;
-    var base = topo + item.height;
+    var top = item.mapToItem(column, 0, 0).y;
+    var bottom = top + item.height;
 
-    if (topo < rolagem.contentY) rolagem.contentY = Math.max(0, topo);
-    else if (base > rolagem.contentY + rolagem.height) rolagem.contentY = base - rolagem.height;
+    if (top < scroller.contentY) scroller.contentY = Math.max(0, top);
+    else if (bottom > scroller.contentY + scroller.height) scroller.contentY = bottom - scroller.height;
   }
 
-  onCursorChanged: revelarCursor()
+  onCursorChanged: revealCursor()
 
-  readonly property var defaultRow: Model.acharLinha(rows, defaultMachine, defaultPane)
+  readonly property var defaultRow: Model.findRow(rows, defaultMachine, defaultPane)
   readonly property var cursorRow: cursor >= 0 && cursor < rows.length ? rows[cursor] : null
 
   KeyboardPanel {
@@ -696,10 +681,9 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    // Bem mais largo que os paineis de status: aqui cada linha carrega uma frase
-    // inteira de conversa, e a pergunta de um dialogo vai inteira. Largura
-    // comprada aqui e altura economizada -- e altura e o que falta num popup
-    // pendurado na barra.
+    // Much wider than the status panels: here every row carries a whole sentence
+    // of conversation, and a dialog's question goes whole. Width bought here is
+    // height saved -- and height is what is scarce in a popup hanging off the bar.
     contentWidth: panel.fittedContentWidth(Style.space(780))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
@@ -708,12 +692,13 @@ Panel {
 
       anchors.fill: parent
 
-      // Com o campo em foco o dispatcher tem de sair da frente por inteiro:
-      // "i" e "j" sao texto para o campo e comando para a lista.
+      // With the field focused the dispatcher has to get entirely out of the way:
+      // "i" and "j" are text for the field and commands for the list.
       blocked: field.activeFocus
 
-      // Esc na configuracao volta para a lista antes de fechar: sair da gaveta
-      // inteira porque voce errou a pagina custa reabrir e reachar o widget.
+      // Esc on the settings page goes back to the list before closing: leaving the
+      // whole drawer because you picked the wrong page costs reopening and finding
+      // the widget again.
       onCloseRequested: {
         if (root.settingsOpen) root.settingsOpen = false;
         else root.close();
@@ -729,24 +714,24 @@ Panel {
         if (t === "i") { field.forceActiveFocus(); return; }
         if (t === "r") { root.refresh(); root.refreshPrs(); return; }
 
-        var linha = root.cursorRow;
-        if (!linha) return;
+        var row_ = root.cursorRow;
+        if (!row_) return;
 
-        if (t === "*") { root.setDefault(linha); return; }
+        if (t === "*") { root.setDefault(row_); return; }
 
-        // 1..9 responde o dialogo da linha sob o cursor. Vale a posicao na
-        // lista, e nao a tecla do agente: nos dialogos sem numero nao ha tecla
-        // nenhuma, e a lista e o que voce esta vendo.
+        // 1..9 answers the dialog of the row under the cursor. It is the position in
+        // the list that counts, not the agent's key: unnumbered dialogs have no key at
+        // all, and the list is what you are looking at.
         var n = "123456789".indexOf(t);
-        if (n >= 0 && Model.temOpcoes(linha) && n < linha.options.length)
-          root.pickOption(linha, linha.options[n]);
+        if (n >= 0 && Model.hasOptions(row_) && n < row_.options.length)
+          root.pickOption(row_, row_.options[n]);
       }
 
-      // Uma linha aberta cresce, e quatro falas de uma conversa longa passam
-      // da altura da tela. O painel para de crescer e passa a rolar: cortar
-      // seria perder justamente o fim da conversa, que e a parte nova.
+      // An open row grows, and four messages of a long conversation exceed the
+      // screen's height. The panel stops growing and starts scrolling: cutting would
+      // lose exactly the end of the conversation, which is the new part.
       Flickable {
-        id: rolagem
+        id: scroller
 
         anchors.fill: parent
         contentWidth: width
@@ -760,29 +745,29 @@ Panel {
       Column {
         id: column
 
-        width: rolagem.width
+        width: scroller.width
         spacing: Style.space(6)
 
-        // ---------- cabecalho ----------
+        // ---------- header ----------
         Item {
           width: parent.width
-          // A altura tem de caber os dois lados. Com so a do titulo, a linha da
-          // direita transbordava: aparecia por cima do campo de texto, e o
-          // clique no glifo caia fora dos limites do pai -- em Qt Quick, filho
-          // fora do retangulo do pai desenha, mas nao recebe mouse.
-          implicitHeight: Math.max(header.implicitHeight, direita.implicitHeight)
+          // The height has to fit both sides. With only the title's, the right-hand row
+          // overflowed: it appeared on top of the text field, and the click on the glyph
+          // fell outside the parent's bounds -- in Qt Quick a child outside the parent's
+          // rectangle draws, but receives no mouse.
+          implicitHeight: Math.max(header.implicitHeight, rightSide.implicitHeight)
 
           PanelSectionHeader {
             id: header
             anchors.left: parent.left
             text: root.settingsOpen
-                  ? "‹  " + Model.titulo(root.label, root.machines, root.useLocal) + " · configuração"
-                  : Model.titulo(root.label, root.machines, root.useLocal)
+                  ? "‹  " + Model.title(root.label, root.machines, root.useLocal) + " · settings"
+                  : Model.title(root.label, root.machines, root.useLocal)
             foreground: root.barForeground
             fontFamily: root.fontFamily
 
-            // O proprio titulo e o caminho de volta: com uma pagina so para
-            // sair, um botao dedicado seria mais cromo que ajuda.
+            // The title itself is the way back: with only one page to leave, a dedicated
+            // button would be more chrome than help.
             MouseArea {
               anchors.fill: parent
               enabled: root.settingsOpen
@@ -792,13 +777,12 @@ Panel {
           }
 
           Row {
-            id: direita
+            id: rightSide
 
             anchors.right: parent.right
-            // Centralizada, e nao pela linha de base: o PanelSectionHeader tem
-            // um topPadding proprio (reserva o transbordo dos glifos da Nerd
-            // Font), e alinhar pela base empurrava esta linha para baixo dele,
-            // por cima da borda do campo.
+            // Centred rather than baseline-aligned: PanelSectionHeader has a topPadding of
+            // its own (reserving the overshoot of Nerd Font glyphs), and aligning to the
+            // baseline pushed this row below it, over the field's border.
             anchors.verticalCenter: parent.verticalCenter
             visible: !root.settingsOpen
             spacing: Style.space(10)
@@ -811,31 +795,12 @@ Panel {
               font.bold: true
             }
 
-            // Vira janela de verdade. Fica ao lado das contagens porque é uma
-            // ação sobre o painel inteiro, e não sobre uma linha dele.
-            Text {
-              text: "\uf065"
-              color: root.barForeground
-              opacity: janelaMouse.containsMouse ? 0.9 : 0.45
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-
-              MouseArea {
-                id: janelaMouse
-
-                anchors.fill: parent
-                anchors.margins: -Style.space(5)
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.abrirJanela()
-              }
-            }
           }
         }
 
-        // ---------- campo de envio ----------
-        // Fica em cima da lista porque e o gesto mais barato do painel: manda
-        // uma linha e nao tira voce de onde voce esta.
+        // ---------- send field ----------
+        // It sits above the list because it is the panel's cheapest gesture: it sends
+        // one line and does not take you away from where you are.
         TextField {
           id: field
 
@@ -843,11 +808,11 @@ Panel {
           visible: !root.settingsOpen
           enabled: root.pendingOption !== null || root.defaultPane !== ""
           placeholderText: root.pendingOption
-                           ? Model.placeholderOpcao(root.pendingOption)
+                           ? Model.optionPlaceholder(root.pendingOption)
                            : Model.placeholder(root.defaultRow, root.rows.length > 0)
           foreground: root.barForeground
-          // A borda acesa é o que separa "escrevendo dentro de um diálogo" de
-          // "mandando um prompt novo": são destinos diferentes no mesmo campo.
+          // The lit border is what separates "writing inside a dialog" from "sending a
+          // new prompt": they are different destinations in the same field.
           accent: root.pendingOption ? root.urgentColor : root.barForeground
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -877,18 +842,18 @@ Panel {
           elide: Text.ElideRight
         }
 
-        // ---------- configuração ----------
-        // Quais Herdr este widget está olhando. Cada máquina é um interruptor:
-        // ligada, os agentes dela entram na mesma lista; desligada, o túnel
-        // fecha na hora. O resto das chaves fica no shell.json, que é onde
-        // ficariam de qualquer jeito -- esta é a que ninguém adivinha.
+        // ---------- settings ----------
+        // Which Herdr this widget is watching. Each machine is a switch: on, its
+        // agents join the same list; off, the tunnel closes at once. The rest of the
+        // keys live in shell.json, which is where they would live anyway -- this is
+        // the one nobody guesses exists.
         Column {
           visible: root.settingsOpen
           width: parent.width
           spacing: Style.space(4)
 
           PanelSectionHeader {
-            text: "Máquinas"
+            text: "Machines"
             foreground: root.barForeground
             fontFamily: root.fontFamily
           }
@@ -903,12 +868,12 @@ Panel {
 
             readonly property bool ligada: machine.target === ""
                                            ? root.useLocal
-                                           : Model.temMaquina(root.machines, machine.target)
-            readonly property string falha: Model.erroDaMaquina(root.machineStates, machine.target)
+                                           : Model.hasMachine(root.machines, machine.target)
+            readonly property string falha: Model.machineError(root.machineStates, machine.target)
 
             width: parent ? parent.width : 0
-            implicitHeight: aviso.visible
-                            ? Style.space(26) + aviso.implicitHeight
+            implicitHeight: warning.visible
+                            ? Style.space(26) + warning.implicitHeight
                             : Style.space(26)
             radius: Style.space(6)
             color: machineMouse.containsMouse ? root.hoverFill : "transparent"
@@ -926,7 +891,7 @@ Panel {
             }
 
             Row {
-              id: cabeca
+              id: headLine
 
               anchors.left: parent.left
               anchors.right: parent.right
@@ -966,13 +931,13 @@ Panel {
               }
             }
 
-            // O erro fica na linha da máquina que o causou. Numa lista de
-            // quatro, "deu erro" no rodapé não diz qual nem por quê.
+            // The error sits on the row of the machine that caused it. In a list of four,
+            // "something failed" in the footer says neither which nor why.
             Text {
-              id: aviso
+              id: warning
 
               visible: machine.ligada && machine.falha !== ""
-              anchors.top: cabeca.bottom
+              anchors.top: headLine.bottom
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.leftMargin: Style.space(32)
@@ -985,11 +950,11 @@ Panel {
             }
           }
 
-          // "esta máquina" é um interruptor como os outros, e não a ausência
-          // de escolha: dá para olhar só as remotas, ou só a local, ou tudo.
+          // "this machine" is a switch like the others, not the absence of a choice: you
+          // can look at only the remotes, or only the local one, or everything.
           MachineRow {
             target: ""
-            title: "esta máquina"
+            title: "this machine"
           }
 
           Repeater {
@@ -999,19 +964,19 @@ Panel {
               required property var modelData
 
               target: String(modelData.target || "")
-              title: Model.rotuloHost(modelData)
+              title: Model.hostLabel(modelData)
               note: modelData.online ? "online" : "offline"
-              // Offline não impede: a máquina pode acordar, e o widget diria
-              // o que houve. Escondê-la é que seria mentira.
+              // Offline does not stop it: the machine can wake up, and the widget would say
+              // what happened. Hiding it is what would be a lie.
               dim: !modelData.online
             }
           }
 
-          // As que estão ligadas mas não vieram da Tailscale (alvo digitado à
-          // mão, apelido do ~/.ssh/config). Sem esta lista elas ficariam
-          // ligadas e invisíveis, sem gesto para desligar.
+          // The ones that are on but did not come from Tailscale (a target typed by hand,
+          // an alias from ~/.ssh/config). Without this list they would stay on and
+          // invisible, with no gesture to turn them off.
           Repeater {
-            model: Model.maquinasSoltas(root.machines, root.hosts)
+            model: Model.unlistedMachines(root.machines, root.hosts)
 
             MachineRow {
               required property var modelData
@@ -1023,18 +988,18 @@ Panel {
           }
 
           TextField {
-            id: alvoManual
+            id: manualTarget
 
             width: parent.width
-            placeholderText: "outro alvo SSH (user@host, apelido do ~/.ssh/config)…"
+            placeholderText: "outro target_ SSH (user@host, alias do ~/.ssh/config)…"
             foreground: root.barForeground
             accent: root.barForeground
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
 
             onAccepted: {
-              var alvo = text.trim();
-              if (alvo !== "" && !Model.temMaquina(root.machines, alvo)) root.toggleMachine(alvo);
+              var target_ = text.trim();
+              if (target_ !== "" && !Model.hasMachine(root.machines, target_)) root.toggleMachine(target_);
               text = "";
             }
 
@@ -1048,7 +1013,7 @@ Panel {
           Text {
             width: parent.width
             topPadding: Style.space(4)
-            text: "As demais chaves (intervalo, sessão, linhas) ficam na entrada deste widget em ~/.config/omarchy/shell.json."
+            text: "The remaining keys (interval, session, rows) live in this widget's entry in ~/.config/omarchy/shell.json."
             color: root.fadeColor
             wrapMode: Text.WordWrap
             font.family: root.fontFamily
@@ -1056,11 +1021,11 @@ Panel {
           }
         }
 
-        // ---------- lista ----------
+        // ---------- list ----------
         Text {
           visible: !root.settingsOpen && root.rows.length === 0
           width: parent.width
-          text: root.helperError !== "" ? root.helperError : "Nenhum agente na sessão do Herdr."
+          text: root.helperError !== "" ? root.helperError : "No agents in the Herdr session."
           color: root.helperError !== "" ? root.urgentColor : root.barForeground
           opacity: root.helperError !== "" ? 1 : 0.6
           font.family: root.fontFamily
@@ -1068,10 +1033,9 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        // O conserto, pronto para colar. Um comando que você tem de redigitar
-        // de um popup não é uma dica, é uma pista -- e uma linha de `ssh-copy-id`
-        // com nome de máquina da Tailscale é justamente o tipo de coisa que se
-        // digita errado duas vezes antes de acertar.
+        // The fix, ready to paste. A command you have to retype out of a popup is not a
+        // hint, it is a lead -- and a line of `ssh-copy-id` with a Tailscale machine
+        // name is exactly the sort of thing you mistype twice before getting right.
         Rectangle {
           visible: !root.settingsOpen && root.errorCommand !== ""
           width: parent.width
@@ -1107,7 +1071,7 @@ Panel {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               width: parent.width - Style.space(40)
-              text: root.copied ? "copiado" : root.errorCommand
+              text: root.copied ? "copied" : root.errorCommand
               color: copyMouse.containsMouse || root.copied ? root.barForeground : root.dimColor
               elide: Text.ElideRight
               font.family: root.fontFamily
@@ -1117,7 +1081,7 @@ Panel {
         }
 
         Repeater {
-          id: listaLinhas
+          id: rowsRepeater
 
           model: root.settingsOpen ? [] : root.rows
 
@@ -1130,17 +1094,17 @@ Panel {
             readonly property bool highlighted: mouse.containsMouse || root.cursor === index
             readonly property bool isDefault: modelData.pane_id === root.defaultPane
                                               && modelData.machine === root.defaultMachine
-            readonly property string pr: Model.rotuloPr(modelData)
-            readonly property bool expandida: root.estaExpandida(modelData)
+            readonly property string pr: Model.prLabel(modelData)
+            readonly property bool expanded: root.isExpanded(modelData)
 
             width: column.width
-            implicitHeight: conteudo.implicitHeight + Style.space(10)
+            implicitHeight: content.implicitHeight + Style.space(10)
             radius: Style.space(6)
             color: row.highlighted ? root.hoverFill : "transparent"
 
-            // Declarada antes do conteudo de proposito: em QML quem vem depois
-            // fica por cima e recebe o clique primeiro, e o numero do PR e a
-            // estrela precisam ganhar desta area que cobre a linha inteira.
+            // Declared before the content on purpose: in QML whatever comes later sits on
+            // top and gets the click first, and the PR number and the star need to win
+            // against this area covering the whole row.
             MouseArea {
               id: mouse
 
@@ -1150,16 +1114,16 @@ Panel {
               cursorShape: Qt.PointingHandCursor
               onEntered: root.cursor = row.index
               onClicked: function (evento) {
-                // Direito abre a conversa, esquerdo vai ate ela. Ler o que
-                // aconteceu e decidir se vale ir sao dois gestos, e gastar o
-                // clique de ir para descobrir isso e caro: ele fecha o painel.
-                if (evento.button === Qt.RightButton) root.alternarExpansao(row.modelData);
+                // Right opens the conversation, left goes to it. Reading what happened and
+                // deciding whether it is worth going are two gestures, and spending the go
+                // click to find out is expensive: it closes the panel.
+                if (evento.button === Qt.RightButton) root.toggleExpanded(row.modelData);
                 else root.goTo(row.modelData);
               }
             }
 
             Column {
-              id: conteudo
+              id: content
 
               anchors.left: parent.left
               anchors.right: parent.right
@@ -1168,7 +1132,7 @@ Panel {
               anchors.rightMargin: Style.space(10)
               spacing: Style.space(2)
 
-              // ----- identificacao -----
+              // ----- identification -----
               Row {
                 width: parent.width
                 spacing: Style.space(8)
@@ -1176,7 +1140,7 @@ Panel {
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
                   width: Style.space(12)
-                  text: Model.glifo(row.modelData.status)
+                  text: Model.glyph(row.modelData.status)
                   color: row.modelData.status === "blocked" ? root.urgentColor : root.barForeground
                   opacity: row.modelData.status === "idle" || row.modelData.status === "unknown" ? 0.45 : 1
                   font.family: root.fontFamily
@@ -1184,7 +1148,7 @@ Panel {
                 }
 
                 Text {
-                  id: projeto
+                  id: project_
 
                   anchors.verticalCenter: parent.verticalCenter
                   width: Math.min(implicitWidth, Style.space(150))
@@ -1195,16 +1159,16 @@ Panel {
                   font.pixelSize: Style.font.body
                 }
 
-                // O titulo do terminal e o que distingue duas abas do mesmo
-                // projeto; cede a largura para o resto e some quando repetiria
-                // o projeto. A largura desconta a estrela mesmo quando ela esta
-                // escondida: reservar o espaco custa uma folga a direita e evita
-                // que a linha se remonte cada vez que o cursor passa por ela.
+                // The terminal title is what tells two tabs of the same project apart; it
+                // yields width to the rest and disappears when it would repeat the project.
+                // The width discounts the star even when it is hidden: reserving the space
+                // costs some slack on the right and keeps the row from re-laying out every
+                // time the cursor passes over it.
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width
                          - Style.space(20)
-                         - projeto.width
+                         - project_.width
                          - (row.pr !== "" ? Style.space(50) : 0)
                          - Style.space(26)
                          - Style.space(20)
@@ -1215,13 +1179,13 @@ Panel {
                   font.pixelSize: Style.font.bodySmall
                 }
 
-                // Abrir e fechar a conversa. Aparece sob o cursor e fica
-                // enquanto a linha estiver aberta -- senao, uma linha aberta
-                // com o mouse longe nao teria gesto visivel para fechar.
+                // Open and close the conversation. It appears under the cursor and stays while
+                // the row is open -- otherwise an open row with the mouse far away would have
+                // no visible gesture to close it.
                 Text {
-                  visible: row.highlighted || row.expandida
+                  visible: row.highlighted || row.expanded
                   anchors.verticalCenter: parent.verticalCenter
-                  text: row.expandida ? "\uf077" : "\uf078"
+                  text: row.expanded ? "\uf077" : "\uf078"
                   color: root.barForeground
                   opacity: chevronMouse.containsMouse ? 0.9 : 0.4
                   font.family: root.fontFamily
@@ -1234,7 +1198,7 @@ Panel {
                     anchors.margins: -Style.space(4)
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: root.alternarExpansao(row.modelData)
+                    onClicked: root.toggleExpanded(row.modelData)
                   }
                 }
 
@@ -1258,9 +1222,9 @@ Panel {
                   }
                 }
 
-                // Alvo do campo de texto. Preenchida no alvo atual, vazia sob o
-                // cursor: uma estrela em toda linha viraria ruido numa lista que
-                // e feita para ser lida de relance.
+                // The text field's target. Filled on the current target, hollow under the
+                // cursor: a star on every row would be noise in a list built to be read at a
+                // glance.
                 Text {
                   visible: row.isDefault || row.highlighted
                   anchors.verticalCenter: parent.verticalCenter
@@ -1282,86 +1246,80 @@ Panel {
                 }
               }
 
-              // ----- o que foi dito -----
-              // Uma fala para cada agente e tres para o do campo: e nele que
-              // voce vai responder, e para responder precisa da conversa, nao
-              // da manchete. Alinhadas sob o nome do projeto, nao sob o glifo,
-              // para a coluna de estado continuar sendo uma coluna.
+              // ----- what was said -----
+              // One message per agent and three for the field's own: it is the one you will
+              // reply to, and replying needs the conversation, not the headline. Aligned
+              // under the project name, not under the glyph, so the state column stays a
+              // column.
               Repeater {
-                model: Model.falasVisiveis(row.modelData, row.expandida)
+                model: Model.visibleMessages(row.modelData, row.expanded)
 
                 Row {
                   required property var modelData
 
-                  width: conteudo.width
+                  width: content.width
                   leftPadding: Style.space(20)
                   spacing: Style.space(6)
 
                   Text {
-                    // Sem verticalCenter: ancorar ao centro de um Row cuja
-                    // altura depende deste mesmo texto e circular, e o Qt
-                    // resolve segurando a altura numa linha so -- que era
-                    // exatamente por que o texto quebrado nao aparecia.
+                    // No verticalCenter: anchoring to the centre of a Row whose height depends on
+                    // this very text is circular, and Qt resolves it by holding the height at one
+                    // line -- which was exactly why wrapped text did not show.
                     y: Style.space(1)
                     width: Style.space(9)
-                    text: Model.voz(modelData.who)
+                    text: Model.voice(modelData.who)
                     color: root.fadeColor
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                   }
 
-                  // Elidida em repouso, inteira sob o cursor: a lista continua
-                  // varrivel de relance, e ler a fala toda custa so apontar
-                  // para ela. Cresce para baixo, entao a linha apontada nao
-                  // foge do ponteiro -- as de baixo e que descem.
+                  // Elided at rest, whole under the cursor: the list stays scannable at a glance,
+                  // and reading the full message costs only pointing at it. It grows downward,
+                  // so the row you are pointing at does not run from the pointer -- the ones
+                  // below move down.
                   Text {
                     width: parent.width - Style.space(38)
                     text: modelData.text
                     color: root.dimColor
-                    // Aberta ou sob o cursor, a fala vai inteira; fechada e em
-                    // repouso, cabe numa linha. Cresce para baixo, entao a
-                    // linha apontada nao foge do ponteiro.
-                    elide: row.expandida || row.highlighted ? Text.ElideNone : Text.ElideRight
-                    wrapMode: row.expandida || row.highlighted ? Text.WordWrap : Text.NoWrap
+                    // Open or under the cursor, the message goes whole; closed and at rest, it
+                    // fits on one line. It grows downward, so the row you point at does not run
+                    // from the pointer.
+                    elide: row.expanded || row.highlighted ? Text.ElideNone : Text.ElideRight
+                    wrapMode: row.expanded || row.highlighted ? Text.WordWrap : Text.NoWrap
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                   }
                 }
               }
 
-              // ----- o que ele esta perguntando -----
-              // So aparece em quem esta bloqueado, e so quando o dialogo tem
-              // alternativas reconheciveis. Um agente que pergunta de outro
-              // jeito nao ganha botao nenhum -- o campo de texto responde
-              // qualquer coisa, e um botao adivinhado apertaria a errada.
+              // ----- what it is asking -----
               Column {
-                // Pergunta sem alternativa reconhecivel ainda e pergunta: um
-                // "[y/N]" nao rende botao, mas rende a frase que voce precisa
-                // ler antes de ir ate a aba responder.
-                visible: Model.temOpcoes(row.modelData)
+                // A question with no recognisable option is still a question: a "[y/N]" yields
+                // no button, but it yields the sentence you need to read before going to the
+                // tab to answer.
+                visible: Model.hasOptions(row.modelData)
                          || row.modelData.question !== ""
                          || (row.modelData.context || []).length > 0
-                width: conteudo.width
+                width: content.width
                 topPadding: visible ? Style.space(4) : 0
                 spacing: Style.space(4)
 
-                // O corpo do diálogo: o comando que ele quer rodar, o "Tip:"
-                // que muda o que você escolheria, a descrição. "Do you want to
-                // proceed?" sozinho não é uma pergunta — é a metade dela que
-                // não informa nada.
+                // The dialog's body: the command it wants to run, the "Tip:" that changes what
+                // you would choose, the description. "Do you want to proceed?" on its own is
+                // not a question -- it is the half of it that informs nothing.
                 //
-                // Um Text só, e não um por linha: as quebras já vêm no texto, e
-                // é a fonte monoespaçada da barra que mantém o bloco de comando
-                // alinhado como ele estava na tela.
+                // One single Text rather than one per line: the breaks already come in the
+                // text, and it is the bar's monospaced font that keeps the command block
+                // aligned as it was on screen.
                 Text {
                   visible: (row.modelData.context || []).length > 0
                   x: Style.space(20)
-                  width: conteudo.width - Style.space(20)
-                  // RichText porque as cores vêm do terminal: o Claude Code já
-                  // realçou o diff e o bloco de comando, e repintar aqui seria
-                  // adivinhar de novo o que a outra ponta já sabe.
+                  width: content.width - Style.space(20)
+                  // RichText because the colors come from the terminal: Claude Code already
+                  // highlighted the diff and the command block, and repainting here would mean
+                  // guessing again what the other end already knows.
                   textFormat: Text.RichText
-                  text: Model.htmlDoContexto(row.modelData.context)
+                  text: Model.contextHtml(row.modelData.context)
                   color: root.fadeColor
                   wrapMode: Text.Wrap
                   font.family: root.fontFamily
@@ -1371,32 +1329,31 @@ Panel {
                 Text {
                   visible: row.modelData.question !== ""
                   x: Style.space(20)
-                  width: conteudo.width - Style.space(20)
+                  width: content.width - Style.space(20)
                   text: row.modelData.question
                   color: root.barForeground
-                  // Inteira, e nao elidida: e sobre esta frase que voce decide,
-                  // e meia pergunta e pior que nenhuma -- a metade que sobra
-                  // parece a pergunta toda e voce responde a outra coisa.
+                  // Whole, not elided: this sentence is what you decide on, and half a question
+                  // is worse than none -- the half that survives looks like the whole question
+                  // and you answer something else.
                   wrapMode: Text.WordWrap
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                 }
 
-                // Uma alternativa por linha, largura cheia, texto que quebra
-                // em vez de elidir. Em fila os rotulos curtos caberiam, mas o
-                // "Yes, and always allow access to /home/..." -- justamente o
-                // que carrega a decisao -- chegaria cortado no "/hom…", que e
-                // um sim sem objeto. Altura gasta aqui e a altura da escolha.
+                // One option per row, full width, text that wraps instead of eliding. In a row
+                // the short labels would fit, but "Yes, and always allow access to /home/..."
+                // -- exactly the one carrying the decision -- would arrive cut at "/hom…",
+                // which is a yes with no object. Height spent here is the height of the choice.
                 Column {
                   x: Style.space(20)
-                  width: conteudo.width - Style.space(20)
+                  width: content.width - Style.space(20)
                   spacing: Style.space(3)
 
                   Repeater {
                     model: row.modelData.options || []
 
                     Rectangle {
-                      id: opcao
+                      id: option
 
                       required property var modelData
                       required property int index
@@ -1404,34 +1361,33 @@ Panel {
                       readonly property string badge: Model.badge(modelData)
 
                       width: parent.width
-                      implicitHeight: rotulo.implicitHeight + Style.space(10)
+                      implicitHeight: label_.implicitHeight + Style.space(10)
                       radius: Style.space(5)
-                      color: opcaoMouse.containsMouse ? root.hoverFill : "transparent"
+                      color: optionMouse.containsMouse ? root.hoverFill : "transparent"
                       border.width: 1
-                      // A escolhida ja tem o cursor do proprio dialogo; a borda
-                      // acesa repete isso aqui para o Enter que voce daria la
-                      // ter um equivalente visivel aqui.
-                      border.color: opcao.modelData.selected ? root.barForeground : root.fadeColor
+                      // The chosen one already has the dialog's own cursor; the lit border repeats
+                      // that here so the Enter you would press over there has a visible equivalent
+                      // here.
+                      border.color: option.modelData.selected ? root.barForeground : root.fadeColor
 
                       MouseArea {
-                        id: opcaoMouse
+                        id: optionMouse
 
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         onEntered: root.cursor = row.index
-                        onClicked: root.pickOption(row.modelData, opcao.modelData)
+                        onClicked: root.pickOption(row.modelData, option.modelData)
                       }
 
                       Text {
-                        // Numerado ganha o cracha da tecla; lista com cursor
-                        // nao ganha numero nenhum, porque ali nao ha tecla para
-                        // digitar -- o widget anda com as setas por voce.
-                        visible: opcao.badge !== ""
+                        // Numbered gets the key badge; a cursor list gets no number at all, because
+                        // there is no key to type there -- the widget walks the arrows for you.
+                        visible: option.badge !== ""
                         x: Style.space(10)
                         y: Style.space(5)
                         width: Style.space(14)
-                        text: opcao.badge
+                        text: option.badge
                         color: root.barForeground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
@@ -1439,13 +1395,13 @@ Panel {
                       }
 
                       Text {
-                        id: rotulo
+                        id: label_
 
-                        x: Style.space(10) + (opcao.badge !== "" ? Style.space(20) : 0)
+                        x: Style.space(10) + (option.badge !== "" ? Style.space(20) : 0)
                         y: Style.space(5)
-                        width: opcao.width - x - Style.space(10)
-                        text: opcao.modelData.label
-                        color: opcaoMouse.containsMouse ? root.barForeground : root.dimColor
+                        width: option.width - x - Style.space(10)
+                        text: option.modelData.label
+                        color: optionMouse.containsMouse ? root.barForeground : root.dimColor
                         wrapMode: Text.WordWrap
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
@@ -1458,11 +1414,11 @@ Panel {
           }
         }
 
-        // ---------- rodape ----------
+        // ---------- footer ----------
         Text {
           width: parent.width
           visible: !root.settingsOpen && text !== ""
-          text: Model.avisoGh(root.ghState)
+          text: Model.ghNotice(root.ghState)
           color: root.fadeColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -1473,8 +1429,8 @@ Panel {
         Text {
           width: parent.width
           text: root.settingsOpen
-                ? Model.ajudaConfig(root.hosts)
-                : Model.ajuda(root.rows, root.defaultRow, field.activeFocus, root.cursorRow)
+                ? Model.settingsHint(root.hosts)
+                : Model.hint(root.rows, root.defaultRow, field.activeFocus, root.cursorRow)
           color: root.fadeColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

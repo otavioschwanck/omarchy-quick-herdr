@@ -1,50 +1,38 @@
 # Quick Herdr
 
-Widget de barra do Omarchy: quantos agentes do [Herdr](https://herdr.dev)
-estão rodando, bloqueados e ociosos, o que cada um falou por último, e uma
-lista para ir até um deles ou mandar texto sem sair da barra.
+An Omarchy bar widget: how many [Herdr](https://herdr.dev) agents are running,
+stopped on a question and idle — across as many machines as you turn on — and
+a list to read each one's conversation, go to it, or answer without leaving
+the bar.
 
 ```
 ▶ 2  ◼ 0  ○ 1
 ```
 
-![O painel aberto sobre a sessão do Herdr: um agente parado num pedido de aprovação, com o comando que ele quer rodar, a pergunta e as alternativas como botões](preview.png)
+![The panel open over the Herdr session: an agent stopped on an approval request, with the command it wants to run, the question and the options as buttons](preview.png)
 
-Clicar abre a lista. Clicar numa linha **vai** até o agente: foca a aba dele
-dentro do Herdr e a janela do terminal que roda o cliente. Se não houver
-nenhum cliente aberto, abre o terminal padrão do sistema com o `herdr` já
-na aba certa.
+Clicking opens the list. Clicking a row **goes** to the agent: it focuses its
+tab inside Herdr and the terminal window running the client. If no client is
+open, it launches the system's default terminal with `herdr` already on the
+right tab.
 
-O campo em cima da lista **manda** uma linha para o agente marcado com **★**,
-sem focar nada. É o gesto barato do painel: você responde uma pergunta ou
-empilha a próxima tarefa e continua onde estava.
+The field above the list **sends** one line to the agent marked with **★**,
+focusing nothing. It is the panel's cheap gesture: you answer a question or
+queue the next task and stay where you were.
 
-O **#2313** aparece na linha quando o `gh` acha um PR para o branch do
-diretório do agente, e leva até ele no navegador.
+The **#2313** appears on a row when `gh` finds a PR for the branch of the
+agent's directory, and takes you to it in the browser.
 
-```
-▶  ~                Admin PROD window styling                    ☆
-   ●  Inspecting all three source videos
+## Install
 
-○  nvim.lazy-repo-bak   lazy.nvim                                 ☆
-   ●  Resolvido. checkhealth lazy agora está ✅ em tudo.
-
-▶  acme-api       Corrige o cálculo de amortização      #2313   ★
-   ❯  o vídeo que fiz do tutorial tu cortou?
-   ●  Cortei os 4 segundos iniciais…
-   ●  Write(README.md)
-```
-
-## Instalar
-
-O diretório do plugin **é** o repositório: é assim que o Omarchy espera
-plugins de git, e é o que `omarchy plugin update` sabe atualizar depois.
+The plugin directory **is** the repository: that is how Omarchy expects git
+plugins, and it is what `omarchy plugin update` knows how to update later.
 
 ```bash
 omarchy plugin add https://github.com/otavioschwanck/omarchy-quick-herdr.git --enable
 ```
 
-Ou à mão, que dá no mesmo:
+Or by hand, which amounts to the same:
 
 ```bash
 git clone https://github.com/otavioschwanck/omarchy-quick-herdr.git \
@@ -52,510 +40,481 @@ git clone https://github.com/otavioschwanck/omarchy-quick-herdr.git \
 omarchy plugin enable otavio.quick-herdr --section right
 ```
 
-Widget novo pede `omarchy restart shell` na primeira vez — o hot-reload
-recarrega o QML, mas não registra o alvo de IPC.
+A new widget needs `omarchy restart shell` the first time — the hot reload
+reloads the QML, but does not register the IPC target.
 
-### Do que ele depende
+### What it depends on
 
 | | | |
 |---|---|---|
-| `herdr` | **obrigatório** | vem com o Omarchy; é a sessão que o widget lê |
-| `python3` | **obrigatório** | roda `bin/herdr-bar`; só a biblioteca padrão, sem pacote nenhum |
-| `hyprctl` | **obrigatório** | acha e foca a janela do terminal; vem com o Hyprland |
-| `wl-copy` | opcional | copiar o comando de conserto de um erro |
-| `gh` | opcional | números de PR; sem ele a coluna some e o rodapé diz por quê |
-| `ssh` | opcional | máquinas remotas |
-| `tailscale` | opcional | sugerir máquinas na página de configuração |
+| `herdr` | **required** | ships with Omarchy; it is the session the widget reads |
+| `python3` | **required** | runs `bin/herdr-bar`; standard library only, no packages |
+| `hyprctl` | **required** | finds and focuses the terminal window; ships with Hyprland |
+| `wl-copy` | optional | copying an error's fix command |
+| `gh` | optional | PR numbers; without it the column disappears and the footer says why |
+| `ssh` | optional | remote machines |
+| `tailscale` | optional | suggesting machines on the settings page |
 
-Nada é instalado por você: quando um opcional falta, o recurso dele some e o
-painel diz qual é e o que fazer.
+Nothing is installed for you: when an optional tool is missing, its feature
+disappears and the panel says which one and what to do.
 
-Num Omarchy recém-instalado, só o `gh` costuma faltar — `herdr`, `python`,
-`hyprctl`, `wl-copy`, `ssh` e `tailscale` já vêm. Para garantir todos de uma
-vez (o comando pula o que já está instalado):
+On a fresh Omarchy only `gh` tends to be missing — the rest already ships. To
+get them all in one go (the command skips whatever is already installed):
 
 ```bash
 omarchy pkg add github-cli wl-clipboard openssh tailscale
 ```
 
-O `gh` ainda precisa de `gh auth login` uma vez, senão a coluna de PR continua
-vazia — e o rodapé do painel diz exatamente isso, com o comando pronto para
-copiar.
+`gh` still needs `gh auth login` once, or the PR column stays empty — and the
+panel's footer says exactly that, with the command ready to copy.
 
-### O que ele escreve
+### What it writes
 
-Só isto, e nada fora daqui:
+Only this, and nothing outside it:
 
 ```
-~/.cache/omarchy-quick-herdr/    cache de PR, caminho do herdr remoto, socket ssh
-~/.local/state/omarchy-quick-herdr/  o agente marcado com ★
-/tmp/omarchy-quick-herdr.log     o log (veja "Logs")
+~/.cache/omarchy-quick-herdr/        PR cache, remote herdr path, ssh socket
+~/.local/state/omarchy-quick-herdr/  the agent marked with the star
+/tmp/omarchy-quick-herdr.log         the log (see "Logs")
 ```
 
-A **sua própria entrada** em `~/.config/omarchy/shell.json` também muda, mas
-só quando você liga ou desliga uma máquina na página de configuração — e quem
-escreve é o próprio shell, pelo `setBarWidget`, que é o dono do arquivo. O
-widget não encosta em nenhuma outra entrada nem em configuração de mais
-ninguém.
+**Its own entry** in `~/.config/omarchy/shell.json` changes too, but only when
+you turn a machine on or off on the settings page — and the shell itself does
+the writing, through `setBarWidget`, which owns the file. The widget touches
+no other entry and nobody else's configuration.
 
-## Remover
+## Remove
 
 ```bash
 omarchy plugin remove otavio.quick-herdr
 ```
 
-Isso desabilita e apaga o checkout. Para levar junto o que ele guardou:
+That disables it and deletes the checkout. To take what it kept along with it:
 
 ```bash
 rm -rf ~/.cache/omarchy-quick-herdr ~/.local/state/omarchy-quick-herdr
 rm -f /tmp/omarchy-quick-herdr.log
 ```
 
-Se você tinha máquinas remotas ligadas, o `ControlPersist` fecha os túneis
-sozinho em alguns minutos; para fechar na hora, `ssh -O exit <máquina>`.
+If you had remote machines on, `ControlPersist` closes the tunnels on its own
+within a few minutes; to close one now, `ssh -O exit <machine>`.
 
-## Os três números
+## The three numbers
 
-| glifo | estado do Herdr | |
+| glyph | Herdr state | |
 |---|---|---|
-| `▶` | `working` | está rodando agora |
-| `◼` | `blocked` | parou numa pergunta ou aprovação |
-| `○` | `idle` + `done` | pronto para receber |
+| `▶` | `working` | running right now |
+| `◼` | `blocked` | stopped on a question or an approval |
+| `○` | `idle` + `done` | ready to receive |
 
-`done` é o mesmo `idle` por baixo — é o idle de um trabalho que terminou sem
-ninguém olhando. Conta como ocioso na barra, e na lista aparece como `✓`,
-porque "terminou enquanto você estava longe" é a linha que você quer abrir
-primeiro.
+`done` is the same `idle` underneath — it is the idle of work that finished
+with nobody watching. It counts as idle on the bar, and shows in the list as
+`✓`, because "finished while you were away" is the row you want to open first.
 
-Bloqueado é o único estado que pede você **agora**, então o botão inteiro
-vira urgente quando existe um. A barra é vista de relance, e não lida número
-a número.
+Blocked is the only state that asks for you **now**, so the whole button turns
+urgent when one exists. The bar is read at a glance, not number by number.
 
-## As mensagens
+## The messages
 
-Uma fala por agente, e três no agente do **★** — é nele que você vai
-responder, e para responder precisa da conversa, não da manchete. `●` é o
-agente, `❯` é você.
+One message per agent, and three on the starred one — it is the one you will
+reply to, and replying needs the conversation, not the headline.
 
-O que dá para ler é o que está na tela do terminal: um agente em tela
-alternativa não deixa scrollback, então pedir mais linhas não traz mais
-história. Isso combina com o propósito — a lista mostra o que você veria se
-focasse a aba, nem mais nem menos.
+What can be read is what is on the terminal's screen: an agent on the
+alternate screen leaves no scrollback, so asking for more lines brings no more
+history. That matches the purpose — the list shows what you would see if you
+focused the tab, no more and no less.
 
-De cada fala vem só o primeiro parágrafo. Depois dele vem o detalhamento —
-listas, tabelas, blocos de código — que numa linha de popup viraria ruído.
+Only the first paragraph of each message comes through. After it comes the
+detail — lists, tables, code blocks — which in one popup line would be noise.
 
-Um agente trabalhando mostra a ação do momento (`Write(Panel.qml)`), porque
-é isso que o Claude Code está desenhando ali; um agente parado mostra a
-última coisa que ele te disse. É a distinção útil: para quem está rodando
-você quer saber o que está fazendo, e para quem parou, o que ficou faltando.
+A working agent shows the action of the moment (`Write(Panel.qml)`), because
+that is what Claude Code is drawing there; a stopped agent shows the last
+thing it told you. That is the useful distinction: for one that is running you
+want to know what it is doing, and for one that stopped, what is missing.
 
-Só os primeiros agentes da lista ganham leitura de terminal a cada
-atualização (24, ou `maxRows` se for menor). Cada leitura é uma chamada; na
-mesma máquina são microssegundos, mas por SSH são idas e voltas, e uma sessão
-com trinta agentes não pode travar a barra. E leitura nenhuma acontece com o
-popup fechado — aí a barra quer as contagens e mais nada.
+Only the first agents in the list get a terminal read per refresh (24, or
+`maxRows` if that is smaller). Each read is one call; on the same machine that
+is microseconds, but over SSH they are round trips, and a session with thirty
+agents cannot stall the bar. And no read happens with the popup closed — there
+the bar wants the counts and nothing else.
 
-## Expandir uma conversa
+## Expanding a conversation
 
-Cada linha mostra a última fala, cortada numa linha só. **Botão direito** (ou o
-chevron que aparece sob o cursor) abre a conversa: as últimas quatro falas,
-inteiras, com quebra de linha. Quem está parado numa pergunta já nasce aberto —
-a pergunta é o motivo de você ter aberto a lista.
+Each row shows the last message, cut to a single line. **Right click** (or the
+chevron that appears under the cursor) opens the conversation: the last four
+messages, whole, with line wrapping. Whoever stopped on a question is born
+open — the question is why you opened the list.
 
-`` é você, `✳` é o agente — a mesma marca que o Claude Code desenha no
-terminal, para a lista falar a língua da aba para onde ela leva.
+The four messages arrive in the same payload as the list, always. Reading the
+terminal is one call, and pulling four messages out of it costs the same as
+pulling one — so expanding is instant, instead of a round trip that, on a
+remote machine, would be across the network.
 
-As quatro falas vêm no mesmo pacote da lista, sempre. Ler o terminal é uma
-chamada, e extrair quatro falas dela custa o mesmo que extrair uma — então
-expandir é instantâneo, em vez de uma ida e volta que, numa máquina remota,
-seria pela rede.
+When the content exceeds the screen's height the panel stops growing and
+scrolls. Cutting would lose exactly the end of the conversation, which is the
+new part.
 
-Quando o conteúdo passa da altura da tela o painel para de crescer e rola.
-Cortar seria perder justamente o fim da conversa, que é a parte nova.
+Messages are elided at rest and open whole under the cursor — the list stays
+scannable at a glance, and reading everything costs only pointing. They grow
+downward, so the row you point at does not run from the pointer.
 
-## A janela grande
+## When it stops to ask
 
-O `` no canto do painel abre a mesma lista numa **janela de terminal de
-verdade** (`bin/quick-herdr-tui`). O painel da barra é feito para o relance:
-abre ancorado, fecha quando perde o foco e cabe no que sobra da tela. Para
-sentar e acompanhar várias máquinas isso vira limitação — a janela fica
-aberta, redimensiona e vai para outro workspace.
+A blocked agent's row shows the question and the options as buttons. Clicking
+one answers and the panel **stays open** — the agent changes state next, and
+watching that happen is half the reason to answer from here instead of going
+to the tab. With the cursor on the row, `1`…`9` do the same.
 
-| tecla | |
-|---|---|
-| `↑` `↓` / `j` `k` | navegar |
-| `↵` | ir até o agente |
-| `espaço` | abrir/fechar a conversa |
-| `1`…`9` | responder a alternativa |
-| `i` | escrever para o agente sob o cursor |
-| `*` | marcar o padrão |
-| `r` | atualizar |
-| `q` | sair |
+Two dialog shapes turn up, and each is answered its own way:
 
-A **fonte é do terminal** — `ctrl +` e `ctrl −` no foot, kitty, alacritty e
-ghostty. Não há sequência de escape para tamanho de fonte: quem manda nisso é
-o emulador, e um `+` nosso que não redimensiona nada seria só um botão morto.
-Apertar `+` ali diz isso em vez de engolir a tecla em silêncio.
+- **Numbered** (`1. Yes` / `2. No`) — the number is the key itself, and the
+  widget types that number, as you would.
+- **Cursor list** (`No, exit` / `Yes, I trust this folder`) — there is no key
+  to type at all, so the widget walks the arrows to the line and presses Enter.
+  That is why the number badge only appears in the first shape: inventing a
+  number in the second would teach a shortcut that does not exist.
 
-Não há lógica duplicada entre as duas telas. Todo dado e toda ação passam pelo
-mesmo `bin/herdr-bar` que o painel usa; a janela é só uma segunda forma de
-olhar e de apertar. O dia em que a leitura de diálogo mudar, muda num lugar só.
+Before pressing any key, `answer` re-reads the buffer and rechecks that the
+position **and the label** are still the ones that were on screen when you
+clicked. A dialog can have changed in the meantime, and sending "down, down,
+Enter" into a different dialog approves something else. When they do not
+match, it says the dialog changed rather than risking it.
 
-## Quando ele para para perguntar
+The **dialog's body** comes along: the command it wants to run, the `Tip:`
+that changes what you would choose, the description. "Do you want to proceed?"
+on its own is not a question — it is the half of it that informs nothing.
 
-`◼` é o agente parado num diálogo de aprovação. A linha dele mostra a pergunta
-e as alternativas como botões:
+Lines come separated, not glued into a paragraph: a command block with its
+breaks undone is unreadable. The common indent is stripped (the dialog box
+already pushed everything inward) and the relative one stays, which is what
+keeps the command readable. They are the **last** 24 lines: the request sits
+against the question, and what is far above is conversation history.
 
-```
-◼  acme-api       Corrige o cálculo                       #2313   ★
-   ●  Vou apagar o diretório de scratch antes de recompilar.
-   Do you want to proceed?
-   [1 Yes] [2 Yes, and don't ask again for rm commands] [3 No, and tell…]
-```
+An agent that asks some other way — `[y/n]`, running text — gets no button,
+but it **does get the question**: the sentence shows the same, only with
+nothing to click. No button is honest; no question would be hiding what
+happened.
 
-Clicar numa alternativa responde e o painel **fica aberto** — o agente muda de
-estado em seguida, e ver isso acontecer é metade da razão de responder daqui
-em vez de ir até a aba. Com o cursor na linha, `1`…`9` fazem o mesmo.
+### The options that ask for text
 
-Duas formas de diálogo aparecem por aí, e cada uma se responde do seu jeito:
+Not every option answers on its own. `No, and tell Claude what to do
+differently`, `Chat about this`, `Tell Claude what to change` — those open a
+field and wait for you to write. Pressing the key and stopping there would
+leave the agent stuck on an empty input, which is worse than having no button.
 
-- **Numerada** (`❯ 1. Yes` / `2. No`) — o número é a própria tecla, e o widget
-  digita esse número, como você digitaria.
-- **Lista com cursor** (`❯ No, exit` / `  Yes, I trust this folder`) — não há
-  tecla nenhuma para digitar, então o widget anda com as setas até a linha e
-  aperta Enter. É por isso que o crachá do número só aparece na primeira
-  forma: inventar um número na segunda ensinaria um atalho que não existe.
+So the panel inverts the order: clicking one of those **does not touch the
+dialog yet**. The field at the top changes destination (the border lights up,
+the placeholder names the option) and only when you press Enter does the widget
+choose the option, wait for the screen to react and type the text. `esc`
+cancels without having touched anything.
 
-Antes de apertar qualquer tecla, o `answer` relê o buffer e reconfere que a
-posição **e o rótulo** ainda são os que estavam na tela quando você clicou. Um
-diálogo pode ter mudado nesse meio tempo, e mandar "para baixo, para baixo,
-Enter" num diálogo diferente aprova outra coisa. Quando não bate, ele diz que
-o diálogo mudou em vez de arriscar.
+The wait is for any change in the buffer, not for the options to disappear:
+some screens keep the list and open the field beside it. A stopped agent has a
+still screen, so any change there is the answer to the key — which would not
+hold for a working agent, whose spinner changes on its own.
 
-O **corpo do diálogo** sobe junto: o comando que ele quer rodar, o `Tip:` que
-muda o que você escolheria, a descrição. "Do you want to proceed?" sozinho não
-é uma pergunta — é a metade dela que não informa nada.
+### Writing something else
 
-As linhas vão separadas, e não coladas num parágrafo: um bloco de comando com
-as quebras desfeitas fica ilegível. O recuo comum sai (a caixa do diálogo já
-empurrava tudo para dentro) e o relativo fica, que é o que mantém o comando
-legível. São as **últimas** 24 linhas: o pedido fica colado na pergunta, e o
-que está muito acima é histórico da conversa, não o pedido.
+Sending text to a blocked agent **refuses** what it was asking and sends your
+text instead. The field's placeholder says so while the target is blocked.
 
-Um agente que pergunta de outro jeito — `[y/n]`, texto corrido — não ganha
-botão nenhum, mas **ganha a pergunta**: a frase aparece igual, só sem
-alternativa para clicar. Botão nenhum é honesto; pergunta nenhuma seria
-esconder o que aconteceu. Sobra o campo, que responde qualquer coisa.
+What does that is `esc`, which is the way out the dialog itself offers: Claude
+Code labels the last option *"No, and tell Claude what to do differently
+(esc)"*. So the widget presses `esc`, waits for the agent to return to the
+prompt and only then sends the text — exactly the sequence you would do by
+hand. If it does not come back in time, the text is **not** sent and the panel
+says so: a prompt delivered halfway into an open dialog is worse than an error.
 
-As falas da lista ficam elididas em repouso e se abrem inteiras sob o cursor —
-a lista continua varrível de relance, e ler tudo custa só apontar. Elas crescem
-para baixo, então a linha apontada não foge do ponteiro; as de baixo é que
-descem.
+The order is to try first and unblock after, rather than checking first:
+between the snapshot and the click the agent can have stopped, and there is no
+way to test without that race.
 
-### As alternativas que pedem texto
+## A Herdr on another machine
 
-Nem toda alternativa responde sozinha. `No, and tell Claude what to do
-differently`, `Chat about this`, `Tell Claude what to change` — essas abrem um
-campo e ficam esperando você escrever. Apertar a tecla e parar ali deixaria o
-agente travado num input vazio, que é pior que não ter botão.
+One widget watches as many machines as you like. Right click opens the list of
+switches: on, that machine's agents join the same list; off, the tunnel closes
+at once — "I turned it off" has to mean "it disconnected", not "it will
+disconnect eventually".
 
-Então o painel inverte a ordem: clicar numa dessas **não toca no diálogo
-ainda**. O campo do topo muda de destino (a borda acende, o placeholder passa
-a `escrever em "Chat about this"…`) e só quando você dá Enter é que o widget
-escolhe a alternativa, espera a tela reagir e digita o texto. `esc` cancela
-sem ter mexido em nada.
-
-A espera é por qualquer mudança no buffer, e não pelo sumiço das alternativas:
-há telas que mantêm a lista e abrem o campo ao lado. Agente bloqueado tem tela
-parada, então qualquer mudança ali é a resposta à tecla — o que não valeria
-para um agente trabalhando, cujo spinner muda sozinho.
-
-### Escrever outra coisa
-
-Mandar texto para um agente bloqueado **recusa** o que ele estava pedindo e
-manda o seu texto no lugar. O placeholder do campo diz isso enquanto o alvo
-estiver `◼`.
-
-Quem faz isso é o `esc`, que é a saída que o próprio diálogo oferece: o Claude
-Code rotula a última alternativa como *"No, and tell Claude what to do
-differently (esc)"*. Então o widget aperta `esc`, espera o agente voltar ao
-prompt e só então manda o texto — exatamente a sequência que você faria à mão.
-Se ele não voltar a tempo, o texto **não** é enviado e o painel diz isso: um
-prompt entregue pela metade num diálogo aberto é pior que um erro.
-
-A ordem é tentar primeiro e destravar depois, e não checar antes: entre o
-snapshot e o clique o agente pode ter travado, e não há como testar sem essa
-corrida. Então o caminho é mandar, e só quando levar o `agent_blocked` é que
-o `esc` entra.
-
-## Um Herdr de outra máquina
-
-Um widget só olha quantas máquinas você quiser. Botão direito abre a lista de
-interruptores: ligada, os agentes daquela máquina entram na mesma lista;
-desligada, o túnel fecha na hora — "desliguei" tem de significar "desconectou",
-não "vai desconectar quando der".
-
-"Esta máquina" é um interruptor como os outros, e não a ausência de escolha: dá
-para olhar só as remotas, só a local, ou tudo junto.
+"This machine" is a switch like the others, not the absence of a choice: you
+can look at only the remotes, only the local one, or everything together.
 
 ```json
-{ "id": "otavio.quick-herdr", "machines": "desktop servidor", "local": true }
+{ "id": "otavio.quick-herdr", "machines": "desktop server", "local": true }
 ```
 
-A lista vai separada por espaço, e não como array, porque a IPC do shell lê um
-argumento `[...]` como lista de argumentos — array de verdade não atravessa
-ela. Nome de host não tem espaço, então não há ambiguidade; quem editar o
-`shell.json` à mão pode escrever um array, que também é aceito na leitura.
+The list goes space-separated rather than as an array because the shell's IPC
+reads a `[...]` argument as an argument list — a real array cannot cross it.
+Hostnames have no spaces, so there is no ambiguity; anyone editing `shell.json`
+by hand can write an array, which is accepted on read too.
 
-As máquinas são consultadas em paralelo, numa thread cada: com quatro ligadas,
-esperar uma de cada vez faria a barra andar no ritmo da soma de todas. Quando
-uma falha, o erro aparece **na linha dela** na página de configuração — numa
-lista de quatro, "deu erro" não diz qual nem por quê.
+Machines are queried in parallel, one thread each: with four on, waiting for
+one at a time would make the bar move at the speed of their sum. When one
+fails, the error appears **on its own row** on the settings page — in a list of
+four, "something failed" says neither which nor why.
 
-Para descobrir os alvos:
+To discover targets:
 
 ```bash
 ~/.config/omarchy/plugins/otavio.quick-herdr/bin/herdr-bar hosts
 ```
 
-Isso lista as máquinas da Tailscale, que é a resposta certa aqui: o alvo tem
-de continuar valendo de qualquer rede, e um IP de LAN no `shell.json` quebra
-na primeira vez que você abre o notebook em outro lugar. Mas é sugestão, não
-única porta — qualquer alvo que o seu `~/.ssh/config` entenda serve, apelido
-incluído, e `usuario@maquina` quando o login do outro lado for outro.
+That lists the Tailscale machines, which is the right answer here: the target
+has to keep working from any network, and a LAN IP in `shell.json` breaks the
+first time you open the laptop somewhere else. But it is a suggestion, not the
+only door — any target your `~/.ssh/config` understands works, aliases
+included, and `user@machine` when the login on the other end differs.
 
-O alvo sugerido é o **nome curto** (`desktop`) sempre que o MagicDNS o
-resolver, e só cai no FQDN quando não resolve. `desktop` é um alvo que você
-lê, confere e digita; `desktop.tailnet-abc123.ts.net` é um que você copia e cola
-torcendo para não ter errado uma letra do meio.
+The suggested target is the **short name** (`desktop`) whenever MagicDNS
+resolves it, falling back to the FQDN only when it does not. `desktop` is a
+target you read, check and type; `desktop.tailnet-abc123.ts.net` is one you
+copy and paste hoping you did not get a letter wrong in the middle.
 
-Na primeira vez, conecte uma vez à mão:
+The first time, connect once by hand:
 
 ```bash
 ssh desktop.tailnet-abc123.ts.net
 ```
 
-O widget conecta com `BatchMode=yes` e não aceita chave de host nova sozinho
-— confiar numa chave nova é decisão sua, não de um processo de fundo. Quando
-algo assim falha, o erro no painel já vem com o comando que resolve.
-
-Quando algo falha, a dica vem com o comando que resolve **entre crases**, e o
-painel transforma isso num botão de copiar. Um comando que você tem de
-redigitar de um popup não é uma dica, é uma pista — e uma linha de
-`ssh-copy-id` com nome de máquina da Tailscale é justamente o tipo de coisa
-que se digita errado duas vezes antes de acertar.
+The widget connects with `BatchMode=yes` and will not accept a new host key on
+its own — trusting a new key is your decision, not a background process's.
+When something like that fails, the panel's error comes with the command that
+fixes it, in backticks, and the panel turns that into a copy button. A command
+you have to retype out of a popup is not a hint, it is a lead.
 
 ### Tailscale SSH
 
-Se você quer que a autenticação seja da tailnet e não de chave, o destino
-precisa de `sudo tailscale up --ssh`. Sem isso quem atende na porta 22 é o
-`sshd` comum, e o erro é `Permission denied (publickey,password)` mesmo com a
-Tailscale funcionando — dá para confirmar pelo banner: o Tailscale SSH se
-anuncia como `Tailscale`, o outro como `OpenSSH_x.y`.
+If you want authentication to come from the tailnet rather than from a key,
+the target needs `tailscale up --ssh` with the usual privilege. Without it,
+what answers on port 22 is the plain `sshd`, and the error is
+`Permission denied (publickey,password)` even with Tailscale working — you can
+tell from the banner: Tailscale SSH announces itself as `Tailscale`, the other
+one as `OpenSSH_x.y`.
 
-E a regra `ssh` da ACL precisa ser `"action": "accept"`. Com `"check"`, a
-Tailscale pede re-autenticação no navegador de tempos em tempos, e um widget
-que conecta com `BatchMode=yes` nunca vai ver essa URL — ele só falha. O
-painel reconhece esse erro e diz isso.
+And the ACL's `ssh` rule needs to be `"action": "accept"`. With `"check"`,
+Tailscale asks for browser re-authentication periodically, and a widget
+connecting with `BatchMode=yes` will never see that URL — it only fails. The
+panel recognises that error and says so.
 
-Ir até um agente remoto foca a janela local aberta com `herdr --remote ALVO`,
-e abre uma se não houver. Os números de PR somem: os repositórios estão na
-outra ponta, e rodar `git` nos caminhos que o Herdr remoto devolve daria
-número errado ou nenhum — melhor não ter coluna do que ter uma que mente.
+### Going to a remote agent
 
-### Ir até um agente remoto
+It opens `ssh -t <machine> <herdr-path>`, not `herdr --remote`. The difference
+matters: `--remote` brings the client from **here** to the server **over
+there**, compares versions and, when they differ, opens on a `[y/N]` offering
+to update the remote server — a terminal stopping on a question is not "go to
+the agent". With `ssh -t`, client and server are both from over there: there
+is nothing to compare.
 
-Abre `ssh -t <máquina> <caminho-do-herdr>`, e não `herdr --remote`. A diferença
-importa: `--remote` traz o cliente **daqui** para o servidor **de lá**, compara
-as versões e, quando divergem, abre num `[y/N]` oferecendo atualizar o servidor
-remoto — um terminal que para numa pergunta não é "ir até o agente". Com
-`ssh -t`, cliente e servidor são os dois de lá: não há o que comparar.
+Aligning versions would also fix it, but not always. A build with self-update
+disabled will never align, and then the question would be forever.
 
-Alinhar as versões também resolveria, mas nem sempre dá. Um build com
-self-update desativado nunca vai alinhar, e aí a pergunta seria para sempre.
+The price is what `--remote` manages on its own: keepalive, multiplexing and
+image paste. Whoever wants those opens `herdr --remote` by hand — the window is
+recognised just the same, and the widget focuses it instead of opening another.
 
-O preço é o que o `--remote` gerencia sozinho: keepalive, multiplexação e o
-paste de imagem. Quem quiser isso abre `herdr --remote` à mão — a janela é
-reconhecida do mesmo jeito, e o widget foca ela em vez de abrir outra.
+The refresh default rises to 8 seconds with remote machines (floor of 5),
+because each one is a round trip across the network. The connection is
+multiplexed (`ControlMaster`), so only the first pays for the handshake.
 
-O padrão de atualização sobe para 8 segundos com máquinas remotas (piso de 5),
-porque cada uma é uma ida e volta pela rede. A conexão é multiplexada
-(`ControlMaster`), então só a primeira paga o handshake.
+## Settings (right click)
 
-## Configurar (botão direito)
+Right click on the widget opens the same drawer on the settings page, with the
+machine picker: this machine, one row per Tailscale peer (online or not — the
+machine can wake up, and hiding it would be a lie), and a field for any other
+SSH target. Choosing a remote machine with no label set uses its name as the
+label, or two instances look identical on the bar.
 
-Botão direito no widget abre a mesma gaveta na página de configuração, com o
-seletor de máquina: `esta máquina`, uma linha por par da Tailscale (online ou
-não — a máquina pode acordar, e escondê-la seria mentira), e um campo para
-qualquer outro alvo SSH. Escolher uma máquina remota sem rótulo definido usa o
-nome dela como rótulo, senão duas instâncias ficam idênticas na barra.
+Configuring a widget is something you look for **in it**, not in a file whose
+path you have to remember. The remaining keys stay in the widget's entry in
+`~/.config/omarchy/shell.json`, which is where they would live anyway — this is
+the one nobody guesses exists.
 
-Configurar um widget é coisa que se procura **nele**, e não num arquivo cujo
-caminho você tem de lembrar. As demais chaves continuam na entrada do widget
-em `~/.config/omarchy/shell.json`, que é onde ficariam de qualquer jeito —
-esta é a que ninguém adivinha que existe.
+The shell does the writing, through `setBarWidget`: it owns `shell.json` and
+reloads on its own afterwards. The widget finds its own position by re-reading
+the file, because the bar hands it `bar`, `moduleName` and `settings`, but not
+where it sits on the bar.
 
-Quem escreve é o próprio shell, via `setBarWidget`: ele é o dono do
-`shell.json` e recarrega sozinho depois. O widget descobre a própria posição
-relendo o arquivo, porque o bar entrega a ele `bar`, `moduleName` e
-`settings`, mas não onde ele está na barra.
+## Keyboard
 
-## Teclado
+With the popup open:
 
-Com o popup aberto:
-
-| tecla | |
+| key | |
 |---|---|
-| `↑` `↓` / `j` `k` | navegar |
-| `↵` | ir até o agente |
-| `1`…`9` | responder a alternativa, na linha de um bloqueado |
-| `i` | escrever no campo (`esc` volta para a lista) |
-| `*` | marcar/desmarcar o padrão do campo |
-| `r` | atualizar, PRs inclusive |
-| `esc` | fechar |
+| `↑` `↓` / `j` `k` | move |
+| `↵` | go to the agent |
+| `1`…`9` | answer an option, on a blocked row |
+| `i` | write in the field (`esc` goes back to the list) |
+| `*` | mark/unmark the field's default |
+| `r` | refresh, PRs included |
+| `esc` | close |
 
-E de fora, para quem preferir uma tecla a um clique:
+And from outside, for anyone who prefers a key to a click:
 
 ```bash
 omarchy-shell otavio.quick-herdr toggle
 ```
 
-## Todas as chaves
+## Every key
 
-Em `~/.config/omarchy/shell.json`, na entrada do widget:
+In `~/.config/omarchy/shell.json`, on the widget's entry:
 
-| chave | padrão | |
+| key | default | |
 |---|---|---|
-| `remote` | "" | alvo SSH; vazio = o Herdr desta máquina |
-| `label` | "" | rótulo na barra, para distinguir instâncias |
-| `session` | `default` | sessão do Herdr |
-| `interval` | 4 (8 com `remote`) | segundos entre atualizações das contagens |
-| `prInterval` | 180 | segundos entre consultas de PR, só com a lista aberta |
-| `maxRows` | 20 | linhas na lista |
-| `hideWhenEmpty` | false | sumir da barra quando não houver agente |
+| `machines` | "" | space-separated SSH targets; empty means only this machine |
+| `local` | true | include this machine's agents |
+| `label` | "" | label on the bar, to tell instances apart |
+| `session` | `default` | Herdr session |
+| `interval` | 4 (8 with remotes) | seconds between count refreshes |
+| `prInterval` | 180 | seconds between PR lookups, only with the list open |
+| `maxRows` | 20 | rows in the list |
+| `hideWhenEmpty` | false | disappear from the bar when there is no agent |
 
-## Notas de implementação
+## Implementation notes
 
-- Tudo passa por `bin/herdr-bar`, que devolve uma linha de JSON. Um clique
-  aqui vira várias chamadas encadeadas — foco no Herdr, descoberta da janela,
-  dispatch do Hyprland — e encadear `Process` em QML é como se escreve
-  callback hell. Todo comando sai com 0 e reporta falha dentro do JSON: um
-  servidor do Herdr parado não pode parecer um helper quebrado.
+- Everything goes through `bin/herdr-bar`, which returns one line of JSON. One
+  click here becomes several chained calls — focus in Herdr, finding the
+  window, a Hyprland dispatch — and chaining `Process` in QML is how callback
+  hell gets written. Every command exits 0 and reports failure inside the JSON:
+  a stopped Herdr server must not look like a broken helper.
 
-- **Qual janela é a do Herdr.** O cliente é neto do emulador de terminal
-  (terminal → shell → `herdr`), então a ligação vem de subir a cadeia de
-  `ppid` até cair num pid que o compositor conheça. Isso vale para qualquer
-  terminal, o que casar por `class` não faria — e nesta máquina já existe uma
-  janela de terminal com o título `herdr` cujo `herdr` morreu faz tempo, que
-  um casamento por título pegaria errado. Com mais de um cliente aberto,
-  ganha o menor `focusHistoryID`: a janela que você usou por último. Um
-  terminal em modo servidor, com uma janela só para todas as abas, é o caso
-  que isso não resolve.
+- **The cost of being on.** The data the bar needs costs 5 ms
+  (`herdr api snapshot`); the tick used to cost 134 ms of CPU. The difference
+  was interpreter startup, paid again on every refresh — 25 ms of imports plus
+  ~13 ms of Python, times three processes, because each machine ran in a
+  subprocess so as not to fight over the target global. Two changes cut that:
+  the target became *thread-local*, so machines run on threads in one process
+  (134 to 64 ms); and with the list closed the interval doubles on every cycle
+  with no news, up to 60 s. Any change in the counts, or opening the list,
+  drops back to the floor at once. In a quiet session that is the difference
+  between 0.8 % and 0.1 % of a core.
 
-- **A ordem do foco.** `herdr agent focus` vai antes de a janela existir, de
-  propósito. Quando não há cliente nenhum, o terminal novo já sobe
-  renderizando a aba certa, e não há corrida entre o attach e um focus que
-  chegaria depois.
+- **Finding `herdr` on the other end.** `ssh machine command` runs a
+  non-interactive, non-login shell: it reads neither `.zshrc` nor `.bashrc`, so
+  its `PATH` is the system minimum. A `herdr` in `~/.local/bin` — which is
+  where its installer tends to put it — simply does not exist on that side, and
+  the error reads `command not found` on a machine where the binary is right
+  there, visible to you. So the absolute path is discovered once, in a login
+  shell, and cached; paying for that shell on every refresh would be expensive,
+  and guessing the directory would be worse. If a call fails that way again, it
+  rediscovers before giving up.
 
-- **O custo de estar ligado.** O dado que a barra precisa custa 5 ms
-  (`herdr api snapshot`); o tick custava 134 ms de CPU. A diferença era partida
-  de interpretador, paga de novo a cada atualização — 25 ms de imports mais
-  ~13 ms de Python, vezes três processos, porque cada máquina rodava num
-  subprocesso para não disputar o global do alvo. Duas mudanças cortaram isso:
-  o alvo virou *thread-local*, então as máquinas rodam em threads no mesmo
-  processo (134 → 64 ms); e com a lista fechada o intervalo dobra a cada ciclo
-  sem novidade, até 60 s. Qualquer mudança nas contagens, ou abrir a lista,
-  volta ao piso na hora. Numa sessão parada isso é a diferença entre 0,8 % e
-  0,1 % de um núcleo.
+- **Which window is Herdr's.** The client is the terminal emulator's grandchild
+  (terminal, shell, `herdr`), so the link comes from walking the `ppid` chain
+  until it lands on a pid the compositor knows. That holds for any terminal,
+  which matching on `class` would not, and it is not fooled by a terminal
+  window that merely kept the title `herdr` after its herdr died. With more
+  than one client open, the lowest `focusHistoryID` wins: the window you used
+  last. A terminal in server mode, with one window for every tab, is the case
+  this does not solve.
 
-- **Achar o `herdr` na outra ponta.** `ssh maquina comando` roda um shell
-  não-interativo e não-login: ele não lê o `.zshrc` nem o `.bashrc`, então o
-  `PATH` dele é o mínimo do sistema. Um `herdr` em `~/.local/bin` — que é onde
-  o instalador dele costuma pôr — simplesmente não existe desse lado, e o erro
-  sai como `command not found` numa máquina onde o binário está lá, visível
-  para você. Então o caminho absoluto é descoberto uma vez, num shell de
-  login, e guardado no cache; pagar esse shell a cada atualização seria caro, e
-  adivinhar o diretório seria pior. Se uma chamada voltar a falhar assim, ele
-  redescobre antes de desistir — senão uma reinstalação em outro prefixo daria
-  um widget que só volta limpando cache à mão.
+- **The order of focus.** `herdr agent focus` goes before the window exists, on
+  purpose. When no client is open, the new terminal comes up already rendering
+  the right tab, and there is no race between the attach and a focus arriving
+  after it.
 
-- **Ler o diálogo** sai da mesma leitura de terminal que as mensagens: um
-  `agent read` por agente, e o formulário só é extraído de quem está `blocked`.
-  As alternativas sem número se reconhecem pela **coluna** onde o texto começa,
-  e não por um marcador — é a única coisa que elas têm em comum com a linha do
-  cursor. Por isso a moldura da caixa é tirada só nas barras verticais: um
-  `strip()` genérico apagaria justamente o recuo que as identifica.
+- **Reading the dialog** comes out of the same terminal read as the messages:
+  one `pane read --format ansi` per agent, and the form is only extracted from
+  agents that are blocked. Unnumbered options are recognised by the **column**
+  where their text starts, not by a marker — it is the only thing they share
+  with the cursor line. That is why the box chrome is stripped only at the
+  vertical bars: a generic `strip()` would erase exactly the indent that
+  identifies them.
 
-- **Extrair mensagens** é achar os marcadores de fala na margem do buffer
-  (`herdr agent read --source detection`) e parar cada bloco na primeira linha
-  de moldura ou na primeira linha em branco. Marcador no meio de um parágrafo
-  é conteúdo, não fala nova; e o `❯` sozinho é o prompt vazio esperando você.
-  O Herdr suporta 22 tipos de agente e este parser conhece os marcadores dos
-  que os usam — para os outros, a linha simplesmente fica sem mensagem, o que
-  é melhor que inventar uma.
+- **Code highlighting comes from the terminal.** Claude Code already highlights
+  diffs and command blocks, so the read is `pane read --format ansi` and the
+  panel translates the SGR into rich text. Reimplementing a highlighter would
+  mean guessing again what the other end already knows. Every color that turns
+  up is truecolor, so there is no palette to guess. Measured cost: 66 ms per
+  tick against 68 ms before — the same read, now with color.
 
-- **O prompt vai pelo stdin**, nunca pelo argv. Prompt não é segredo, mas
-  argv aparece no `ps` de qualquer processo da máquina, e prompt de agente
-  costuma carregar caminho, nome de cliente e trecho de código.
+- **Extracting messages** means finding the speech markers in the buffer's
+  margin and stopping each block at the first chrome line or the first blank
+  line. A marker in the middle of a paragraph is content, not new speech; and a
+  lone prompt marker is the empty prompt waiting for you. Herdr supports 22
+  agent kinds and this parser knows the markers of those that use them — for
+  the others the row simply has no message, which is better than inventing one.
 
-- **Dois ritmos.** `snapshot` só lê o cache de PR; quem vai ao GitHub é
-  `prs`, e só enquanto a lista está à vista. Uma chamada de rede por
-  repositório a cada 4 segundos, para um número que quase nunca muda, seria
-  puro desperdício. O cache é chaveado por (repositório, branch) e guarda o
-  cwd que o gerou — trocar de branch no mesmo diretório reivindica o cwd para
-  a chave nova, senão o snapshot devolveria o PR do branch anterior, num
-  número que parece certo e não é.
+- **Dialog text is never attributed to anyone.** A line starting with a speech
+  marker is speech, and speech with a `?` in it is a question someone asked in
+  the conversation, not the one the screen is waiting on. And a menu needs a
+  choice: a marked line with no siblings is the prompt, not an option. Without
+  those two guards, a pane Herdr marked blocked by mistake produced a
+  "question" made of loose conversation — a guess that looks like information.
 
-- **O alvo padrão** é gravado por `pane_id` e, como segunda tentativa, casa
-  por `cwd`. Um pane movido para outro workspace ganha um `pane_id` novo, e o
-  padrão não pode se perder numa reorganização de layout — é o mesmo agente,
-  no mesmo projeto. Quando nenhum dos dois casa, o campo diz que não tem para
-  onde mandar em vez de mandar para o vizinho. Cada `remote` e cada `session`
-  tem o seu.
+- **The prompt goes on stdin**, never on argv. A prompt is not a secret, but
+  argv shows up in the `ps` of every process on the machine, and an agent
+  prompt tends to carry paths, client names and snippets of code.
 
-- **A lista é o foco inicial.** Um `TextField` visível toma o foco no
-  instante em que o painel mapeia, então a lista o reivindica logo depois:
-  escrever é um gesto a mais (`i`), não o padrão.
+- **Two rhythms.** `snapshot` only reads the PR cache; `prs` is what goes to
+  GitHub, and only while the list is in view. One network call per repository
+  every 4 seconds, for a number that almost never changes, would be pure waste.
+  The cache is keyed by (repository, branch) and stores the cwd that produced
+  it — switching branch in the same directory claims the cwd for the new key,
+  or the snapshot would return the previous branch's PR, in a number that looks
+  right and is not.
 
-- A ordem das linhas é a do próprio Herdr (workspace, aba, pane). Ordenar por
-  estado poria o bloqueado em cima, mas faria a linha fugir do cursor toda vez
-  que um agente mudasse de estado; o botão urgente já avisa sem mexer na
-  lista.
+- **The default target** is stored by `pane_id` and, as a second try, matched by
+  `cwd`. A pane moved to another workspace gets a new `pane_id`, and the default
+  must not be lost in a layout reshuffle — it is the same agent, in the same
+  project. When neither matches, the field says it has nowhere to send rather
+  than sending to the neighbour.
 
-- O `MouseArea` da linha inteira é declarado **antes** do conteúdo: em QML
-  quem vem depois fica por cima e recebe o clique primeiro, e o número do PR e
-  a estrela precisam ganhar dele.
+- **The list is the initial focus.** A visible `TextField` takes focus the
+  instant the panel maps, so the list claims it back right after: writing is one
+  extra gesture (`i`), not the default.
 
-- O root repassa `implicitWidth`/`implicitHeight` do botão: o bar dimensiona
-  o slot por eles, e sem isso o widget existe, roda e não ocupa espaço nenhum.
+- Row order is Herdr's own (workspace, tab, pane). Ordering by state would put
+  the blocked one on top, but would make the row run from the cursor every time
+  an agent changed state; the urgent button already warns without moving the
+  list.
+
+- The whole row's `MouseArea` is declared **before** the content: in QML
+  whatever comes later sits on top and gets the click first, and the PR number
+  and the star need to win against it.
+
+- In Qt Quick a child outside its parent's rectangle **draws but receives no
+  mouse**. The header's `Item` used to be as tall as the title alone, so the
+  counts row overflowed: it drew over the text field and its clicks fell
+  nowhere.
+
+- The root passes the button's `implicitWidth`/`implicitHeight` through: the bar
+  sizes the slot by them, and without that the widget exists, runs and takes up
+  no space.
+
+- HTML collapses whitespace, which eats exactly the indentation of a code
+  block. Every run of two or more spaces becomes a hard space, and so does a
+  single one starting a line — a lone space in the middle stays ordinary, or a
+  long line would lose where to wrap. Not only on the first run of a line:
+  when the line is highlighted the indentation falls inside the colored run,
+  and that is where it used to disappear.
 
 ## Logs
 
-Tudo que o helper faz de consequência — foco, prompt, resposta a diálogo,
-gravação de configuração, descoberta do Herdr remoto, e todo erro — vai para
-um arquivo:
+Everything the helper does that has consequences — focus, prompt, dialog
+answer, settings write, discovering the remote Herdr, and every error — goes to
+a file:
 
 ```bash
 tail -f /tmp/omarchy-quick-herdr.log
 ```
 
-Uma linha por evento, com hora e a máquina quando é remota:
+One line per event, with the time and the machine when it is remote:
 
 ```
-2026-08-29T18:46:10 herdr-remoto-achado remoto=desktop caminho=/home/voce/.local/bin/herdr
-2026-08-29T18:52:31 terminal-aberto remoto=desktop pane=w2K:p3
-2026-08-29T18:53:04 respondeu remoto=desktop pane=w2K:p3 opcao=Yes
+2026-08-29T18:46:10 remote-herdr-found remote=desktop path=/home/you/.local/bin/herdr
+2026-08-29T18:52:31 terminal-opened remote=desktop pane=w2K:p3
+2026-08-29T18:53:04 answered remote=desktop pane=w2K:p3 option=Yes
 ```
 
-O que **não** entra: o snapshot de cada 4 segundos, que encheria o arquivo sem
-dizer nada. O log é para o que mudou alguma coisa e para o que falhou.
+What does **not** go in: the snapshot every 4 seconds, which would fill the
+file without saying anything. The log is for what changed something and for
+what failed.
 
-O arquivo é cortado pela metade quando passa de 1 MB, então pode ficar aberto
-sem cuidado. Ele é aberto com `O_NOFOLLOW` e modo `0600`: um nome fixo em
-`/tmp` é compartilhado, e alguém pode ter plantado um symlink ali antes — no
-pior caso não se registra nada, e nunca se escreve no arquivo de outra pessoa.
+The file is cut in half when it passes 1 MB, so it can be left open without
+care. It is opened with `O_NOFOLLOW` and mode `0600`: a fixed name in `/tmp` is
+shared, and someone could have planted a symlink there first — in the worst
+case nothing is logged, and never into somebody else's file.
 
-## Licença
+## License
 
-MIT. Veja [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
