@@ -41,13 +41,13 @@ O diretório do plugin **é** o repositório: é assim que o Omarchy espera
 plugins de git, e é o que `omarchy plugin update` sabe atualizar depois.
 
 ```bash
-omarchy plugin add https://github.com/<voce>/omarchy-quick-herdr.git --enable
+omarchy plugin add https://github.com/otavioschwanck/omarchy-quick-herdr.git --enable
 ```
 
 Ou à mão, que dá no mesmo:
 
 ```bash
-git clone https://github.com/<voce>/omarchy-quick-herdr.git \
+git clone https://github.com/otavioschwanck/omarchy-quick-herdr.git \
   ~/.config/omarchy/plugins/otavio.quick-herdr
 omarchy plugin enable otavio.quick-herdr --section right
 ```
@@ -55,10 +55,52 @@ omarchy plugin enable otavio.quick-herdr --section right
 Widget novo pede `omarchy restart shell` na primeira vez — o hot-reload
 recarrega o QML, mas não registra o alvo de IPC.
 
-Precisa de `herdr` no `PATH` (vem com o Omarchy) e, para os números de PR,
-de um `gh` autenticado. Sem `gh`, a coluna de PR some e o rodapé diz por quê:
-"nenhum PR" e "o gh nunca foi autenticado nesta máquina" não podem parecer a
-mesma coisa, porque só um dos dois tem conserto.
+### Do que ele depende
+
+| | | |
+|---|---|---|
+| `herdr` | **obrigatório** | vem com o Omarchy; é a sessão que o widget lê |
+| `python3` | **obrigatório** | roda `bin/herdr-bar`; só a biblioteca padrão, sem pacote nenhum |
+| `hyprctl` | **obrigatório** | acha e foca a janela do terminal; vem com o Hyprland |
+| `wl-copy` | opcional | copiar o comando de conserto de um erro |
+| `gh` | opcional | números de PR; sem ele a coluna some e o rodapé diz por quê |
+| `ssh` | opcional | máquinas remotas |
+| `tailscale` | opcional | sugerir máquinas na página de configuração |
+
+Nada é instalado por você: quando um opcional falta, o recurso dele some e o
+painel diz qual é e o que fazer.
+
+### O que ele escreve
+
+Só isto, e nada fora daqui:
+
+```
+~/.cache/omarchy-quick-herdr/    cache de PR, caminho do herdr remoto, socket ssh
+~/.local/state/omarchy-quick-herdr/  o agente marcado com ★
+/tmp/omarchy-quick-herdr.log     o log (veja "Logs")
+```
+
+A **sua própria entrada** em `~/.config/omarchy/shell.json` também muda, mas
+só quando você liga ou desliga uma máquina na página de configuração — e quem
+escreve é o próprio shell, pelo `setBarWidget`, que é o dono do arquivo. O
+widget não encosta em nenhuma outra entrada nem em configuração de mais
+ninguém.
+
+## Remover
+
+```bash
+omarchy plugin remove otavio.quick-herdr
+```
+
+Isso desabilita e apaga o checkout. Para levar junto o que ele guardou:
+
+```bash
+rm -rf ~/.cache/omarchy-quick-herdr ~/.local/state/omarchy-quick-herdr
+rm -f /tmp/omarchy-quick-herdr.log
+```
+
+Se você tinha máquinas remotas ligadas, o `ControlPersist` fecha os túneis
+sozinho em alguns minutos; para fechar na hora, `ssh -O exit <máquina>`.
 
 ## Os três números
 
