@@ -233,10 +233,16 @@ Panel {
   // one network call per repository every few seconds, for a number that almost
   // never changes.
   function refreshPrs() {
-    if (!prsProc.running) {
-      prsProc.command = argv(["prs"]);
-      prsProc.running = true;
-    }
+    if (prsProc.running) return;
+
+    // The same machine list as the snapshot: the lookup runs where each
+    // repository lives, so a remote machine gets its numbers too.
+    var args = ["prs"];
+    if (root.useLocal) args.push("--local");
+    for (var i = 0; i < root.machines.length; i++) args.push("--remote", root.machines[i]);
+
+    prsProc.command = argv(args);
+    prsProc.running = true;
   }
 
   function apply(payload) {

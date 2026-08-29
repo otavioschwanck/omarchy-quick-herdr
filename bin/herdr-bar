@@ -895,6 +895,14 @@ def short_name(cwd):
 
 def agent_row(agent, tabs, prs):
     cwd = str(agent.get("cwd") or "")
+    # Two directories, two purposes. `cwd` is where the pane opened and gives
+    # the project its name; `foreground_cwd` is where the agent actually is,
+    # which with git worktrees is a different branch under
+    # .claude/worktrees/<branch>. Looking the PR up by `cwd` made every agent
+    # in one repository resolve to the same branch -- usually main, usually no
+    # PR -- which is why the column was empty on exactly the machine with the
+    # most branches open.
+    work_cwd = str(agent.get("foreground_cwd") or "") or cwd
     title = str(agent.get("terminal_title_stripped") or agent.get("terminal_title") or "").strip()
     project = tabs.get(agent.get("tab_id")) or short_name(cwd)
 
@@ -902,7 +910,7 @@ def agent_row(agent, tabs, prs):
     if status not in STATUSES:
         status = "unknown"
 
-    pr = prs.get(cwd) or {}
+    pr = prs.get(work_cwd) or prs.get(cwd) or {}
 
     return {
         "pane_id": str(agent.get("pane_id") or ""),
@@ -911,6 +919,7 @@ def agent_row(agent, tabs, prs):
         "kind": str(agent.get("agent") or ""),
         "status": status,
         "cwd": cwd,
+        "pr_cwd": work_cwd,
         "project": project,
         # The title would repeat the project when the tab was not renamed and the
         # agent did not touch the title; a column that repeats another only spends
@@ -1473,54 +1482,77 @@ def cmd_default(args):
     fail("no agent in %s" % args[0])
 
 
-def cmd_prs(_args):
-    # A remote Herdr has its repositories on the other end: the paths it returns
-    # do not exist here, and running git on them would give the wrong PR number,
-    # or none. Better no column than one that lies.
+# One round trip per machine instead of three per repository. Over SSH the
+# difference is not the CPU, it is the latency: eight agents on four repos would
+# be a dozen round trips, and this is a single one.
+PR_SCRIPT = """
+for d in %s; do
+  root=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || continue
+  br=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null) || continue
+  [ "$br" = HEAD ] && continue
+  pr=$(cd "$d" 2>/dev/null && gh pr view --json number,url,title,state 2>/dev/null)
+  printf '%%s\\t%%s\\t%%s\\t%%s\\n' "$d" "$root" "$br" "$pr"
+done
+"""
+
+
+def pr_lookup(cwds):
+    """(cwd, root, branch, pr json) for each directory, resolved where it lives.
+
+    A remote Herdr has its repositories on the other end: the paths it returns
+    do not exist here, so the lookup has to happen there. Which is also why it
+    is one shell script over one connection rather than a call per repository.
+    """
+    if not cwds:
+        return []
+
+    script = PR_SCRIPT % " ".join(shlex.quote(c) for c in cwds)
     if remote():
-        reply(queried=0, gh="remote")
+        argv = ssh_prefix() + ['exec "$SHELL" -lc ' + shlex.quote(script)]
+        timeout = TIMEOUT_GH + TIMEOUT_SSH
+    else:
+        argv = ["sh", "-c", script]
+        timeout = TIMEOUT_GH + TIMEOUT_HERDR
+
+    code, out, _ = run(argv, timeout)
+    if code != 0:
+        return []
+
+    found = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4 and parts[1]:
+            found.append((parts[0], parts[1], parts[2], json_from(parts[3]) or {}))
+    return found
+
+
+def refresh_prs_for(target):
+    """Refreshes one machine's PR cache. Returns how many repositories it asked about."""
+    use_remote(target)
 
     data, err = build_snapshot()
     if err:
-        fail(err)
+        return 0
 
     cache = read_json(pr_cache_path())
     now = time.time()
 
-    gh = cache.get("_gh") if isinstance(cache.get("_gh"), dict) else {}
-    if now - float(gh.get("ts") or 0) >= GH_TTL:
-        gh = {"state": gh_state(), "ts": now}
-        cache["_gh"] = gh
-
-    queried = 0
+    # Which directories are stale enough to be worth asking about. A PR never
+    # changes number, so what expires is the "this branch has no PR yet".
+    pending = []
     for line in data["rows"]:
-        root_, branch = repo_and_branch(line["cwd"])
-        if not root_:
+        cwd = line.get("pr_cwd") or line["cwd"]
+        if not cwd or cwd in pending:
             continue
-        key = "%s\n%s" % (root_, branch)
-
-        entry = cache.get(key)
+        entry = prs_by_cwd(cache).get(cwd)
         if isinstance(entry, dict):
             ttl = PR_TTL if entry.get("number") else PR_TTL_EMPTY
             if now - float(entry.get("ts") or 0) < ttl:
-                # Even when fresh, the entry has to point at the cwd of now: that is how the
-                # snapshot finds it.
-                claim_cwd(cache, key, line["cwd"])
                 continue
+        pending.append(cwd)
 
-        if queried >= MAX_REPOS_PER_RUN or gh.get("state") != "ok":
-            break
-        queried += 1
-
-        code, out, _ = run(
-            ["gh", "pr", "view", "--json", "number,url,title,state"],
-            TIMEOUT_GH,
-            cwd=line["cwd"],
-        )
-        body = json_from(out) if code == 0 else None
-        if not isinstance(body, dict):
-            body = {}
-
+    for cwd, root_, branch, body in pr_lookup(pending[:MAX_REPOS_PER_RUN]):
+        key = "%s\n%s" % (root_, branch)
         cache[key] = {
             "ts": now,
             "number": int(body["number"]) if isinstance(body.get("number"), int) else 0,
@@ -1528,46 +1560,33 @@ def cmd_prs(_args):
             "title": str(body.get("title") or ""),
             "state": str(body.get("state") or ""),
         }
-        claim_cwd(cache, key, line["cwd"])
+        claim_cwd(cache, key, cwd)
 
     write_json(pr_cache_path(), prune(cache))
-    reply(queried=queried, gh=gh.get("state") or "")
+    return len(pending[:MAX_REPOS_PER_RUN])
 
 
-# ------------------------------------------------------------ configuration
+def cmd_prs(args):
+    """Refreshes the PR cache of every machine that is on.
 
-
-SHELL_JSON = os.path.expanduser("~/.config/omarchy/shell.json")
-PLUGIN_ID = "otavio.quick-herdr"
-
-
-def my_entry():
-    """(section, index, entry) of this instance in shell.json.
-
-    The bar hands the widget only `bar`, `moduleName` and `settings` -- not its
-    position on the bar, which is what `setBarWidget` needs. So it is found
-    again here: a plugin with allowMultiple can have several entries, and what
-    tells mine apart from the others is exactly the `remote` I was given.
+    The lookup runs where each repository lives, so a remote machine gets its
+    numbers too. It used to give up on remotes -- the paths did not exist here,
+    and running git on them would have lied -- but not asking at all left the
+    column empty on exactly the machines with the most branches open.
     """
-    config = read_json(SHELL_JSON, teto=4 * 1024 * 1024)
-    layout = ((config.get("bar") or {}).get("layout") or {})
+    targets = values_of(args, "--remote")
+    if "--local" in args or not targets:
+        targets.insert(0, "")
 
-    candidates = []
-    for section in ("left", "center", "right"):
-        for index, entry in enumerate(layout.get(section) or []):
-            if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
-                candidates.append((section, index, entry))
+    if len(targets) == 1:
+        queried = refresh_prs_for(targets[0])
+    else:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+            queried = sum(pool.map(refresh_prs_for, targets))
 
-    if not candidates:
-        return (None, "this instance is not in shell.json")
-    if len(candidates) == 1:
-        return (candidates[0], "")
-
-    same = [c for c in candidates if str(c[2].get("remote") or "") == remote()]
-    if len(same) == 1:
-        return (same[0], "")
-
-    return (None, "there are %d copies of this widget on the same machine — edit shell.json" % len(candidates))
+    use_remote("")
+    reply(queried=queried, gh=gh_state())
 
 
 def cmd_config(args):

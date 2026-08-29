@@ -263,9 +263,6 @@ function settingsHint(hosts) {
 function ghNotice(gh) {
   if (gh === "missing") return "gh not installed — no PR numbers";
   if (gh === "unauthenticated") return "gh not authenticated — run `gh auth login`";
-  // The repositories live on the other end: running git on the paths a remote
-  // Herdr returns would give the wrong number, or none.
-  if (gh === "remote") return "remote session — no PR numbers";
   return "";
 }
 
