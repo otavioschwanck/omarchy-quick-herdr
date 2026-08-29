@@ -1,0 +1,1708 @@
+#!/usr/bin/env python3
+"""Ponte entre o widget de barra otavio.quick-herdr e o Herdr.
+
+Imprime uma linha de JSON no stdout para o lado QML ler. Todo comando sai com
+0 e reporta falha dentro desse JSON -- o widget sempre tem algo para desenhar,
+e um servidor do Herdr parado nao pode parecer um helper quebrado.
+
+Uso: herdr-bar [--session NOME] [--remote ALVO_SSH] <comando> [args]
+
+Comandos:
+  snapshot [--messages]   estado da sessao: contagens, uma linha por agente e,
+                          com --messages, o que cada um falou por ultimo
+  focus <pane_id>         foca o agente no Herdr e a janela que roda o cliente
+  send <pane_id>          manda o texto que vier no stdin para o agente; se ele
+                          estiver num dialogo, recusa com esc antes de mandar
+  answer <pane_id> <n> [rotulo] [--with-text]
+                          escolhe a alternativa <n> do dialogo de um bloqueado;
+                          com --with-text, escreve no campo que ela abrir
+  default <pane_id|->     grava (ou limpa) o alvo padrao do campo de texto
+  prs                     atualiza o cache de PRs (o unico que vai na rede)
+  hosts                   maquinas da Tailscale que servem de alvo --remote
+  config get              a entrada desta instancia no shell.json
+  config set <chave> <v> [--json]
+                          grava uma configuracao desta instancia
+  all [--messages] [--local] [--remote A]...
+                          os agentes de todas as maquinas ligadas, em paralelo
+  pick <maquina|.|-> <pane> [cwd]
+                          escolhe (ou limpa) o alvo do campo de texto
+  disconnect <alvo>       fecha o tunel multiplexado de uma maquina desligada
+
+Com --remote, todo comando do Herdr vai por SSH ate aquela maquina, e a janela
+que o `focus` procura e a do cliente local aberto com `herdr --remote ALVO`. A
+conexao e multiplexada (ControlMaster), porque um widget que atualiza a cada
+poucos segundos nao pode pagar um handshake SSH por atualizacao.
+
+O texto do `send` vem no stdin e nunca no argv: uma linha, terminada em \\n.
+Prompt nao e segredo, mas argv aparece no `ps` de qualquer processo da maquina
+e prompt de agente costuma carregar caminho, nome de cliente e trecho de codigo.
+
+`snapshot` nunca vai na rede: ele le o cache que `prs` escreveu. Sao ritmos
+diferentes -- as contagens querem 4 segundos, e uma chamada ao GitHub por
+repositorio nao aguenta esse ritmo nem precisa dele.
+"""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+
+SESSAO_PADRAO = "default"
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "omarchy-quick-herdr",
+)
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "omarchy-quick-herdr",
+)
+
+# TTL do cache de PR. Um PR nao muda de numero, entao o que expira aqui e o
+# "esse branch ainda nao tem PR" -- o unico caso que vale reperguntar, e o
+# unico motivo do TTL nao ser infinito.
+PR_TTL = 900
+PR_TTL_VAZIO = 120
+GH_TTL = 300
+
+# Tetos em tudo que chega de fora deste processo: resposta do Herdr, resposta
+# do gh, o buffer de um terminal alheio, o cache que outra invocacao escreveu.
+# Um socket que despeja megabytes nao pode inchar a barra, que roda dentro do
+# mesmo processo do resto do desktop.
+MAX_SAIDA = 4 * 1024 * 1024
+MAX_CACHE = 2 * 1024 * 1024
+MAX_TEXTO = 32 * 1024
+MAX_REPOS_POR_VEZ = 12
+MAX_ENTRADAS_CACHE = 200
+
+# Quantos agentes ganham leitura de terminal numa atualizacao. Cada leitura e
+# uma chamada; local sao microssegundos, mas por SSH sao idas e voltas, e uma
+# sessao com trinta agentes nao pode travar a barra.
+MAX_LEITURAS = 24
+LINHAS_BUFFER = 90
+# Teto de uma fala. Alto de proposito: ele existe para um buffer estranho nao
+# despejar uma tela inteira no painel, e nao para encurtar conversa -- expandida,
+# a linha mostra a frase toda, e cortar no meio dela e pior que ocupar altura.
+MAX_MENSAGEM = 1200
+# Quantas falas cada linha carrega. A lista mostra a ultima; expandir mostra
+# todas, e e por isso que elas ja vem no mesmo pacote.
+MAX_FALAS = 4
+# Quantas linhas de contexto do dialogo sobem junto. Teto porque um diff grande
+# nao pode virar o painel inteiro; as ultimas porque o pedido fica colado na
+# pergunta, e o que esta acima e historico.
+MAX_CONTEXTO = 24
+# A pergunta de um dialogo vai inteira: e sobre ela que voce decide, e o teto
+# aqui existe so para um buffer estranho nao despejar uma tela no painel.
+MAX_PERGUNTA = 600
+# O rotulo de uma alternativa vai inteiro pelo mesmo motivo da pergunta: e nele
+# que mora a decisao. "Yes, and always allow access to /home/..." cortado no
+# meio do caminho vira um "sim" sem objeto, que e exatamente o que voce
+# precisava ler antes de clicar.
+MAX_ROTULO = 240
+
+# Um arquivo fixo em /tmp e conveniente e compartilhado: qualquer um pode ter
+# plantado um symlink ali antes. O O_NOFOLLOW recusa seguir um, entao o pior
+# caso e nao registrar nada -- e nunca escrever no arquivo de outra pessoa.
+LOG = "/tmp/omarchy-quick-herdr.log"
+MAX_LOG = 1024 * 1024
+CAUDA_LOG = 256 * 1024
+
+TIMEOUT_HERDR = 5
+TIMEOUT_SSH = 15
+TIMEOUT_GIT = 5
+TIMEOUT_GH = 20
+TIMEOUT_HYPR = 5
+
+# idle e done sao o mesmo estado por baixo: done e o idle de um trabalho que
+# terminou sem ninguem olhando. Contam junto em "ocioso" e so se separam na
+# lista, onde da para marcar o que terminou enquanto voce estava longe.
+STATUS = ("working", "blocked", "idle", "done", "unknown")
+
+SESSAO = SESSAO_PADRAO
+
+# A maquina atual e por thread, e nao do modulo: as maquinas sao consultadas em
+# paralelo, e um global seria trocado por uma thread debaixo da outra. Antes
+# isto era um subprocesso por maquina, que dava o mesmo isolamento cobrando um
+# interpretador Python inteiro por maquina a cada atualizacao.
+_ALVO = threading.local()
+
+
+def remoto():
+    return getattr(_ALVO, "remoto", "")
+
+
+def usar_remoto(alvo):
+    _ALVO.remoto = alvo or ""
+
+
+# --------------------------------------------------------------- utilidades
+
+
+def responder(**campos):
+    campos.setdefault("ok", True)
+    campos.setdefault("error", "")
+    sys.stdout.write(json.dumps(campos, ensure_ascii=False) + "\n")
+    sys.exit(0)
+
+
+def falhar(mensagem, **campos):
+    registrar("erro", mensagem=str(mensagem)[:300])
+    responder(ok=False, error=str(mensagem)[:400], **campos)
+
+
+def registrar(evento, **campos):
+    """Uma linha no log. Nunca levanta: log e diagnostico, nao funcionalidade."""
+    partes = ["%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), evento)]
+    if remoto():
+        partes.append("remoto=%s" % remoto())
+    for chave, valor in campos.items():
+        if valor not in ("", None):
+            partes.append("%s=%s" % (chave, str(valor).replace("\n", " ")[:300]))
+    linha = " ".join(partes) + "\n"
+
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > MAX_LOG:
+            with open(LOG, "rb") as arquivo:
+                arquivo.seek(-CAUDA_LOG, os.SEEK_END)
+                cauda = arquivo.read()
+            with open(LOG, "wb") as arquivo:
+                arquivo.write(cauda)
+        descritor = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(descritor, linha.encode("utf-8", "replace"))
+        finally:
+            os.close(descritor)
+    except OSError:
+        pass
+
+
+def rodar(argv, timeout, cwd=None):
+    """Executa argv sem shell. Devolve (codigo, stdout, stderr) e nunca levanta."""
+    try:
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        return (127, "", "%s nao encontrado" % argv[0])
+    except subprocess.TimeoutExpired:
+        return (124, "", "%s excedeu %ss" % (argv[0], timeout))
+    except OSError as erro:
+        return (126, "", str(erro))
+
+    return (
+        proc.returncode,
+        proc.stdout[:MAX_SAIDA].decode("utf-8", "replace"),
+        proc.stderr[:4096].decode("utf-8", "replace"),
+    )
+
+
+def json_de(texto):
+    try:
+        return json.loads(texto)
+    except (ValueError, TypeError):
+        return None
+
+
+def ler_json(caminho, teto=MAX_CACHE):
+    try:
+        if os.path.getsize(caminho) > teto:
+            return {}
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            valor = json.load(arquivo)
+    except (OSError, ValueError):
+        return {}
+    return valor if isinstance(valor, dict) else {}
+
+
+def gravar_json(caminho, valor):
+    """Grava atomico: o widget le esses arquivos a qualquer instante."""
+    try:
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        temporario = "%s.tmp.%d" % (caminho, os.getpid())
+        with open(temporario, "w", encoding="utf-8") as arquivo:
+            json.dump(valor, arquivo, ensure_ascii=False)
+        os.replace(temporario, caminho)
+    except OSError:
+        pass
+
+
+def escopo():
+    """Sufixo de arquivo que separa local de cada remoto e cada sessao."""
+    alvo = re.sub(r"[^A-Za-z0-9_.@-]", "_", remoto()) if remoto() else "local"
+    return "%s-%s" % (alvo, re.sub(r"[^A-Za-z0-9_.-]", "_", SESSAO))
+
+
+def caminho_pr():
+    return os.path.join(CACHE_DIR, "prs-%s.json" % escopo())
+
+
+def caminho_padrao():
+    return os.path.join(STATE_DIR, "default-%s.json" % escopo())
+
+
+# -------------------------------------------------------------------- herdr
+
+
+def ssh_prefixo():
+    """Multiplexa a conexao: sem isso, cada atualizacao paga um handshake.
+
+    O socket de controle fica no cache e persiste alguns minutos depois da
+    ultima chamada, entao a atualizacao seguinte reaproveita o mesmo tunel.
+    """
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    except OSError:
+        pass
+    return [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=%s/ssh-%%r@%%h-%%p" % CACHE_DIR,
+        "-o", "ControlPersist=300",
+        remoto(),
+    ]
+
+
+# `ssh maquina comando` roda um shell nao-interativo e nao-login: ele nao le o
+# .zshrc nem o .bashrc, entao o PATH dele e o minimo do sistema. Um herdr
+# instalado em ~/.local/bin -- que e onde o instalador dele costuma por --
+# simplesmente nao existe desse lado, e o erro sai como "command not found"
+# numa maquina onde o binario esta la, visivel para voce.
+#
+# Por isso o caminho absoluto e descoberto uma vez e guardado: pagar um shell
+# de login por atualizacao seria caro, e adivinhar o diretorio seria pior.
+BUSCA_HERDR = (
+    'command -v herdr 2>/dev/null || '
+    'for p in "$HOME/.local/bin/herdr" /usr/bin/herdr /usr/local/bin/herdr "$HOME/bin/herdr"; '
+    'do [ -x "$p" ] && printf %s "$p" && break; done'
+)
+
+_HERDR_POR_ALVO = {}
+_TRAVA_HERDR = threading.Lock()
+
+
+def caminho_remoto_json():
+    return os.path.join(CACHE_DIR, "remoto-%s.json" % escopo())
+
+
+def descobrir_herdr():
+    """Caminho absoluto do herdr na outra ponta, ou "" se nao houver."""
+    argv = ssh_prefixo() + ['exec "$SHELL" -lc ' + shlex.quote(BUSCA_HERDR)]
+    codigo, saida, _ = rodar(argv, TIMEOUT_SSH)
+    achado = saida.strip().splitlines()[-1].strip() if codigo == 0 and saida.strip() else ""
+    return achado if achado.startswith("/") else ""
+
+
+def herdr_remoto(redescobrir=False):
+    alvo = remoto()
+
+    with _TRAVA_HERDR:
+        if redescobrir:
+            _HERDR_POR_ALVO.pop(alvo, None)
+            guardado = ler_json(caminho_remoto_json(), teto=64 * 1024)
+            guardado.pop("herdr", None)
+            gravar_json(caminho_remoto_json(), guardado)
+        elif alvo in _HERDR_POR_ALVO:
+            return _HERDR_POR_ALVO[alvo]
+
+        guardado = ler_json(caminho_remoto_json(), teto=64 * 1024).get("herdr")
+        if isinstance(guardado, str) and guardado.startswith("/"):
+            _HERDR_POR_ALVO[alvo] = guardado
+            return guardado
+
+    achado = descobrir_herdr()
+    if achado:
+        with _TRAVA_HERDR:
+            guardado = ler_json(caminho_remoto_json(), teto=64 * 1024)
+            guardado.update({"herdr": achado, "ts": time.time()})
+            gravar_json(caminho_remoto_json(), guardado)
+            _HERDR_POR_ALVO[alvo] = achado
+        registrar("herdr-remoto-achado", caminho=achado)
+    # Sem descoberta, tenta o nome pelado assim mesmo: se o PATH minimo o
+    # alcancar, funciona; se nao, o erro que volta e o certo.
+    return achado or "herdr"
+
+
+def chamar_herdr(*args, _retentou=False):
+    """Roda a CLI do Herdr, aqui ou na outra ponta. Devolve (codigo, out, err)."""
+    if not remoto():
+        partes = ["herdr"]
+        if SESSAO != SESSAO_PADRAO:
+            partes += ["--session", SESSAO]
+        return rodar(partes + [str(a) for a in args], TIMEOUT_HERDR)
+
+    partes = [herdr_remoto()]
+    if SESSAO != SESSAO_PADRAO:
+        partes += ["--session", SESSAO]
+    partes += [str(a) for a in args]
+
+    # Uma string so: o comando de `ssh` passa por um shell na outra ponta,
+    # entao cada argumento vai citado para chegar inteiro.
+    resultado = rodar(ssh_prefixo() + [" ".join(shlex.quote(p) for p in partes)], TIMEOUT_SSH)
+
+    # O caminho guardado pode ter envelhecido -- atualizacao, reinstalacao em
+    # outro prefixo. Uma redescoberta antes de desistir custa um shell de login
+    # e evita um widget que so volta a funcionar limpando cache.
+    baixo = (resultado[1] + resultado[2]).lower()
+    if not _retentou and ("command not found" in baixo or "no such file or directory" in baixo):
+        herdr_remoto(redescobrir=True)
+        return chamar_herdr(*args, _retentou=True)
+
+    return resultado
+
+
+# Um erro de SSH sozinho e um beco sem saida numa barra de status: ninguem
+# conserta "Host key verification failed" olhando para ele. A dica que vai
+# junto e o comando que resolve.
+DICAS_SSH = (
+    # As duas do Tailscale SSH vem primeiro porque a mensagem dele tambem casa
+    # com agulhas mais genericas abaixo, e a dica especifica e a util.
+    ("additional check", 'ACL do Tailscale em "check": troque para "accept", ou o widget nunca vai passar'),
+    ("login.tailscale.com", 'a Tailscale quer re-autenticacao no navegador; para um widget, use action "accept"'),
+    ("host key verification", "rode `ssh %s` uma vez para aceitar a chave"),
+    # Chave recusada e o sintoma de "achei que o Tailscale SSH estava ligado la":
+    # sem `tailscale up --ssh` no destino, quem atende e o sshd comum.
+    ("permission denied", "`ssh-copy-id %s`, ou `sudo tailscale up --ssh` nessa maquina"),
+    ("could not resolve", "o nome nao resolve — a Tailscale esta ligada?"),
+    ("name or service not known", "o nome nao resolve — a Tailscale esta ligada?"),
+    ("connection timed out", "maquina fora do ar ou fora da tailnet"),
+    ("connection refused", "sem servidor SSH escutando em %s"),
+    # Precisa ser a frase do shell, e nao um "not found" solto: o proprio Herdr
+    # responde "agent target w2:p9 not found", que nao tem nada a ver com onde
+    # o binario esta.
+    ("command not found", "nao achei o herdr la, nem em ~/.local/bin — ele esta instalado?"),
+    ("no such file or directory", "o caminho guardado do herdr remoto nao existe mais"),
+    ("excedeu", "sem resposta a tempo — a maquina esta acordada?"),
+)
+
+
+def erro_de(codigo, saida, erro):
+    mensagem = (erro or saida or "herdr saiu com %d" % codigo).strip()[:200]
+    if not remoto():
+        return mensagem
+
+    baixo = mensagem.lower()
+    for agulha, dica in DICAS_SSH:
+        if agulha in baixo:
+            return "%s: %s — %s" % (remoto(), mensagem, dica.replace("%s", remoto()))
+    return "%s: %s" % (remoto(), mensagem)
+
+
+def herdr_texto(*args):
+    """Para os comandos que devolvem texto cru, e nao JSON -- `agent read`."""
+    codigo, saida, erro = chamar_herdr(*args)
+    return ("", erro_de(codigo, saida, erro)) if codigo != 0 else (saida, "")
+
+
+def herdr(*args):
+    """Chama a CLI do Herdr e devolve (payload, mensagem_de_erro)."""
+    codigo, saida, erro = chamar_herdr(*args)
+    corpo = json_de(saida) or json_de(erro) or {}
+
+    if isinstance(corpo, dict) and isinstance(corpo.get("error"), dict):
+        detalhe = corpo["error"]
+        return (None, detalhe.get("message") or detalhe.get("code") or "erro do herdr")
+    if codigo != 0:
+        return (None, erro_de(codigo, saida, erro))
+    if not isinstance(corpo, dict):
+        return (None, "resposta do herdr nao era JSON")
+
+    return (corpo.get("result") or {}, "")
+
+
+def numeros(valor):
+    """"w2:t10" -> (2, 10). Ordena a lista como o Herdr mostra a sessao."""
+    return tuple(int(n) for n in re.findall(r"\d+", str(valor or ""))) or (0,)
+
+
+# --------------------------------------------------------------- mensagens
+
+
+# Quem falou. O primeiro conjunto e como os agentes marcam a propria fala
+# (Claude, Codex e parentes); o segundo e como marcam a sua.
+MARCA_AGENTE = "●⏺◍⦿"
+MARCA_VOCE = ">❯»"
+
+# Linhas que sao moldura, nao conversa: reguas, caixa de input, rodape de
+# atalhos, contador de tokens, spinner e o recap automatico. Fecham o bloco
+# aberto em vez de entrar nele.
+RE_REGUA = re.compile(r"^[\s─━═╌╍‾_\-]{20,}$")
+RE_MOLDURA = re.compile(r"^[\s\u2500-\u257f]+$")
+RE_RODAPE = re.compile(r"^\s*(⏵|\?\s|esc |ctrl|shift|tab )", re.IGNORECASE)
+RE_ESTADO = re.compile(r"^\s*[✻✽✢✳❉*·⧗⣿]\s")
+RE_RECAP = re.compile(r"^\s*※")
+RE_FERRAMENTA = re.compile(r"^\s*[⎿⧉↳]")
+
+
+def e_moldura(linha):
+    if not linha.strip():
+        return False
+    return bool(
+        RE_REGUA.match(linha)
+        or RE_MOLDURA.match(linha)
+        or RE_RODAPE.match(linha)
+        or RE_ESTADO.match(linha)
+        or RE_RECAP.match(linha)
+        or RE_FERRAMENTA.match(linha)
+        # "❯ 1. Yes" comeca com o mesmo "❯" que marca a sua fala. Sem esta
+        # linha, o dialogo inteiro entra na lista como se fosse a ultima coisa
+        # que voce disse -- e ocupa o lugar do que o agente realmente falou
+        # antes de parar para perguntar.
+        or RE_OPCAO.match(linha)
+    )
+
+
+def marcador(linha):
+    """'agente', 'voce' ou None -- quem comeca a falar nesta linha.
+
+    O marcador tem de vir na margem: uma seta ou um bullet no meio de um
+    paragrafo e conteudo, nao o comeco de uma fala nova.
+    """
+    sem_recuo = linha.lstrip(" ")
+    if len(linha) - len(sem_recuo) > 2 or not sem_recuo or RE_OPCAO.match(linha):
+        return None
+    cabeca = sem_recuo[0]
+    resto = sem_recuo[1:].strip()
+    if cabeca in MARCA_AGENTE:
+        return "agente"
+    # "❯" sozinho e o prompt vazio esperando voce, e nao uma fala.
+    if cabeca in MARCA_VOCE and resto:
+        return "voce"
+    return None
+
+
+def sem_marcador(linha):
+    return linha.lstrip(" ")[1:].strip()
+
+
+def mensagens(bruto, quantas):
+    """As ultimas `quantas` falas visiveis no terminal do agente.
+
+    O que da para ler e o que esta na tela: um agente em tela alternativa nao
+    deixa scrollback, entao pedir mais linhas nao traz mais historia. Isso
+    combina com o proposito -- a lista mostra o que voce veria se focasse a
+    aba, nem mais nem menos.
+    """
+    blocos = []
+    atual = None
+
+    for linha in (bruto or "").splitlines():
+        quem = marcador(linha)
+        if quem:
+            atual = {"who": quem, "linhas": [sem_marcador(linha)]}
+            blocos.append(atual)
+        elif atual is None:
+            continue
+        elif e_moldura(linha) or not linha.strip():
+            # So o primeiro paragrafo. Depois dele vem o detalhamento -- listas,
+            # tabelas, blocos de codigo -- que numa linha de popup viraria ruido:
+            # a manchete e o que responde "o que esta acontecendo ali".
+            atual = None
+        else:
+            atual["linhas"].append(linha.strip())
+
+    saida = []
+    for bloco in blocos[-max(1, quantas):]:
+        texto = re.sub(r"\s+", " ", " ".join(bloco["linhas"])).strip()
+        if not texto:
+            continue
+        if len(texto) > MAX_MENSAGEM:
+            texto = texto[:MAX_MENSAGEM - 1].rstrip() + "…"
+        saida.append({"who": bloco["who"], "text": texto})
+
+    return saida
+
+
+# Uma alternativa de dialogo: "❯ 1. Yes" / "  2. No, and tell Claude ...".
+RE_OPCAO = re.compile(r"^\s*(?P<cursor>[❯>»])?\s*(?P<chave>\d{1,2})[.)]\s+(?P<rotulo>\S.*?)\s*$")
+# So as barras verticais da caixa, e nunca o recuo: as alternativas sem numero
+# se reconhecem pela coluna em que o texto comeca, e um strip() generico
+# apagaria justamente o que as identifica.
+RE_BORDA = re.compile(r"^\s*[│┃┆┇┊┋╎╏║]\s?|\s*[│┃┆┇┊┋╎╏║]\s*$")
+
+# Alternativas que nao respondem nada sozinhas: escolher uma abre um campo e
+# fica esperando voce escrever. Apertar a tecla e parar ali deixa o agente
+# travado num input vazio, que e pior que nao ter botao.
+RE_PEDE_TEXTO = re.compile(
+    r"(?i)(tell claude|tell it|chat about|what to change|what to do differently"
+    r"|add notes|give feedback|explain|escrever|responder)"
+)
+
+# Rodape do proprio dialogo: instrucao de teclado, nao pergunta nem alternativa.
+RE_INSTRUCAO = re.compile(
+    r"(?i)(esc to cancel|enter to (confirm|select|submit)|to navigate|to amend|to explain|for shortcuts)"
+)
+
+
+def desenquadra(linha):
+    """Tira a moldura da caixa: "│ ❯ 1. Yes        │" -> "❯ 1. Yes"."""
+    return RE_BORDA.sub("", linha)
+
+
+def opcoes_numeradas(linhas):
+    """A forma "❯ 1. Yes" / "  2. No": o numero e a propria tecla."""
+    achadas = []
+    for indice, linha in enumerate(linhas):
+        casou = RE_OPCAO.match(linha)
+        if casou and not RE_INSTRUCAO.search(linha):
+            rotulo = casou.group("rotulo")[:MAX_ROTULO]
+            achadas.append((indice, {
+                "key": casou.group("chave"),
+                "label": rotulo,
+                "selected": casou.group("cursor") is not None,
+                "prompts": bool(RE_PEDE_TEXTO.search(rotulo)),
+            }))
+    return achadas
+
+
+def opcoes_com_cursor(linhas):
+    """A forma sem numero: um "❯" marca a escolhida e as irmas se alinham a ela.
+
+    E o dialogo de confianca de pasta do Claude Code, entre outros. Sem numero
+    para digitar, responder e andar com as setas ate a linha e apertar Enter --
+    e por isso as irmas sao reconhecidas pela coluna onde o texto comeca, e nao
+    por um marcador: e a unica coisa que elas tem em comum com a escolhida.
+    """
+    cursor = -1
+    for indice, linha in enumerate(linhas):
+        if re.match(r"^\s*[❯>»]\s+\S", linha) and not RE_INSTRUCAO.search(linha):
+            cursor = indice
+    if cursor < 0:
+        return []
+
+    marcado = re.match(r"^(\s*[❯>»]\s+)(\S.*?)\s*$", linhas[cursor])
+    coluna = len(marcado.group(1))
+
+    def irma(linha):
+        if not linha.strip() or RE_INSTRUCAO.search(linha):
+            return None
+        casou = re.match(r"^(\s*)(\S.*?)\s*$", linha)
+        return casou.group(2) if casou and len(casou.group(1)) == coluna else None
+
+    bloco = [(cursor, marcado.group(2), True)]
+    for passo, limite in ((-1, -1), (1, len(linhas))):
+        indice = cursor + passo
+        while indice != limite:
+            texto = irma(linhas[indice])
+            if texto is None:
+                break
+            bloco.append((indice, texto, False))
+            indice += passo
+
+    bloco.sort()
+    # Menu precisa de escolha: uma linha marcada sem irmas e o prompt esperando
+    # voce, e trata-lo como alternativa faz o painel oferecer um botao que
+    # responde a nada.
+    if len(bloco) < 2:
+        return []
+    return [
+        (
+            indice,
+            {
+                "key": "",
+                "label": texto[:MAX_ROTULO],
+                "selected": marcada,
+                "prompts": bool(RE_PEDE_TEXTO.search(texto)),
+            },
+        )
+        for indice, texto, marcada in bloco
+    ]
+
+
+def formulario(bruto, quantas_linhas=40):
+    """A pergunta e as alternativas de um agente bloqueado.
+
+    O Herdr classifica como `blocked` o que reconhece como aprovacao ou
+    pergunta; aqui so se le o que ja esta desenhado na tela para virar botao.
+    Um agente que pergunta de outro jeito -- "[y/n]", texto livre -- nao rende
+    alternativa nenhuma, e sobra o campo, que responde qualquer coisa.
+    """
+    linhas = [desenquadra(l) for l in (bruto or "").splitlines()][-quantas_linhas:]
+
+    achadas = opcoes_numeradas(linhas) or opcoes_com_cursor(linhas)
+    if not achadas:
+        # Sem alternativa reconhecivel -- "[y/N]", texto corrido -- ainda ha uma
+        # pergunta na tela, e ela e o que voce precisa ler. Botao nenhum e
+        # honesto; pergunta nenhuma e so esconder o que aconteceu.
+        return {"question": pergunta_de(linhas), "options": [], "context": contexto_de(linhas)}
+
+    primeira = achadas[0][0]
+    opcoes = [opcao for _, opcao in achadas][:8]
+    for posicao, opcao in enumerate(opcoes):
+        opcao["index"] = posicao
+
+    acima = linhas[:primeira]
+    return {"question": pergunta_de(acima), "options": opcoes, "context": contexto_de(acima)}
+
+
+def contexto_de(acima):
+    """Tudo que o dialogo mostra antes da pergunta, como esta na tela.
+
+    E o comando que ele quer rodar, o diff que quer aplicar, o "Tip:" que muda
+    o que voce escolheria. Antes so a pergunta subia, e "Do you want to
+    proceed?" sozinho nao e uma pergunta -- e a metade dela que nao informa
+    nada. As linhas vem separadas, e nao coladas num paragrafo: um bloco de
+    comando com as quebras desfeitas fica ilegivel.
+    """
+    inicio, _ = faixa_da_pergunta(acima)
+    corte = inicio if inicio >= 0 else len(acima)
+
+    uteis = [l.rstrip() for l in acima[:corte] if util(l)]
+    # As de baixo sao as que importam: o comando fica colado na pergunta, e o
+    # que esta muito acima e historico da conversa, nao o pedido.
+    uteis = uteis[-MAX_CONTEXTO:]
+    if not uteis:
+        return []
+
+    # Tira o recuo comum e mantem o relativo: a caixa do dialogo ja empurrava
+    # tudo para dentro, e repetir isso aqui so gastaria largura -- mas a
+    # indentacao interna do comando e o que o torna legivel.
+    recuo = min(len(l) - len(l.lstrip(" ")) for l in uteis)
+    return [l[recuo:][:MAX_MENSAGEM] for l in uteis]
+
+
+def util(linha):
+    """Linha que conta como texto da pergunta: nem vazia, nem moldura.
+
+    Sem descartar a moldura, uma regua entre a pergunta e a caixa de input
+    entraria no paragrafo e o "texto" da pergunta viria com um traco de
+    oitenta caracteres no meio.
+    """
+    return bool(linha.strip()) and not RE_INSTRUCAO.search(linha) and not e_moldura(linha)
+
+
+def faixa_da_pergunta(acima):
+    """(inicio, fim) do paragrafo da pergunta, ou (-1, -1) se nao houver.
+
+    A ancora e a linha com "?" mais proxima do bloco -- em qualquer posicao dela,
+    e nao no fim, porque uma pergunta longa quebra em varias linhas e o "?" cai
+    no meio da primeira. Dali o paragrafo inteiro: mostrar meia pergunta e pior
+    que nao mostrar nenhuma, porque a metade que sobra parece a pergunta toda e
+    voce responde a outra coisa.
+    """
+    # Texto de dialogo nunca vem atribuido a alguem: uma linha que comeca com
+    # "●" ou "❯" e fala, e uma fala com "?" no meio e so uma pergunta que
+    # alguem fez na conversa -- nao a que a tela esta esperando resposta.
+    alvo = -1
+    for indice in range(len(acima) - 1, max(-1, len(acima) - 13), -1):
+        if util(acima[indice]) and "?" in acima[indice] and not marcador(acima[indice]):
+            alvo = indice
+            break
+    # Sem "?" em lugar nenhum nao ha pergunta. Antes daqui saia a ultima linha
+    # de texto qualquer, e num pane que o Herdr marcou como bloqueado por
+    # engano isso virava uma "pergunta" feita de conversa solta -- um palpite
+    # que parece informacao.
+    if alvo < 0:
+        return (-1, -1)
+
+    inicio = alvo
+    while inicio > 0 and util(acima[inicio - 1]) and not marcador(acima[inicio - 1]):
+        inicio -= 1
+    fim = alvo
+    while fim + 1 < len(acima) and util(acima[fim + 1]) and not marcador(acima[fim + 1]):
+        fim += 1
+    return (inicio, fim)
+
+
+def pergunta_de(acima):
+    inicio, fim = faixa_da_pergunta(acima)
+    if inicio < 0:
+        return ""
+    junto = " ".join(linha.strip() for linha in acima[inicio:fim + 1])
+    return re.sub(r"\s+", " ", junto).strip()[:MAX_PERGUNTA]
+
+
+def ler_terminal(pane, quantas, bloqueado):
+    """Uma leitura por agente: dela saem as falas e, se parado, o dialogo."""
+    # `agent read` e a excecao entre os comandos: cospe o buffer do terminal no
+    # stdout, sem envelope JSON.
+    bruto, erro = herdr_texto(
+        "agent", "read", pane, "--source", "detection", "--lines", str(LINHAS_BUFFER)
+    )
+    if erro:
+        return ([], {"question": "", "options": [], "context": []})
+    vazio = {"question": "", "options": [], "context": []}
+    return (mensagens(bruto, quantas), formulario(bruto) if bloqueado else vazio)
+
+
+# ------------------------------------------------------------------ agentes
+
+
+def rotulos_de_aba(instantaneo):
+    """tab_id -> rotulo, apenas quando renomeada.
+
+    Aba sem nome vem rotulada com o proprio numero ("1", "2"), o que nao
+    identifica nada numa lista -- vale menos que o basename do cwd.
+    """
+    mapa = {}
+    for aba in instantaneo.get("tabs") or []:
+        rotulo = str(aba.get("label") or "").strip()
+        if rotulo and not rotulo.isdigit():
+            mapa[aba.get("tab_id")] = rotulo
+    return mapa
+
+
+def nome_curto(cwd):
+    """Nome de projeto a partir do cwd. O home vira "~".
+
+    Um agente rodando no home apareceria como "otavio", que nao diz nada e
+    ainda passa por nome de projeto numa lista onde todo o resto e um.
+    """
+    if not cwd:
+        return ""
+    if not remoto() and os.path.normpath(cwd) == os.path.normpath(os.path.expanduser("~")):
+        return "~"
+    return os.path.basename(cwd.rstrip("/"))
+
+
+def linha_de_agente(agente, abas, prs):
+    cwd = str(agente.get("cwd") or "")
+    titulo = str(agente.get("terminal_title_stripped") or agente.get("terminal_title") or "").strip()
+    projeto = abas.get(agente.get("tab_id")) or nome_curto(cwd)
+
+    status = str(agente.get("agent_status") or "unknown")
+    if status not in STATUS:
+        status = "unknown"
+
+    pr = prs.get(cwd) or {}
+
+    return {
+        "pane_id": str(agente.get("pane_id") or ""),
+        "tab_id": str(agente.get("tab_id") or ""),
+        "workspace_id": str(agente.get("workspace_id") or ""),
+        "kind": str(agente.get("agent") or ""),
+        "status": status,
+        "cwd": cwd,
+        "project": projeto,
+        # O titulo repetiria o projeto quando a aba nao foi renomeada e o agente
+        # nao mexeu no titulo; uma coluna que repete a outra so gasta largura.
+        "title": "" if titulo == projeto else titulo,
+        "pr_number": int(pr.get("number") or 0),
+        "pr_url": str(pr.get("url") or ""),
+        "pr_title": str(pr.get("title") or ""),
+        "pr_state": str(pr.get("state") or ""),
+        "messages": [],
+        "question": "",
+        "options": [],
+        "context": [],
+    }
+
+
+def prs_por_cwd(cache):
+    """cwd -> entrada de PR, sem tocar em git nem na rede.
+
+    O cache guarda o cwd que gerou cada entrada justamente para isso: achar a
+    chave (repositorio, branch) custa dois `git rev-parse`, e o snapshot roda a
+    cada poucos segundos com o popup aberto.
+    """
+    mapa = {}
+    for chave, entrada in cache.items():
+        if chave.startswith("_") or not isinstance(entrada, dict):
+            continue
+        cwd = entrada.get("cwd")
+        if cwd:
+            mapa[cwd] = entrada
+    return mapa
+
+
+def montar_snapshot():
+    resultado, erro = herdr("api", "snapshot")
+    if erro:
+        return (None, erro)
+
+    instantaneo = (resultado or {}).get("snapshot") or {}
+    abas = rotulos_de_aba(instantaneo)
+    cache = ler_json(caminho_pr())
+    prs = prs_por_cwd(cache)
+
+    linhas = [linha_de_agente(a, abas, prs) for a in instantaneo.get("agents") or []]
+    linhas.sort(key=lambda l: (numeros(l["workspace_id"]), numeros(l["tab_id"]), numeros(l["pane_id"])))
+
+    contagens = {chave: 0 for chave in STATUS}
+    for linha in linhas:
+        contagens[linha["status"]] += 1
+    contagens["total"] = len(linhas)
+    contagens["ocioso"] = contagens["idle"] + contagens["done"]
+
+    gh = cache.get("_gh")
+    return (
+        {
+            "version": str(instantaneo.get("version") or ""),
+            "counts": contagens,
+            "rows": linhas,
+            "gh": str(gh.get("state")) if isinstance(gh, dict) else "",
+        },
+        "",
+    )
+
+
+# ---------------------------------------------------------------- alvo padrao
+
+
+def resolver_padrao(linhas):
+    """Qual linha o campo de texto usa.
+
+    Casa pelo pane_id, e como segunda tentativa pelo cwd. Um pane movido para
+    outro workspace ganha um pane_id novo, e o alvo padrao nao pode se perder
+    numa reorganizacao de layout -- e o mesmo agente, no mesmo projeto.
+    """
+    gravado = ler_json(caminho_padrao(), teto=64 * 1024)
+    pane = str(gravado.get("pane_id") or "")
+    cwd = str(gravado.get("cwd") or "")
+
+    if not pane and not cwd:
+        return ("", "vazio")
+
+    for linha in linhas:
+        if linha["pane_id"] == pane:
+            return (linha["pane_id"], "pane")
+    for linha in linhas:
+        if cwd and linha["cwd"] == cwd:
+            return (linha["pane_id"], "cwd")
+
+    return ("", "morto")
+
+
+# ------------------------------------------------------------ janela do herdr
+
+
+def cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as arquivo:
+            bruto = arquivo.read(8192)
+    except OSError:
+        return []
+    return [parte.decode("utf-8", "replace") for parte in bruto.split(b"\0") if parte]
+
+
+def ppid(pid):
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as arquivo:
+            bruto = arquivo.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return 0
+    # comm vem entre parenteses e pode conter espacos e parenteses; o unico
+    # corte seguro e depois do ultimo ")".
+    fim = bruto.rfind(")")
+    if fim < 0:
+        return 0
+    campos = bruto[fim + 2:].split()
+    try:
+        return int(campos[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def valores(args, nome):
+    """Todos os valores de uma opcao repetida: --remote a --remote b."""
+    saida = []
+    for indice, arg in enumerate(args):
+        if arg == nome and indice + 1 < len(args):
+            saida.append(args[indice + 1])
+    return saida
+
+
+def opcao(resto, nome):
+    """Valor de "--nome valor" ou "--nome=valor" numa lista de argumentos."""
+    for indice, arg in enumerate(resto):
+        if arg == nome and indice + 1 < len(resto):
+            return resto[indice + 1]
+        if arg.startswith(nome + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+# Opcoes do ssh que consomem o argumento seguinte. Sem essa lista, o "yes" de
+# um "-o BatchMode=yes" passaria por nome de maquina.
+SSH_COM_VALOR = frozenset(
+    "-b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w".split()
+)
+
+
+def alvo_do_ssh(argv):
+    """(sessao, maquina) de um `ssh [opcoes] maquina .../herdr [--session x]`."""
+    maquina = ""
+    resto = []
+    pular = False
+
+    for indice, arg in enumerate(argv[1:], start=1):
+        if pular:
+            pular = False
+            continue
+        if arg in SSH_COM_VALOR:
+            pular = True
+            continue
+        if arg.startswith("-"):
+            continue
+        if not maquina:
+            maquina = arg
+            continue
+        # Primeiro argumento depois da maquina: o comando remoto. So interessa
+        # se for o herdr -- um `ssh maquina htop` nao e janela de sessao.
+        if os.path.basename(arg) != "herdr":
+            return None
+        resto = argv[indice + 1:]
+        break
+    else:
+        # Saiu sem achar comando nenhum: `ssh maquina` abre um shell, nao o Herdr.
+        return None
+
+    return (opcao(resto, "--session") or SESSAO_PADRAO, maquina) if maquina else None
+
+
+def alvo_do_cliente(argv):
+    """(sessao, remoto) de um cliente do Herdr, ou None se o processo nao for um.
+
+    Tres formas contam como janela desta sessao:
+
+      herdr                       o cliente local
+      herdr --remote alvo         o cliente daqui, atracado la
+      ssh [-t] alvo .../herdr     o cliente de la, que e o que este widget abre
+
+    O servidor nao tem janela e sai fora. Ignorar qualquer uma das outras faria
+    o widget abrir um terminal novo em cima de um que ja esta ali.
+    """
+    if not argv:
+        return None
+
+    if os.path.basename(argv[0]) == "ssh":
+        return alvo_do_ssh(argv)
+
+    if os.path.basename(argv[0]) != "herdr":
+        return None
+
+    resto = argv[1:]
+    if "server" in resto:
+        return None
+
+    sessao = opcao(resto, "--session")
+    if sessao is None:
+        for indice, arg in enumerate(resto):
+            if arg == "attach" and indice > 0 and resto[indice - 1] == "session" and indice + 1 < len(resto):
+                sessao = resto[indice + 1]
+                break
+    # "--remote-keybindings" nao e "--remote"; opcao() casa o nome inteiro.
+    return (sessao or SESSAO_PADRAO, opcao(resto, "--remote") or "")
+
+
+def pids_de_cliente():
+    encontrados = []
+    try:
+        entradas = os.listdir("/proc")
+    except OSError:
+        return encontrados
+
+    for entrada in entradas:
+        if entrada.isdigit() and alvo_do_cliente(cmdline(int(entrada))) == (SESSAO, remoto()):
+            encontrados.append(int(entrada))
+    return encontrados
+
+
+def janela_do_cliente():
+    """Endereco da janela do Hyprland que hospeda um cliente desta sessao.
+
+    O cliente do Herdr e neto do emulador de terminal (terminal -> shell ->
+    herdr), entao a ligacao vem de subir a cadeia de ppid ate cair num pid que
+    o compositor conheca. Isso vale para qualquer terminal, o que casar por
+    class nao faria, e nao se deixa enganar por uma janela que so ficou com o
+    titulo "herdr" depois que o herdr dela morreu. Um terminal em modo
+    servidor, com uma unica janela para todas as abas, e o caso que isso nao
+    resolve.
+    """
+    codigo, saida, _ = rodar(["hyprctl", "-j", "clients"], TIMEOUT_HYPR)
+    janelas = json_de(saida) if codigo == 0 else None
+    if not isinstance(janelas, list):
+        return ""
+
+    por_pid = {}
+    for janela in janelas:
+        pid = janela.get("pid")
+        if isinstance(pid, int) and pid > 0 and janela.get("mapped") is not False:
+            por_pid.setdefault(pid, janela)
+
+    candidatas = []
+    for pid in pids_de_cliente():
+        atual = pid
+        for _ in range(20):
+            if atual in por_pid:
+                candidatas.append(por_pid[atual])
+                break
+            pai = ppid(atual)
+            if pai <= 1 or pai == atual:
+                break
+            atual = pai
+
+    if not candidatas:
+        return ""
+
+    # focusHistoryID cresce com o tempo desde o ultimo foco: 0 e a janela atual.
+    # Com mais de um cliente aberto, a que voce usou por ultimo e a que quer.
+    candidatas.sort(key=lambda janela: janela.get("focusHistoryID", 1 << 30))
+    return str(candidatas[0].get("address") or "")
+
+
+# ----------------------------------------------------------------------- prs
+
+
+def estado_do_gh():
+    codigo, _, _ = rodar(["gh", "auth", "status"], TIMEOUT_GH)
+    if codigo == 127:
+        return "missing"
+    return "ok" if codigo == 0 else "unauthenticated"
+
+
+def repo_e_branch(cwd):
+    if not cwd or not os.path.isdir(cwd):
+        return ("", "")
+    codigo, raiz, _ = rodar(["git", "-C", cwd, "rev-parse", "--show-toplevel"], TIMEOUT_GIT)
+    if codigo != 0:
+        return ("", "")
+    codigo, branch, _ = rodar(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], TIMEOUT_GIT)
+    if codigo != 0:
+        return ("", "")
+    raiz, branch = raiz.strip(), branch.strip()
+    return (raiz, branch) if raiz and branch and branch != "HEAD" else ("", "")
+
+
+def reivindicar(cache, chave, cwd):
+    """Faz `chave` ser a unica entrada que responde por `cwd`.
+
+    Trocar de branch dentro do mesmo diretorio cria uma segunda entrada com o
+    mesmo cwd, e o snapshot devolveria a primeira que achasse -- o PR do branch
+    anterior, num numero que parece certo e nao e.
+    """
+    for outra, entrada in cache.items():
+        if outra != chave and isinstance(entrada, dict) and entrada.get("cwd") == cwd:
+            entrada.pop("cwd", None)
+    cache[chave]["cwd"] = cwd
+
+
+def podar(cache):
+    if len(cache) <= MAX_ENTRADAS_CACHE:
+        return cache
+    entradas = [(c, e) for c, e in cache.items() if not c.startswith("_") and isinstance(e, dict)]
+    entradas.sort(key=lambda par: float(par[1].get("ts") or 0), reverse=True)
+    podado = dict(entradas[:MAX_ENTRADAS_CACHE])
+    if "_gh" in cache:
+        podado["_gh"] = cache["_gh"]
+    return podado
+
+
+# ------------------------------------------------------------------ comandos
+
+
+def cmd_snapshot(args):
+    dados, erro = montar_snapshot()
+    if erro:
+        vazio = {chave: 0 for chave in list(STATUS) + ["total", "ocioso"]}
+        falhar(erro, counts=vazio, rows=[], default="", default_state="vazio", gh="")
+
+    alvo, motivo = resolver_padrao(dados["rows"])
+    for linha in dados["rows"]:
+        linha["is_default"] = linha["pane_id"] == alvo
+
+    if "--messages" in args:
+        # Tres falas para o alvo do campo e uma para o resto: e nele que voce
+        # vai responder, e para responder precisa da conversa, nao da manchete.
+        for linha in dados["rows"][:MAX_LEITURAS]:
+            falas, forma = ler_terminal(
+                linha["pane_id"],
+                3 if linha["is_default"] else 1,
+                linha["status"] == "blocked",
+            )
+            linha["messages"] = falas
+            linha["question"] = forma["question"]
+            linha["options"] = forma["options"]
+            linha["context"] = forma["context"]
+
+    responder(default=alvo, default_state=motivo, **dados)
+
+
+def cmd_focus(args):
+    if not args:
+        falhar("focus precisa de um pane_id")
+
+    # O foco vai para o servidor antes de a janela existir, de proposito:
+    # quando nao ha cliente aberto, o terminal novo ja sobe renderizando a aba
+    # certa, e nao ha corrida entre o attach e um focus que chegaria depois.
+    _, erro = herdr("agent", "focus", args[0])
+    if erro:
+        falhar(erro)
+
+    endereco = janela_do_cliente()
+    if endereco:
+        # Este Hyprland interpreta o argumento do dispatch como Lua; a forma
+        # antiga "focuswindow address:0x..." vira erro de sintaxe.
+        rodar(
+            ["hyprctl", "dispatch", 'hl.dsp.focus({ window = "address:%s" })' % endereco],
+            TIMEOUT_HYPR,
+        )
+        registrar("focus", pane=args[0], janela=endereco)
+        responder(action="focused", address=endereco)
+
+    if remoto():
+        # `ssh -t` e nao `herdr --remote`: aquele roda o cliente de la, que e da
+        # mesma versao do servidor de la, entao nao ha o que comparar. O
+        # `--remote` traz o cliente daqui, e quando as versoes divergem ele abre
+        # num "[y/N] Install ... and stop the remote server now?" -- um terminal
+        # que para numa pergunta nao e "ir ate o agente". Alinhar as versoes
+        # resolveria, mas nem sempre da: um build com self-update desativado
+        # nunca vai alinhar, e ai a pergunta seria para sempre.
+        #
+        # O preco e o que o --remote gerencia sozinho: keepalive, multiplexacao
+        # e o paste de imagem. Quem quiser isso abre `herdr --remote` a mao --
+        # a janela e reconhecida do mesmo jeito.
+        comando_remoto = [herdr_remoto()]
+        if SESSAO != SESSAO_PADRAO:
+            comando_remoto += ["--session", SESSAO]
+        lancamento = ["omarchy-launch-terminal", "ssh", "-t", remoto()] + comando_remoto
+    else:
+        lancamento = ["omarchy-launch-terminal", "herdr"]
+        if SESSAO != SESSAO_PADRAO:
+            lancamento += ["--session", SESSAO]
+    # Solto, e nao esperado: abrir terminal e pedir para uma janela existir, nao
+    # rodar um comando cuja saida interessa. O `omarchy-launch-terminal` passa
+    # por uwsm e leva o tempo que levar; esperar por ele so daria um timeout que
+    # mata o lancamento no meio -- que foi exatamente o que acontecia.
+    try:
+        with open(LOG, "a") as saida:
+            subprocess.Popen(
+                lancamento,
+                stdin=subprocess.DEVNULL,
+                stdout=saida,
+                stderr=saida,
+                start_new_session=True,
+            )
+    except OSError as erro:
+        falhar("nao consegui abrir o terminal: %s" % erro, action="launch")
+
+    registrar("terminal-aberto", pane=args[0], comando=" ".join(lancamento))
+    responder(action="launched")
+
+
+def cmd_answer(args):
+    """Escolhe uma alternativa do dialogo, do jeito que aquele dialogo aceita.
+
+    Recebe a posicao e o rotulo que estavam na tela quando voce clicou, e
+    reconfere os dois no buffer de agora antes de apertar qualquer tecla. Um
+    dialogo pode ter mudado entre o desenho da lista e o clique, e mandar
+    "para baixo, para baixo, Enter" num dialogo diferente aprova outra coisa.
+    """
+    com_texto = "--with-text" in args
+    args = [a for a in args if a != "--with-text"]
+
+    if len(args) < 2:
+        falhar("answer precisa de um pane_id e de uma posição")
+
+    try:
+        posicao = int(args[1])
+    except ValueError:
+        falhar("posição inválida: %s" % args[1][:16])
+    esperado = args[2] if len(args) > 2 else ""
+
+    bruto, erro = herdr_texto(
+        "agent", "read", args[0], "--source", "detection", "--lines", str(LINHAS_BUFFER)
+    )
+    if erro:
+        falhar(erro)
+
+    opcoes = formulario(bruto)["options"]
+    if not 0 <= posicao < len(opcoes):
+        falhar("o diálogo mudou — abra o agente e responda por lá")
+
+    escolhida = opcoes[posicao]
+    if esperado and escolhida["label"] != esperado:
+        falhar("o diálogo mudou — agora essa opção é “%s”" % escolhida["label"][:60])
+
+    if escolhida["key"]:
+        # Alternativa numerada: o numero e a propria tecla, como voce digitaria.
+        teclas = [escolhida["key"]]
+    else:
+        # Lista com cursor: anda ate a linha e confirma.
+        atual = next((i for i, o in enumerate(opcoes) if o["selected"]), 0)
+        passo = "down" if posicao > atual else "up"
+        teclas = [passo] * abs(posicao - atual) + ["enter"]
+
+    _, erro = herdr("agent", "send-keys", args[0], *teclas)
+    if erro:
+        falhar(erro)
+
+    if not com_texto:
+        registrar("respondeu", pane=args[0], opcao=escolhida["label"][:60])
+        responder(answered=escolhida["label"], keys=teclas, pane_id=args[0])
+
+    texto = sys.stdin.readline(MAX_TEXTO).strip()
+    if not texto:
+        falhar("escolhi “%s”, mas não veio texto para escrever" % escolhida["label"][:60])
+
+    # A alternativa foi escolhida; agora o agente esta desenhando o campo. Sem
+    # esperar isso, o texto seria digitado no dialogo que ainda esta na tela --
+    # e as letras viram atalho de menu em vez de virar frase.
+    if not esperou_reagir(args[0], bruto):
+        falhar("escolhi “%s”, mas a tela não mudou a tempo — o texto não foi enviado"
+               % escolhida["label"][:60])
+
+    _, erro = herdr("pane", "send-text", args[0], texto)
+    if erro:
+        falhar(erro)
+    _, erro = herdr("pane", "send-keys", args[0], "enter")
+    if erro:
+        falhar(erro)
+
+    registrar("respondeu-escrevendo", pane=args[0], opcao=escolhida["label"][:60])
+    responder(answered=escolhida["label"], keys=teclas, wrote=True, pane_id=args[0])
+
+
+def esperou_reagir(pane, antes, limite_ms=3000, passo_ms=150):
+    """Espera a tela do agente mudar depois de uma tecla.
+
+    O sinal e o buffer inteiro mudar, e nao o desaparecimento das alternativas:
+    ha telas que mantem a lista e abrem o campo ao lado. Um agente bloqueado
+    tem tela parada, entao qualquer mudanca ali e a resposta a tecla -- o que
+    nao valeria para um agente trabalhando, cujo spinner muda sozinho.
+    """
+    gasto = 0
+    while gasto < limite_ms:
+        time.sleep(passo_ms / 1000.0)
+        gasto += passo_ms
+        agora, erro = herdr_texto(
+            "agent", "read", pane, "--source", "detection", "--lines", str(LINHAS_BUFFER)
+        )
+        if erro:
+            return False
+        if agora != antes:
+            return True
+    return False
+
+
+def cmd_send(args):
+    if not args:
+        falhar("send precisa de um pane_id")
+
+    texto = sys.stdin.readline(MAX_TEXTO).strip()
+    if not texto:
+        falhar("nada para mandar")
+
+    resultado, erro = herdr("agent", "prompt", args[0], texto)
+    if not erro:
+        registrar("prompt", pane=args[0])
+        responder(sent=True, pane_id=args[0], result=resultado)
+
+    # Um agente parado num dialogo recusa prompt com agent_blocked, e nao ha
+    # como testar antes sem uma corrida: entre o snapshot e o envio ele pode ter
+    # travado. Entao o caminho e tentar, e so destravar quando levar o nao.
+    if "blocked" not in erro.lower():
+        falhar(erro)
+
+    # Esc e a propria saida que o dialogo oferece -- o Claude Code rotula a
+    # ultima alternativa como "No, and tell Claude what to do differently
+    # (esc)". Recusa o que estava pedindo e devolve o prompt, que e exatamente
+    # o que "responder outra coisa" quer dizer.
+    _, erro_esc = herdr("agent", "send-keys", args[0], "esc")
+    if erro_esc:
+        falhar(erro_esc)
+
+    _, erro_espera = herdr("agent", "wait", args[0], "--until", "idle", "--timeout", "4000")
+    if erro_espera:
+        falhar("recusei o pedido, mas o agente não voltou ao prompt a tempo — o texto não foi enviado")
+
+    resultado, erro = herdr("agent", "prompt", args[0], texto)
+    if erro:
+        falhar(erro)
+
+    registrar("prompt-apos-recusa", pane=args[0])
+    responder(sent=True, pane_id=args[0], result=resultado, rejected=True)
+
+
+def cmd_default(args):
+    if not args:
+        falhar("default precisa de um pane_id ou de -")
+
+    if args[0] == "-":
+        gravar_json(caminho_padrao(), {})
+        responder(default="")
+
+    dados, erro = montar_snapshot()
+    if erro:
+        falhar(erro)
+
+    for linha in dados["rows"]:
+        if linha["pane_id"] == args[0]:
+            gravar_json(caminho_padrao(), {"pane_id": linha["pane_id"], "cwd": linha["cwd"]})
+            responder(default=linha["pane_id"])
+
+    falhar("nao ha agente em %s" % args[0])
+
+
+def cmd_prs(_args):
+    # Um Herdr remoto tem os repositorios na outra ponta: os caminhos que ele
+    # devolve nao existem aqui, e rodar git neles daria numero de PR errado ou
+    # nenhum. Melhor nao ter coluna do que ter uma que mente.
+    if remoto():
+        responder(queried=0, gh="remote")
+
+    dados, erro = montar_snapshot()
+    if erro:
+        falhar(erro)
+
+    cache = ler_json(caminho_pr())
+    agora = time.time()
+
+    gh = cache.get("_gh") if isinstance(cache.get("_gh"), dict) else {}
+    if agora - float(gh.get("ts") or 0) >= GH_TTL:
+        gh = {"state": estado_do_gh(), "ts": agora}
+        cache["_gh"] = gh
+
+    consultados = 0
+    for linha in dados["rows"]:
+        raiz, branch = repo_e_branch(linha["cwd"])
+        if not raiz:
+            continue
+        chave = "%s\n%s" % (raiz, branch)
+
+        entrada = cache.get(chave)
+        if isinstance(entrada, dict):
+            ttl = PR_TTL if entrada.get("number") else PR_TTL_VAZIO
+            if agora - float(entrada.get("ts") or 0) < ttl:
+                # Mesmo fresca, a entrada precisa apontar para o cwd de agora:
+                # e por ele que o snapshot a encontra.
+                reivindicar(cache, chave, linha["cwd"])
+                continue
+
+        if consultados >= MAX_REPOS_POR_VEZ or gh.get("state") != "ok":
+            break
+        consultados += 1
+
+        codigo, saida, _ = rodar(
+            ["gh", "pr", "view", "--json", "number,url,title,state"],
+            TIMEOUT_GH,
+            cwd=linha["cwd"],
+        )
+        corpo = json_de(saida) if codigo == 0 else None
+        if not isinstance(corpo, dict):
+            corpo = {}
+
+        cache[chave] = {
+            "ts": agora,
+            "number": int(corpo["number"]) if isinstance(corpo.get("number"), int) else 0,
+            "url": str(corpo.get("url") or ""),
+            "title": str(corpo.get("title") or ""),
+            "state": str(corpo.get("state") or ""),
+        }
+        reivindicar(cache, chave, linha["cwd"])
+
+    gravar_json(caminho_pr(), podar(cache))
+    responder(queried=consultados, gh=gh.get("state") or "")
+
+
+# ------------------------------------------------------------- configuracao
+
+
+SHELL_JSON = os.path.expanduser("~/.config/omarchy/shell.json")
+PLUGIN_ID = "otavio.quick-herdr"
+
+
+def minha_entrada():
+    """(secao, indice, entrada) desta instancia no shell.json.
+
+    O bar entrega ao widget so `bar`, `moduleName` e `settings` -- nao a
+    posicao dele na barra, que e o que o `setBarWidget` precisa. Entao ela e
+    reencontrada aqui: um plugin com allowMultiple pode ter varias entradas, e
+    o que distingue a minha das outras e justamente o `remote` que eu recebi.
+    """
+    config = ler_json(SHELL_JSON, teto=4 * 1024 * 1024)
+    layout = ((config.get("bar") or {}).get("layout") or {})
+
+    candidatas = []
+    for secao in ("left", "center", "right"):
+        for indice, entrada in enumerate(layout.get(secao) or []):
+            if isinstance(entrada, dict) and entrada.get("id") == PLUGIN_ID:
+                candidatas.append((secao, indice, entrada))
+
+    if not candidatas:
+        return (None, "esta instância não está no shell.json")
+    if len(candidatas) == 1:
+        return (candidatas[0], "")
+
+    iguais = [c for c in candidatas if str(c[2].get("remote") or "") == remoto()]
+    if len(iguais) == 1:
+        return (iguais[0], "")
+
+    return (None, "há %d cópias deste widget com a mesma máquina — edite o shell.json" % len(candidatas))
+
+
+def cmd_config(args):
+    achado, erro = minha_entrada()
+    if erro:
+        falhar(erro)
+    secao, indice, entrada = achado
+
+    if not args or args[0] == "get":
+        responder(section=secao, index=indice, settings=entrada)
+
+    if args[0] != "set" or len(args) < 3:
+        falhar("uso: config get | config set <chave> <valor> [--json]")
+
+    chave, bruto = args[1], args[2]
+    # Com --json o valor ja vem estruturado: a lista de maquinas e o "esta
+    # maquina" nao sao texto, e mandar "[\"a\"]" como string gravaria a string.
+    if "--json" in args[3:]:
+        valor = json_de(bruto)
+        if valor is None:
+            falhar("valor nao e JSON: %s" % bruto[:80])
+    else:
+        valor = bruto
+    placement = json.dumps({"section": secao, "index": indice})
+
+    # Quem escreve o shell.json e o shell, e nao este processo: ele e o dono do
+    # arquivo e recarrega sozinho depois. Escrever por fora atropelaria uma
+    # gravacao concorrente dele.
+    codigo, saida, stderr = rodar(
+        ["omarchy-shell", "shell", "setBarWidget", PLUGIN_ID, chave, json.dumps(valor), placement],
+        TIMEOUT_HERDR,
+    )
+    resposta = (saida or stderr).strip()
+    if codigo != 0 or resposta != "ok":
+        falhar(resposta or "setBarWidget falhou")
+
+    registrar("config", chave=chave, valor=valor)
+    responder(section=secao, index=indice, key=chave, value=valor)
+
+
+def resolve(nome):
+    """O nome curto chega a algum lugar? Sem MagicDNS no search, so o FQDN vai."""
+    return rodar(["getent", "hosts", nome], 3)[0] == 0
+
+
+# ------------------------------------------------------- varias maquinas
+
+
+def caminho_padrao_global():
+    """O alvo do campo e um so para todas as maquinas, entao mora fora do escopo."""
+    return os.path.join(STATE_DIR, "default.json")
+
+
+def um_snapshot(alvo, com_mensagens):
+    """O estado de uma maquina, na thread dela.
+
+    Roda no mesmo processo que as outras: o alvo mora num thread-local, entao
+    duas maquinas em paralelo nao se atrapalham. A versao anterior isolava com
+    um subprocesso por maquina, o que custava um interpretador Python inteiro
+    por maquina a cada atualizacao -- mais caro que o dado que ele buscava.
+    """
+    usar_remoto(alvo)
+    dados, erro = montar_snapshot()
+    if erro:
+        return {"ok": False, "error": erro}
+
+    if com_mensagens:
+        # Tres falas para o alvo do campo e uma para o resto: e nele que voce
+        # vai responder, e para responder precisa da conversa, nao da manchete.
+        for linha in dados["rows"][:MAX_LEITURAS]:
+            # Sempre as quatro ultimas, e nao so a que vai aparecer: ler o
+            # terminal e uma chamada, e extrair quatro falas dela custa o mesmo
+            # que extrair uma. Assim expandir uma linha e instantaneo, em vez
+            # de uma ida e volta -- por SSH, uma ida e volta pela rede.
+            falas, forma = ler_terminal(linha["pane_id"], MAX_FALAS, linha["status"] == "blocked")
+            linha["messages"] = falas
+            linha["question"] = forma["question"]
+            linha["options"] = forma["options"]
+            linha["context"] = forma["context"]
+
+    dados["ok"] = True
+    return dados
+
+
+def cmd_all(args):
+    """Uma lista so, com os agentes de todas as maquinas ligadas.
+
+    As maquinas sao consultadas em paralelo: com quatro ligadas, esperar uma de
+    cada vez faria a barra andar no ritmo da mais lenta somada as outras.
+    """
+    import concurrent.futures
+
+    com_mensagens = "--messages" in args
+    alvos = valores(args, "--remote")
+    if "--local" in args:
+        alvos.insert(0, "")
+    if not alvos:
+        alvos = [""]
+
+    if len(alvos) == 1:
+        # Uma maquina so nao paga thread nenhuma.
+        respostas = [(alvos[0], um_snapshot(alvos[0], com_mensagens))]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(alvos)) as piscina:
+            respostas = list(piscina.map(lambda a: (a, um_snapshot(a, com_mensagens)), alvos))
+
+    linhas = []
+    maquinas = []
+    contagens = {chave: 0 for chave in list(STATUS) + ["total", "ocioso"]}
+    gh = ""
+
+    for alvo, dados in respostas:
+        maquinas.append({
+            "target": alvo,
+            "ok": dados.get("ok") is not False,
+            "error": str(dados.get("error") or ""),
+        })
+        if dados.get("ok") is False:
+            continue
+        for chave, valor in (dados.get("counts") or {}).items():
+            if chave in contagens:
+                contagens[chave] += int(valor or 0)
+        for linha in dados.get("rows") or []:
+            linha["machine"] = alvo
+            linhas.append(linha)
+        # A coluna de PR e local por natureza; um remoto responde "remote" e nao
+        # tem o que dizer sobre repositorios daqui.
+        if not alvo:
+            gh = str(dados.get("gh") or "")
+
+    alvo_padrao, motivo = resolver_padrao_global(linhas)
+    for linha in linhas:
+        linha["is_default"] = (linha["machine"], linha["pane_id"]) == alvo_padrao
+
+    responder(
+        counts=contagens,
+        rows=linhas,
+        machines=maquinas,
+        gh=gh,
+        default=alvo_padrao[1],
+        default_machine=alvo_padrao[0],
+        default_state=motivo,
+    )
+
+
+def resolver_padrao_global(linhas):
+    """(maquina, pane) do alvo do campo, casando por pane e depois por cwd."""
+    gravado = ler_json(caminho_padrao_global(), teto=64 * 1024)
+    maquina = str(gravado.get("machine") or "")
+    pane = str(gravado.get("pane_id") or "")
+    cwd = str(gravado.get("cwd") or "")
+
+    if not pane and not cwd:
+        return (("", ""), "vazio")
+
+    for linha in linhas:
+        if linha["machine"] == maquina and linha["pane_id"] == pane:
+            return ((maquina, pane), "pane")
+    for linha in linhas:
+        if cwd and linha["machine"] == maquina and linha["cwd"] == cwd:
+            return ((maquina, linha["pane_id"]), "cwd")
+
+    return (("", ""), "morto")
+
+
+def cmd_pick(args):
+    """Grava o alvo do campo, que agora precisa dizer tambem de qual maquina."""
+    if not args or args[0] == "-":
+        gravar_json(caminho_padrao_global(), {})
+        registrar("padrao-limpo")
+        responder(default="", default_machine="")
+
+    maquina = args[0] if args[0] != "." else ""
+    if len(args) < 2:
+        falhar("pick precisa da maquina e do pane_id")
+
+    gravar_json(caminho_padrao_global(), {"machine": maquina, "pane_id": args[1], "cwd": args[2] if len(args) > 2 else ""})
+    registrar("padrao", maquina=maquina or "local", pane=args[1])
+    responder(default=args[1], default_machine=maquina)
+
+
+def cmd_disconnect(args):
+    """Fecha o tunel multiplexado de uma maquina desligada na lista.
+
+    Sem isto o ControlPersist segura a conexao por mais alguns minutos depois de
+    voce desmarcar a maquina -- e "desliguei" tem de significar "desconectou",
+    nao "vai desconectar quando der".
+    """
+    if not args:
+        falhar("disconnect precisa de um alvo")
+
+    usar_remoto(args[0])
+    codigo, _, erro = rodar(ssh_prefixo()[:-1] + ["-O", "exit", args[0]], TIMEOUT_HERDR)
+    registrar("desconectado", alvo=args[0], codigo=codigo)
+    # Sair com erro aqui e o caso normal: nao havia tunel aberto.
+    responder(target=args[0], closed=codigo == 0, detail=erro.strip()[:120])
+
+
+def cmd_hosts(_args):
+    """Candidatos a `remote`, tirados da Tailscale.
+
+    A Tailscale e a resposta certa aqui porque o alvo tem de continuar valendo
+    de qualquer rede: um IP de LAN no shell.json quebra na primeira vez que
+    voce abre o notebook em outro lugar. Qualquer alvo que o seu ~/.ssh/config
+    entenda tambem serve -- isto e uma sugestao, nao a unica porta.
+    """
+    codigo, saida, erro = rodar(["tailscale", "status", "--json"], TIMEOUT_HERDR)
+    if codigo == 127:
+        falhar("tailscale nao instalado", hosts=[])
+    corpo = json_de(saida)
+    if codigo != 0 or not isinstance(corpo, dict):
+        falhar((erro or "tailscale status falhou").strip()[:200], hosts=[])
+
+    hosts = []
+    for par in (corpo.get("Peer") or {}).values():
+        if not isinstance(par, dict):
+            continue
+        dns = str(par.get("DNSName") or "").rstrip(".")
+        if not dns:
+            continue
+        curto = dns.split(".")[0]
+        hosts.append({
+            # O nome curto quando o MagicDNS o resolve, que e o caso normal com
+            # a Tailscale ligada. "desktop" e um alvo que voce le, confere e
+            # digita; "desktop.tailnet-abc123.ts.net" e um que voce copia e cola
+            # torcendo para nao ter errado uma letra do meio.
+            "target": curto if resolve(curto) else dns,
+            "short": curto,
+            "fqdn": dns,
+            "name": str(par.get("HostName") or ""),
+            "os": str(par.get("OS") or ""),
+            "online": par.get("Online") is True,
+        })
+
+    hosts.sort(key=lambda h: (not h["online"], h["short"]))
+    responder(hosts=hosts)
+
+
+COMANDOS = {
+    "snapshot": cmd_snapshot,
+    "focus": cmd_focus,
+    "send": cmd_send,
+    "answer": cmd_answer,
+    "default": cmd_default,
+    "prs": cmd_prs,
+    "hosts": cmd_hosts,
+    "config": cmd_config,
+    "all": cmd_all,
+    "pick": cmd_pick,
+    "disconnect": cmd_disconnect,
+}
+
+
+def main():
+    global SESSAO
+
+    argv = sys.argv[1:]
+    while len(argv) >= 2 and argv[0] in ("--session", "--remote"):
+        if argv[0] == "--session":
+            SESSAO = argv[1]
+        else:
+            usar_remoto(argv[1])
+        argv = argv[2:]
+
+    if not argv or argv[0] not in COMANDOS:
+        sys.stderr.write(__doc__)
+        return 2
+
+    COMANDOS[argv[0]](argv[1:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "id": "otavio.quick-herdr",
+  "name": "Quick Herdr",
+  "version": "3.1.0",
+  "author": "otavio",
+  "description": "Agentes do Herdr de várias máquinas na barra: quantos rodam, param e esperam; a conversa de cada um; e as alternativas de quem parou para perguntar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Quick Herdr",
+    "description": "Agentes do Herdr, locais e por SSH; clicar leva até a aba, o botão direito abre a conversa, e o campo manda um prompt",
+    "category": "Info",
+    "allowMultiple": true,
+    "defaultSection": "right",
+    "defaults": {
+      "session": "default",
+      "remote": "",
+      "label": "",
+      "interval": 4,
+      "prInterval": 180,
+      "maxRows": 20,
+      "hideWhenEmpty": false
+    },
+    "schema": [
+      {
+        "key": "remote",
+        "type": "string",
+        "label": "Herdr de outra máquina por SSH (vazio = esta); `bin/herdr-bar hosts` lista as da Tailscale"
+      },
+      {
+        "key": "label",
+        "type": "string",
+        "label": "Rótulo na barra (para distinguir instâncias)"
+      },
+      {
+        "key": "session",
+        "type": "string",
+        "label": "Sessão do Herdr"
+      },
+      {
+        "key": "interval",
+        "type": "number",
+        "label": "Atualização das contagens (segundos)"
+      },
+      {
+        "key": "prInterval",
+        "type": "number",
+        "label": "Atualização dos PRs (segundos, só com a lista aberta)"
+      },
+      {
+        "key": "maxRows",
+        "type": "number",
+        "label": "Linhas na lista"
+      },
+      {
+        "key": "hideWhenEmpty",
+        "type": "boolean",
+        "label": "Sumir da barra quando não houver agente"
+      }
+    ]
+  },
+  "omarchy": {
+    "clonePaths": [
+      {
+        "source": "Model.js",
+        "target": "Model.js"
+      },
+      {
+        "source": "bin/herdr-bar",
+        "target": "bin/herdr-bar"
+      }
+    ]
+  }
+}
