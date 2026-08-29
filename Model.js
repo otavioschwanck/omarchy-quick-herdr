@@ -176,6 +176,52 @@ function falasVisiveis(linha, expandida) {
   return expandida ? falas : falas.slice(-1);
 }
 
+// ------------------------------------------------------------------- cores
+
+function escaparHtml(texto) {
+  return String(texto)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// O recuo vira espaco rigido; o resto continua espaco comum. Assim a
+// indentacao do comando sobrevive ao HTML, que colapsaria os espacos, e a
+// linha comprida ainda quebra no meio -- rigido em tudo travaria a quebra.
+function espacosDaMargem(texto) {
+  var margem = /^ +/.exec(texto);
+  if (!margem) return escaparHtml(texto);
+  return Array(margem[0].length + 1).join("&nbsp;") + escaparHtml(texto.slice(margem[0].length));
+}
+
+// As linhas do dialogo em HTML, com as cores que o terminal ja pintou. O
+// Claude Code realca diff e bloco de comando; aproveitar isso e mais fiel (e
+// muito mais barato) que reimplementar um highlighter aqui.
+function htmlDoContexto(linhas) {
+  var saida = [];
+
+  for (var i = 0; i < (linhas || []).length; i++) {
+    var trechos = linhas[i] || [];
+    var partes = [];
+
+    for (var j = 0; j < trechos.length; j++) {
+      var trecho = trechos[j];
+      var texto = j === 0 ? espacosDaMargem(trecho.t) : escaparHtml(trecho.t);
+      var estilo = [];
+
+      if (trecho.f) estilo.push("color:" + trecho.f);
+      if (trecho.g) estilo.push("background-color:" + trecho.g);
+      if (trecho.b) estilo.push("font-weight:bold");
+
+      partes.push(estilo.length ? '<span style="' + estilo.join(";") + '">' + texto + "</span>" : texto);
+    }
+
+    saida.push(partes.join(""));
+  }
+
+  return saida.join("<br>");
+}
+
 function temOpcoes(linha) {
   return !!(linha && linha.options && linha.options.length);
 }

@@ -521,7 +521,8 @@ RE_OPCAO = re.compile(r"^\s*(?P<cursor>[❯>»])?\s*(?P<chave>\d{1,2})[.)]\s+(?P
 # So as barras verticais da caixa, e nunca o recuo: as alternativas sem numero
 # se reconhecem pela coluna em que o texto comeca, e um strip() generico
 # apagaria justamente o que as identifica.
-RE_BORDA = re.compile(r"^\s*[│┃┆┇┊┋╎╏║]\s?|\s*[│┃┆┇┊┋╎╏║]\s*$")
+RE_BORDA_ESQ = re.compile(r"^\s*[│┃┆┇┊┋╎╏║]\s?")
+RE_BORDA_DIR = re.compile(r"\s*[│┃┆┇┊┋╎╏║]\s*$")
 
 # Alternativas que nao respondem nada sozinhas: escolher uma abre um campo e
 # fica esperando voce escrever. Apertar a tecla e parar ali deixa o agente
@@ -537,9 +538,19 @@ RE_INSTRUCAO = re.compile(
 )
 
 
-def desenquadra(linha):
-    """Tira a moldura da caixa: "│ ❯ 1. Yes        │" -> "❯ 1. Yes"."""
-    return RE_BORDA.sub("", linha)
+def desenquadra(linha, estilos=None):
+    """Tira a moldura da caixa: "│ ❯ 1. Yes        │" -> "❯ 1. Yes".
+
+    Corta o estilo nos mesmos indices do texto: os dois andam caractere a
+    caractere, e um deslocamento de um pinta a linha inteira errado.
+    """
+    esquerda = RE_BORDA_ESQ.match(linha)
+    inicio = esquerda.end() if esquerda else 0
+    direita = RE_BORDA_DIR.search(linha, inicio)
+    fim = direita.start() if direita else len(linha)
+    if estilos is None:
+        return linha[inicio:fim]
+    return (linha[inicio:fim], estilos[inicio:fim])
 
 
 def opcoes_numeradas(linhas):
@@ -620,25 +631,103 @@ def formulario(bruto, quantas_linhas=40):
     Um agente que pergunta de outro jeito -- "[y/n]", texto livre -- nao rende
     alternativa nenhuma, e sobra o campo, que responde qualquer coisa.
     """
-    linhas = [desenquadra(l) for l in (bruto or "").splitlines()][-quantas_linhas:]
+    pares = [desenquadra(*tokenizar(l)) for l in (bruto or "").splitlines()][-quantas_linhas:]
+    linhas = [t for t, _ in pares]
+    estilos = [e for _, e in pares]
 
     achadas = opcoes_numeradas(linhas) or opcoes_com_cursor(linhas)
     if not achadas:
         # Sem alternativa reconhecivel -- "[y/N]", texto corrido -- ainda ha uma
         # pergunta na tela, e ela e o que voce precisa ler. Botao nenhum e
         # honesto; pergunta nenhuma e so esconder o que aconteceu.
-        return {"question": pergunta_de(linhas), "options": [], "context": contexto_de(linhas)}
+        return {"question": pergunta_de(linhas), "options": [], "context": contexto_de(linhas, estilos)}
 
     primeira = achadas[0][0]
     opcoes = [opcao for _, opcao in achadas][:8]
     for posicao, opcao in enumerate(opcoes):
         opcao["index"] = posicao
 
-    acima = linhas[:primeira]
-    return {"question": pergunta_de(acima), "options": opcoes, "context": contexto_de(acima)}
+    return {
+        "question": pergunta_de(linhas[:primeira]),
+        "options": opcoes,
+        "context": contexto_de(linhas[:primeira], estilos[:primeira]),
+    }
 
 
-def contexto_de(acima):
+# --------------------------------------------------------------------- cores
+
+
+RE_SGR = re.compile(r"\x1b\[([0-9;]*)m")
+RE_OUTRO_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b[\]P][^\x07\x1b]*(?:\x07|\x1b\\)?")
+
+
+def tokenizar(linha):
+    """Separa uma linha com ANSI em (texto limpo, estilo de cada caractere).
+
+    O terminal ja pintou o codigo -- o Claude Code realca diff e bloco de
+    comando -- entao a cor certa e a que ja esta la. Reimplementar um
+    highlighter aqui seria adivinhar de novo o que a outra ponta ja sabe.
+    """
+    # Fora os SGR, todo escape e movimentacao de cursor e afins: nao pinta nada
+    # e nao ocupa coluna, entao sai antes de contar caractere.
+    limpa = RE_OUTRO_ESCAPE.sub("", linha)
+
+    texto = []
+    estilos = []
+    estilo = {}
+
+    # split com um grupo devolve texto e parametros alternados, comecando pelo
+    # texto -- dai o indice par ser conteudo e o impar ser SGR.
+    for indice, pedaco in enumerate(RE_SGR.split(limpa)):
+        if indice % 2:
+            estilo = aplicar_sgr(estilo, pedaco)
+        else:
+            texto.append(pedaco)
+            estilos.extend([estilo] * len(pedaco))
+
+    return ("".join(texto), estilos)
+
+
+def aplicar_sgr(estilo, parametros):
+    """Um SGR sobre o estilo corrente. So o que muda a leitura: cor, negrito, fraco."""
+    codigos = [c for c in parametros.split(";") if c != ""] or ["0"]
+    novo = dict(estilo)
+    indice = 0
+
+    while indice < len(codigos):
+        codigo = codigos[indice]
+        if codigo == "0":
+            novo = {}
+        elif codigo == "1":
+            novo["b"] = True
+        elif codigo == "2":
+            novo["d"] = True
+        elif codigo in ("22", "21"):
+            novo.pop("b", None)
+            novo.pop("d", None)
+        elif codigo in ("39", "49"):
+            novo.pop("f" if codigo == "39" else "g", None)
+        elif codigo in ("38", "48") and indice + 4 < len(codigos) and codigos[indice + 1] == "2":
+            chave = "f" if codigo == "38" else "g"
+            novo[chave] = "#%02x%02x%02x" % tuple(min(255, int(c or 0)) for c in codigos[indice + 2:indice + 5])
+            indice += 4
+        indice += 1
+
+    return novo
+
+
+def em_trechos(texto, estilos):
+    """Junta caracteres vizinhos de mesmo estilo, para o JSON nao virar um por letra."""
+    trechos = []
+    for caractere, estilo in zip(texto, estilos):
+        if trechos and trechos[-1][1] == estilo:
+            trechos[-1][0] += caractere
+        else:
+            trechos.append([caractere, estilo])
+    return [dict(estilo, t=texto) for texto, estilo in trechos]
+
+
+def contexto_de(acima, estilos):
     """Tudo que o dialogo mostra antes da pergunta, como esta na tela.
 
     E o comando que ele quer rodar, o diff que quer aplicar, o "Tip:" que muda
@@ -650,7 +739,7 @@ def contexto_de(acima):
     inicio, _ = faixa_da_pergunta(acima)
     corte = inicio if inicio >= 0 else len(acima)
 
-    uteis = [l.rstrip() for l in acima[:corte] if util(l)]
+    uteis = [(t.rstrip(), e[:len(t.rstrip())]) for t, e in zip(acima[:corte], estilos[:corte]) if util(t)]
     # As de baixo sao as que importam: o comando fica colado na pergunta, e o
     # que esta muito acima e historico da conversa, nao o pedido.
     uteis = uteis[-MAX_CONTEXTO:]
@@ -660,8 +749,11 @@ def contexto_de(acima):
     # Tira o recuo comum e mantem o relativo: a caixa do dialogo ja empurrava
     # tudo para dentro, e repetir isso aqui so gastaria largura -- mas a
     # indentacao interna do comando e o que o torna legivel.
-    recuo = min(len(l) - len(l.lstrip(" ")) for l in uteis)
-    return [l[recuo:][:MAX_MENSAGEM] for l in uteis]
+    recuo = min(len(t) - len(t.lstrip(" ")) for t, _ in uteis)
+    return [
+        em_trechos(t[recuo:][:MAX_MENSAGEM], e[recuo:][:MAX_MENSAGEM])
+        for t, e in uteis
+    ]
 
 
 def util(linha):
@@ -719,13 +811,20 @@ def ler_terminal(pane, quantas, bloqueado):
     """Uma leitura por agente: dela saem as falas e, se parado, o dialogo."""
     # `agent read` e a excecao entre os comandos: cospe o buffer do terminal no
     # stdout, sem envelope JSON.
+    # `pane read --format ansi` em vez de `agent read`: e a mesma tela, mas com
+    # as cores que o terminal ja pintou. O Claude Code realca diff e bloco de
+    # comando, e essa e a unica forma de o painel mostrar codigo realcado sem
+    # reimplementar um highlighter -- adivinhando de novo o que a outra ponta
+    # ja sabe. O texto limpo sai da mesma leitura, entao nao custa uma segunda.
     bruto, erro = herdr_texto(
-        "agent", "read", pane, "--source", "detection", "--lines", str(LINHAS_BUFFER)
+        "pane", "read", pane, "--source", "recent-unwrapped",
+        "--lines", str(LINHAS_BUFFER), "--format", "ansi"
     )
     if erro:
         return ([], {"question": "", "options": [], "context": []})
     vazio = {"question": "", "options": [], "context": []}
-    return (mensagens(bruto, quantas), formulario(bruto) if bloqueado else vazio)
+    limpo = RE_SGR.sub("", RE_OUTRO_ESCAPE.sub("", bruto))
+    return (mensagens(limpo, quantas), formulario(bruto) if bloqueado else vazio)
 
 
 # ------------------------------------------------------------------ agentes

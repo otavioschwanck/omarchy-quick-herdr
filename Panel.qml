@@ -1296,7 +1296,11 @@ Panel {
                   visible: (row.modelData.context || []).length > 0
                   x: Style.space(20)
                   width: conteudo.width - Style.space(20)
-                  text: (row.modelData.context || []).join("\n")
+                  // RichText porque as cores vêm do terminal: o Claude Code já
+                  // realçou o diff e o bloco de comando, e repintar aqui seria
+                  // adivinhar de novo o que a outra ponta já sabe.
+                  textFormat: Text.RichText
+                  text: Model.htmlDoContexto(row.modelData.context)
                   color: root.fadeColor
                   wrapMode: Text.Wrap
                   font.family: root.fontFamily
