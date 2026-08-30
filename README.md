@@ -324,6 +324,14 @@ machine can wake up, and hiding it would be a lie), and a field for any other
 SSH target. Choosing a remote machine with no label set uses its name as the
 label, or two instances look identical on the bar.
 
+Below the machines, `+` and `−` set the panel's text size. Only the panel grows,
+never the bar button: the bar is one slot among many and cannot widen without
+shoving its neighbours, while the popup is a window of its own and can take the
+room. At the ceiling it already fills the screen, which is where growing
+further would start cutting content instead of showing it. The size is
+persisted — how large you need text to be is a property of your eyes and your
+monitor, not of one session.
+
 Configuring a widget is something you look for **in it**, not in a file whose
 path you have to remember. The remaining keys stay in the widget's entry in
 `~/.config/omarchy/shell.json`, which is where they would live anyway — this is
@@ -368,6 +376,7 @@ In `~/.config/omarchy/shell.json`, on the widget's entry:
 | `prInterval` | 180 | seconds between PR lookups, only with the list open |
 | `maxRows` | 20 | rows in the list |
 | `hideWhenEmpty` | false | disappear from the bar when there is no agent |
+| `fontScale` | 1 | the panel's text size, 0.8 to 2.6 (the `+` / `−` on the settings page) |
 
 ## Implementation notes
 

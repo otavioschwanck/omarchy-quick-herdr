@@ -36,6 +36,7 @@ Panel {
   property int prSeconds: 180
   property int maxRows: 20
   property bool hideWhenEmpty: false
+  property real fontScale: 1
 
   function applySettings() {
     session = String(setting("session", "default") || "default");
@@ -58,6 +59,7 @@ Panel {
     prSeconds = Math.max(30, Number(setting("prInterval", 180)) || 180);
     maxRows = Math.max(1, Number(setting("maxRows", 20)) || 20);
     hideWhenEmpty = setting("hideWhenEmpty", false) === true;
+    fontScale = clampScale(Number(setting("fontScale", 1)) || 1);
     refresh();
   }
 
@@ -75,6 +77,22 @@ Panel {
   readonly property color dimColor: Qt.darker(barForeground, 1.5)
   readonly property color fadeColor: Qt.darker(barForeground, 1.8)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  // The panel's own type scale. The bar keeps the theme's size -- it is one
+  // slot among many and cannot grow without shoving its neighbours -- but the
+  // popup is a window of its own, and a conversation is meant to be read, not
+  // squinted at. The floor is where the layout still holds; the ceiling is
+  // where the panel already fills the screen and more would only cut content.
+  readonly property real minScale: 0.8
+  readonly property real maxScale: 2.6
+
+  function clampScale(value) {
+    return Math.max(minScale, Math.min(maxScale, Math.round(value * 10) / 10));
+  }
+
+  readonly property int fontBody: Math.round(Style.font.body * fontScale)
+  readonly property int fontSmall: Math.round(Style.font.bodySmall * fontScale)
+  readonly property int fontCaption: Math.round(Style.font.caption * fontScale)
 
   // ---------------------------------------------------------------- state
   property var counts: ({})
@@ -399,6 +417,15 @@ Panel {
     refresh();
   }
 
+  // Persisted, and not just applied: the size you can read is a property of
+  // your eyes and your monitor, not of this session.
+  function nudgeFont(step) {
+    var next = clampScale(fontScale + step);
+    if (next === fontScale) return;
+    fontScale = next;
+    setConfigJson("fontScale", String(next));
+  }
+
   function toggleLocal() {
     useLocal = !useLocal;
     setConfigJson("local", useLocal ? "true" : "false");
@@ -705,7 +732,7 @@ Panel {
     // Much wider than the status panels: here every row carries a whole sentence
     // of conversation, and a dialog's question goes whole. Width bought here is
     // height saved -- and height is what is scarce in a popup hanging off the bar.
-    contentWidth: panel.fittedContentWidth(Style.space(780))
+    contentWidth: panel.fittedContentWidth(Style.space(780) * root.fontScale)
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -812,7 +839,7 @@ Panel {
               text: Model.tooltip(root.counts)
               color: (root.counts.blocked || 0) > 0 ? root.urgentColor : root.dimColor
               font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: root.fontCaption
               font.bold: true
             }
 
@@ -851,7 +878,7 @@ Panel {
           selectedTextColor: root.barForeground
           wrapMode: TextArea.Wrap
           font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
+          font.pixelSize: root.fontSmall
 
           leftPadding: Style.spacing.controlPaddingX + Border.left(borderSpec)
           rightPadding: Style.spacing.controlPaddingX + Border.right(borderSpec)
@@ -895,7 +922,7 @@ Panel {
           text: root.status
           color: root.statusIsError ? root.urgentColor : root.dimColor
           font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
+          font.pixelSize: root.fontCaption
           horizontalAlignment: Text.AlignHCenter
           elide: Text.ElideRight
         }
@@ -966,7 +993,7 @@ Panel {
                 color: root.barForeground
                 opacity: machine.ligada ? 1 : 0.45
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.body
+                font.pixelSize: root.fontBody
               }
 
               Text {
@@ -977,7 +1004,7 @@ Panel {
                 opacity: machine.dim && !machine.ligada ? 0.55 : 1
                 elide: Text.ElideRight
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                font.pixelSize: root.fontSmall
               }
 
               Text {
@@ -985,7 +1012,7 @@ Panel {
                 text: machine.note
                 color: root.fadeColor
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fontCaption
               }
             }
 
@@ -1004,7 +1031,7 @@ Panel {
               color: root.urgentColor
               wrapMode: Text.WordWrap
               font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: root.fontCaption
             }
           }
 
@@ -1053,7 +1080,7 @@ Panel {
             foreground: root.barForeground
             accent: root.barForeground
             font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
+            font.pixelSize: root.fontSmall
 
             onAccepted: {
               var target_ = text.trim();
@@ -1068,6 +1095,67 @@ Panel {
             }
           }
 
+          PanelSectionHeader {
+            topPadding: Style.space(8)
+            text: "Text size"
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+          }
+
+          // Only the panel grows, never the bar button: the bar is one slot
+          // among many and cannot widen without shoving its neighbours. Here
+          // the popup is a window of its own, so it can take the room -- at
+          // the ceiling it already fills the screen, which is where growing
+          // further would start cutting content instead of showing it.
+          Row {
+            spacing: Style.space(12)
+            leftPadding: Style.space(10)
+
+            component StepButton: Text {
+              property string glyph: ""
+              property real step: 0
+
+              readonly property bool possible: root.clampScale(root.fontScale + step) !== root.fontScale
+
+              text: glyph
+              color: root.barForeground
+              opacity: !possible ? 0.25 : (stepMouse.containsMouse ? 1 : 0.6)
+              font.family: root.fontFamily
+              font.pixelSize: root.fontBody
+
+              MouseArea {
+                id: stepMouse
+
+                anchors.fill: parent
+                anchors.margins: -Style.space(6)
+                hoverEnabled: true
+                enabled: parent.possible
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.nudgeFont(parent.step)
+              }
+            }
+
+            StepButton {
+              glyph: "\uf068"
+              step: -0.1
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(46)
+              horizontalAlignment: Text.AlignHCenter
+              text: Math.round(root.fontScale * 100) + "%"
+              color: root.dimColor
+              font.family: root.fontFamily
+              font.pixelSize: root.fontSmall
+            }
+
+            StepButton {
+              glyph: "\uf067"
+              step: 0.1
+            }
+          }
+
           Text {
             width: parent.width
             topPadding: Style.space(4)
@@ -1075,7 +1163,7 @@ Panel {
             color: root.fadeColor
             wrapMode: Text.WordWrap
             font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            font.pixelSize: root.fontCaption
           }
         }
 
@@ -1087,7 +1175,7 @@ Panel {
           color: root.helperError !== "" ? root.urgentColor : root.barForeground
           opacity: root.helperError !== "" ? 1 : 0.6
           font.family: root.fontFamily
-          font.pixelSize: Style.font.body
+          font.pixelSize: root.fontBody
           wrapMode: Text.WordWrap
         }
 
@@ -1123,7 +1211,7 @@ Panel {
               text: root.copied ? "✓" : "⧉"
               color: root.copied ? root.barForeground : root.dimColor
               font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
+              font.pixelSize: root.fontSmall
             }
 
             Text {
@@ -1133,7 +1221,7 @@ Panel {
               color: copyMouse.containsMouse || root.copied ? root.barForeground : root.dimColor
               elide: Text.ElideRight
               font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
+              font.pixelSize: root.fontSmall
             }
           }
         }
@@ -1202,7 +1290,7 @@ Panel {
                   color: row.modelData.status === "blocked" ? root.urgentColor : root.barForeground
                   opacity: row.modelData.status === "idle" || row.modelData.status === "unknown" ? 0.45 : 1
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                  font.pixelSize: root.fontBody
                 }
 
                 Text {
@@ -1214,7 +1302,7 @@ Panel {
                   color: root.barForeground
                   elide: Text.ElideRight
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                  font.pixelSize: root.fontBody
                 }
 
                 // Which machine the row came from. Beside the project because
@@ -1228,7 +1316,7 @@ Panel {
                   text: Model.machineBadge(row.modelData.machine, root.severalMachines)
                   color: root.fadeColor
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fontCaption
                 }
 
                 // The terminal title is what tells two tabs of the same project apart; it
@@ -1249,7 +1337,7 @@ Panel {
                   color: root.dimColor
                   elide: Text.ElideRight
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: root.fontSmall
                 }
 
                 // Open and close the conversation. It appears under the cursor and stays while
@@ -1262,7 +1350,7 @@ Panel {
                   color: root.barForeground
                   opacity: chevronMouse.containsMouse ? 0.9 : 0.4
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fontCaption
 
                   MouseArea {
                     id: chevronMouse
@@ -1281,7 +1369,7 @@ Panel {
                   text: row.pr
                   color: prMouse.containsMouse ? root.barForeground : root.dimColor
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: root.fontSmall
                   font.underline: prMouse.containsMouse
 
                   MouseArea {
@@ -1305,7 +1393,7 @@ Panel {
                   color: root.barForeground
                   opacity: row.isDefault ? 0.9 : (starMouse.containsMouse ? 0.9 : 0.4)
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                  font.pixelSize: root.fontBody
 
                   MouseArea {
                     id: starMouse
@@ -1343,7 +1431,7 @@ Panel {
                     text: Model.voice(modelData.who)
                     color: root.fadeColor
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
+                    font.pixelSize: root.fontCaption
                   }
 
                   // Elided at rest, whole under the cursor: the list stays scannable at a glance,
@@ -1360,7 +1448,7 @@ Panel {
                     elide: row.expanded || row.highlighted ? Text.ElideNone : Text.ElideRight
                     wrapMode: row.expanded || row.highlighted ? Text.WordWrap : Text.NoWrap
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
+                    font.pixelSize: root.fontCaption
                   }
                 }
               }
@@ -1396,7 +1484,7 @@ Panel {
                   color: root.fadeColor
                   wrapMode: Text.Wrap
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fontCaption
                 }
 
                 Text {
@@ -1410,7 +1498,7 @@ Panel {
                   // and you answer something else.
                   wrapMode: Text.WordWrap
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: root.fontSmall
                 }
 
                 // One option per row, full width, text that wraps instead of eliding. In a row
@@ -1463,7 +1551,7 @@ Panel {
                         text: option.badge
                         color: root.barForeground
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
+                        font.pixelSize: root.fontSmall
                         font.bold: true
                       }
 
@@ -1477,7 +1565,7 @@ Panel {
                         color: optionMouse.containsMouse ? root.barForeground : root.dimColor
                         wrapMode: Text.WordWrap
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
+                        font.pixelSize: root.fontSmall
                       }
                     }
                   }
@@ -1494,7 +1582,7 @@ Panel {
           text: Model.ghNotice(root.ghState)
           color: root.fadeColor
           font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
+          font.pixelSize: root.fontCaption
           horizontalAlignment: Text.AlignHCenter
           elide: Text.ElideRight
         }
@@ -1506,7 +1594,7 @@ Panel {
                 : Model.hint(root.rows, root.defaultRow, field.activeFocus, root.cursorRow)
           color: root.fadeColor
           font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
+          font.pixelSize: root.fontCaption
           horizontalAlignment: Text.AlignHCenter
           elide: Text.ElideRight
         }
