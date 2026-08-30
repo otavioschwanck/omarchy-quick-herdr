@@ -117,6 +117,11 @@ MAX_QUESTION = 600
 # to read before clicking.
 MAX_LABEL = 240
 
+# A ceiling on what goes to the clipboard. Copying a gigabyte of build output
+# would hang the compositor holding it, and nothing anyone means by "copy this
+# file" is that large.
+MAX_CLIPBOARD = 8 * 1024 * 1024
+
 # A fixed file in /tmp is convenient and shared: anyone could have planted a
 # symlink there first. O_NOFOLLOW refuses to follow one, so the worst case is
 # logging nothing -- and never writing into somebody else's file.
@@ -2048,55 +2053,119 @@ def cmd_open(args):
     """Open a file the conversation mentioned, wherever it lives.
 
     A remote path names a file that is not on this machine, so opening it
-    directly would fail on a name that looks perfectly right. It is copied here
-    first and the copy is what opens -- read-only by nature: editing it would
-    edit a copy, and the panel does not pretend otherwise.
+    directly would fail on a name that looks perfectly right. It is fetched
+    here first and the copy is what opens -- a copy by nature: editing it
+    would edit the copy, and the panel does not pretend otherwise.
     """
     path = option(args, "--path") or ""
     target = option(args, "--remote") or ""
     if not path:
         fail("no file")
 
-    # The line number belongs to the link, not to the filename.
-    path = re.sub(r":\d+(?::\d+)?$", "", path)
-    if path.startswith("~"):
-        path = os.path.expanduser(path)
-
-    local = path
-    if target:
-        use_remote(target)
-        folder = os.path.join(CACHE_DIR, "files", re.sub(r"[^A-Za-z0-9]", "-", target))
-        try:
-            os.makedirs(folder, exist_ok=True)
-        except OSError as erro:
-            fail("cannot create the cache: %s" % erro)
-
-        local = os.path.join(folder, os.path.basename(path) or "file")
-        # The same control socket the refresh already keeps open, so fetching a
-        # file costs a transfer and not another handshake.
-        code, out, err = run(["scp",
-                     "-o", "BatchMode=yes",
-                     "-o", "ConnectTimeout=5",
-                     "-o", "ControlMaster=auto",
-                     "-o", "ControlPath=%s/ssh-%%r@%%h-%%p" % CACHE_DIR,
-                     "-o", "ControlPersist=300",
-                     "%s:%s" % (target, path), local], TIMEOUT_SSH)
-        if code != 0:
-            fail(error_from(code, out, err) or
-                 "could not fetch %s from %s" % (path, target))
-
-    if not os.path.exists(local):
-        fail("no such file: %s" % path)
+    local, erro = here_copy_of(path, target)
+    if erro:
+        fail(erro)
 
     argv = opener_for(local)
     try:
         subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
-    except OSError as erro:
-        fail("could not open: %s" % erro)
+    except OSError as falha:
+        fail("could not open: %s" % falha)
 
     log_event("open", path=local, remote=target, with_=argv[0])
     reply(opened=local, opener=argv[0])
+
+
+def cmd_copy_file(args):
+    """Put the file itself on the clipboard, not the path to it.
+
+    Copying the location is for a terminal; this is for everywhere else. An
+    image goes as an image, so it pastes into Slack as the picture rather than
+    as a string nobody can see; anything else goes as its text.
+    """
+    path = option(args, "--path") or ""
+    target = option(args, "--remote") or ""
+    if not path:
+        fail("no file")
+
+    local, erro = here_copy_of(path, target)
+    if erro:
+        fail(erro)
+
+    code, mime, _ = run(["xdg-mime", "query", "filetype", local], TIMEOUT_HERDR)
+    mime = mime.strip() if code == 0 else ""
+
+    try:
+        with open(local, "rb") as fh:
+            blob = fh.read(MAX_CLIPBOARD + 1)
+    except OSError as falha:
+        fail("could not read it: %s" % falha)
+
+    if len(blob) > MAX_CLIPBOARD:
+        fail("too big to copy (over %d MB)" % (MAX_CLIPBOARD // (1024 * 1024)))
+
+    argv = ["wl-copy"]
+    # Only for the types that mean something as bytes. Handing wl-copy a
+    # binary it cannot describe puts an unpasteable selection on the clipboard.
+    if mime.startswith("image/"):
+        argv += ["--type", mime]
+    elif mime and not mime.startswith("text/"):
+        argv += ["--type", "application/octet-stream"]
+
+    # Nothing of wl-copy's may be held on a pipe. On Wayland the process that
+    # copied has to stay alive to serve the selection, so it forks and lingers;
+    # a pipe we are still holding keeps the wait going until it times out, on a
+    # copy that already succeeded.
+    try:
+        done = subprocess.run(argv, input=blob, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=TIMEOUT_HERDR)
+    except (OSError, subprocess.SubprocessError) as falha:
+        fail("could not copy: %s" % falha)
+
+    if done.returncode != 0:
+        fail("wl-copy exited with %d" % done.returncode)
+
+    log_event("copy-file", path=local, mime=mime, bytes=len(blob))
+    reply(copied=local, mime=mime, bytes=len(blob))
+
+
+def here_copy_of(path, target):
+    """The file on this machine, fetching it first when it lives on another.
+
+    Returns (local path, error). Shared by opening and copying, which want the
+    same thing and used to disagree about how to get it.
+    """
+    path = re.sub(r":\d+(?::\d+)?$", "", path)
+    if path.startswith("~"):
+        path = os.path.expanduser(path)
+
+    if not target:
+        return (path, "" if os.path.exists(path) else "no such file: %s" % path)
+
+    use_remote(target)
+    folder = os.path.join(CACHE_DIR, "files", re.sub(r"[^A-Za-z0-9]", "-", target))
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError as erro:
+        return ("", "cannot create the cache: %s" % erro)
+
+    local = os.path.join(folder, os.path.basename(path) or "file")
+    # The same control socket the refresh already keeps open, so fetching a
+    # file costs a transfer and not another handshake.
+    code, out, err = run(["scp",
+                          "-o", "BatchMode=yes",
+                          "-o", "ConnectTimeout=5",
+                          "-o", "ControlMaster=auto",
+                          "-o", "ControlPath=%s/ssh-%%r@%%h-%%p" % CACHE_DIR,
+                          "-o", "ControlPersist=300",
+                          "%s:%s" % (target, path), local], TIMEOUT_SSH)
+    if code != 0:
+        return ("", error_from(code, out, err) or
+                "could not fetch %s from %s" % (path, target))
+    if not os.path.exists(local):
+        return ("", "no such file: %s" % path)
+    return (local, "")
 
 
 def wants_a_terminal(path):
@@ -2267,6 +2336,7 @@ COMMANDS = {
     "all": cmd_all,
     "history": cmd_history,
     "open": cmd_open,
+    "copy-file": cmd_copy_file,
     "pick": cmd_pick,
     "disconnect": cmd_disconnect,
 }

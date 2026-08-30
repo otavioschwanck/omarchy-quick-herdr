@@ -175,6 +175,18 @@ Panel {
     closeFileMenu();
   }
 
+  // The file itself, not the path to it. Copying the location is for pasting
+  // into a terminal; this is for everywhere else -- an image lands in Slack as
+  // the picture rather than as a string nobody can see.
+  function copyFileContents() {
+    var args = ["copy-file", "--path", filePath];
+    if (fileMachine) args.push("--remote", fileMachine);
+    copyFileProc.command = argv(args);
+    copyFileProc.running = true;
+    note(fileMachine ? "fetching " + Model.baseName(filePath) + "…" : "copying…");
+    closeFileMenu();
+  }
+
   function openFile() {
     var args = ["open", "--path", filePath];
     if (fileMachine) args.push("--remote", fileMachine);
@@ -572,6 +584,19 @@ Panel {
   }
 
   Process {
+    id: copyFileProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var data = root.parse(text);
+        if (!data) return;
+        if (data.ok === false) root.note(String(data.error), true);
+        else root.note(Model.copiedNote(data.bytes, data.mime));
+      }
+    }
+  }
+
+  Process {
     id: openProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -944,6 +969,7 @@ Panel {
             Repeater {
               model: [
                 { label: "Open", glyph: "\uf08e", action: "open" },
+                { label: "Copy file", glyph: "\uf15c", action: "file" },
                 { label: "Copy location", glyph: "\uf0c5", action: "copy" }
               ]
 
@@ -988,6 +1014,7 @@ Panel {
                   cursorShape: Qt.PointingHandCursor
                   onClicked: {
                     if (modelData.action === "open") root.openFile();
+                    else if (modelData.action === "file") root.copyFileContents();
                     else root.copyFile();
                   }
                 }

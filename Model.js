@@ -326,6 +326,17 @@ function trimPath(path) {
   return String(path || "").replace(/[.,;:)\]}'"]+$/, "");
 }
 
+// Whether the match really starts here, or is the tail of something longer.
+// An elided path -- ".../otavio-pc/Gemfile", written that way in prose -- ends
+// with the regex reading the last two dots of "..." as a relative "..", and
+// offering a link to a file that never existed. The character in front settles
+// it: nothing may run into a path from the left.
+function startsClean(text, at) {
+  if (at <= 0) return true;
+  var before = text.charAt(at - 1);
+  return "….".indexOf(before) < 0 && !/[\w/@+%-]/.test(before);
+}
+
 function pathsIn(text) {
   var clean = String(text || "").replace(RE_URL, function (url) {
     return new Array(url.length + 1).join("\u0000");
@@ -335,9 +346,15 @@ function pathsIn(text) {
   var match;
   RE_PATH.lastIndex = 0;
   while ((match = RE_PATH.exec(clean)) !== null) {
+    if (!startsClean(clean, match.index)) continue;
+
     var path = trimPath(match[0]);
     // A lone "/" or "a/b" with nothing to it is not worth a link.
     if (path.length < 3 || path.indexOf("/") < 0) continue;
+    // An ellipsis means the middle was cut out and there is no such file. Both
+    // spellings: the character, and the three dots that a segment happily
+    // swallows because a segment may legitimately contain dots.
+    if (path.indexOf("…") >= 0 || path.indexOf("...") >= 0) continue;
     if (found.indexOf(path) < 0) found.push(path);
   }
   return found;
@@ -357,6 +374,16 @@ function baseName(path) {
 // names a file that is not there, which is worse than useless: it looks right.
 function whereItIs(path, machine) {
   return machine ? machine + ":" + path : path;
+}
+
+// What the status line says after a copy. The size is the confirmation that
+// something real crossed: "copied" alone is what an empty clipboard also says.
+function copiedNote(bytes, mime) {
+  var size = Number(bytes) || 0;
+  var human = size >= 1024 * 1024 ? (Math.round(size / 104857.6) / 10) + " MB"
+            : size >= 1024 ? Math.round(size / 1024) + " KB"
+            : size + " B";
+  return (String(mime || "").indexOf("image/") === 0 ? "image copied · " : "file copied · ") + human;
 }
 
 function hasPath(text) {
@@ -385,9 +412,11 @@ function messageHtml(text, linkColor) {
     var match;
     RE_PATH.lastIndex = 0;
     while ((match = RE_PATH.exec(masked)) !== null) {
-      var raw = match[0];
-      var path = trimPath(raw);
+      if (!startsClean(masked, match.index)) continue;
+
+      var path = trimPath(match[0]);
       if (path.length < 3 || path.indexOf("/") < 0) continue;
+      if (path.indexOf("…") >= 0 || path.indexOf("...") >= 0) continue;
 
       built += line.slice(at, match.index);
       built += '<a href="' + path + '" style="color:' + linkColor + '">' + path + "</a>";

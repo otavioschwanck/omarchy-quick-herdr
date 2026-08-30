@@ -194,9 +194,19 @@ Every message also carries its clock, in the margin rather than in the sentence
 
 ### Files it mentions
 
-Every path in an open conversation is a link. Clicking one offers **Open** and
-**Copy location**, and paths that name an image also get a small thumbnail,
-because a filename does not answer "which screenshot was that".
+Every path in an open conversation is a link. Clicking one offers **Open**,
+**Copy file** and **Copy location**, and paths that name an image also get a
+small thumbnail, because a filename does not answer "which screenshot was
+that".
+
+**Copy file** puts the file itself on the clipboard rather than its name: an
+image goes as an image, so it pastes into Slack as the picture instead of as a
+string nobody can see. Anything else goes as its text. **Copy location** is the
+one you want for pasting into a terminal.
+
+A path written with an ellipsis is not a link. `.../otavio-pc/Gemfile` in prose
+is a name with its middle cut out, and the regex read the last two dots of the
+"..." as a relative `..` — offering to open a file that never existed.
 
 **Open** picks the right thing to open with. An image goes to the image viewer
 through `xdg-open`; a source file goes to your editor **in a terminal window**.
