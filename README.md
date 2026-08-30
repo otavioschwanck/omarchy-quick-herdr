@@ -198,11 +198,21 @@ Every path in an open conversation is a link. Clicking one offers **Open** and
 **Copy location**, and paths that name an image also get a small thumbnail,
 because a filename does not answer "which screenshot was that".
 
+**Open** picks the right thing to open with. An image goes to the image viewer
+through `xdg-open`; a source file goes to your editor **in a terminal window**.
+That distinction is not decoration: on this desktop `text/plain` is handled by
+`nvim.desktop`, which declares `Terminal=true`, so handing it to `xdg-open`
+launches an editor with no terminal to draw in — clicking a `.rb` did nothing at
+all while clicking a `.png` worked. The handler's desktop entry is what decides.
+
 A path on another machine is copied with its machine in front
-(`otavio-pc:/home/...`), which is what actually opens it when pasted; opening
-one fetches it here first. A slash alone does not make a link — "uma
-print/imagem" is ordinary prose, so a path has to have more than one segment or
-a real extension.
+(`otavio-pc:/home/...`), which is what actually opens it when pasted. Opening
+one fetches it here first, over the SSH connection the refresh already keeps
+open, into `~/.cache/omarchy-quick-herdr/files/<machine>/`. That copy is a copy:
+editing it does not edit the file on the other machine.
+
+A slash alone does not make a link — "uma print/imagem" is ordinary prose, so a
+path has to have more than one segment or a real extension.
 
 Messages are elided at rest and open whole under the cursor — the list stays
 scannable at a glance, and reading everything costs only pointing. They grow

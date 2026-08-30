@@ -345,6 +345,20 @@ function pathsIn(text) {
 
 // Rich text costs real time to lay out, and most messages have nothing in them
 // to link. This is the cheap question that keeps them on the plain path.
+// What to call the file in the menu: the name you clicked, without the
+// directory that is already on the line below it.
+function baseName(path) {
+  var clean = withoutLine(path);
+  var cut = clean.lastIndexOf("/");
+  return cut >= 0 ? clean.slice(cut + 1) : clean;
+}
+
+// The whole location, machine included. A remote path with no machine in front
+// names a file that is not there, which is worse than useless: it looks right.
+function whereItIs(path, machine) {
+  return machine ? machine + ":" + path : path;
+}
+
 function hasPath(text) {
   return pathsIn(text).length > 0;
 }

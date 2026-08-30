@@ -881,9 +881,8 @@ Panel {
       anchors.fill: parent
 
       // ---------- what to do with a file ----------
-      // Declared first, shown on top: the z is what puts it over the list, and
-      // being first in the file keeps it out of the way of everything that
-      // reads in order below.
+      // Declared first, drawn on top: z is what puts it over the list, and
+      // keeping it out of the way here leaves the list reading in order below.
       Item {
         anchors.fill: parent
         visible: root.filePath !== ""
@@ -896,60 +895,89 @@ Panel {
           onClicked: root.closeFileMenu()
         }
 
-        Rectangle {
-          // Kept inside the panel: opened from a link near the right edge it
-          // would otherwise hang off the side where it cannot be clicked.
-          x: Math.max(Style.space(6),
-                      Math.min(root.fileX, keyCatcher.width - width - Style.space(6)))
-          y: Math.max(Style.space(6),
-                      Math.min(root.fileY + Style.space(8), keyCatcher.height - height - Style.space(6)))
-          width: Math.min(Style.space(340) * root.fontScale, keyCatcher.width - Style.space(12))
-          height: menuColumn.implicitHeight + Style.space(10)
+        BorderSurface {
+          // Kept inside the panel: opened from a link near an edge it would
+          // otherwise hang off the side, where it cannot be clicked.
+          x: Math.max(Style.spacing.sm,
+                      Math.min(root.fileX, keyCatcher.width - width - Style.spacing.sm))
+          y: Math.max(Style.spacing.sm,
+                      Math.min(root.fileY + Style.spacing.sm,
+                               keyCatcher.height - height - Style.spacing.sm))
+          width: Math.min(Style.space(320) * root.fontScale, keyCatcher.width - Style.spacing.sm * 2)
+          height: card.implicitHeight + Style.spacing.md * 2
           radius: Style.cornerRadius
-          color: Qt.rgba(root.hoverFill.r, root.hoverFill.g, root.hoverFill.b, 1)
-          border.width: 1
-          border.color: root.fadeColor
+          color: Color.popups.background
+          borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border,
+                                                Color.popups.border, Math.max(1, Style.space(2)))
 
           Column {
-            id: menuColumn
+            id: card
 
-            x: Style.space(5)
-            y: Style.space(5)
-            width: parent.width - Style.space(10)
-            spacing: Style.space(2)
+            x: Style.spacing.md
+            y: Style.spacing.md
+            width: parent.width - Style.spacing.md * 2
+            spacing: Style.spacing.sm
+
+            // The name first, because that is what you clicked and what you
+            // recognise; the whole location under it, for when two files share
+            // a name -- which in a repository is most of them.
+            Text {
+              width: parent.width
+              text: Model.baseName(root.filePath)
+              color: Color.popups.text
+              elide: Text.ElideMiddle
+              font.family: root.fontFamily
+              font.pixelSize: root.fontSmall
+            }
 
             Text {
               width: parent.width
-              text: root.fileMachine ? root.fileMachine + ":" + root.filePath : root.filePath
+              text: Model.whereItIs(root.filePath, root.fileMachine)
               color: root.fadeColor
               elide: Text.ElideMiddle
               font.family: root.fontFamily
               font.pixelSize: Math.max(8, root.fontCaption * 0.85)
             }
 
+            Item { width: 1; height: Math.round(Style.spacing.sm / 2) }
+
             Repeater {
               model: [
-                { label: "Open", action: "open" },
-                { label: "Copy location", action: "copy" }
+                { label: "Open", glyph: "\uf08e", action: "open" },
+                { label: "Copy location", glyph: "\uf0c5", action: "copy" }
               ]
 
               Rectangle {
                 required property var modelData
 
-                width: menuColumn.width
-                height: entry.implicitHeight + Style.space(6)
+                width: card.width
+                height: entry.implicitHeight + Style.spacing.sm * 2
                 radius: Style.space(4)
                 color: entryMouse.containsMouse ? root.hoverFill : "transparent"
 
-                Text {
-                  id: entry
-
-                  x: Style.space(4)
+                Row {
+                  x: Style.spacing.sm
                   anchors.verticalCenter: parent.verticalCenter
-                  text: modelData.label
-                  color: root.barForeground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontSmall
+                  spacing: Style.spacing.sm
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(14)
+                    text: modelData.glyph
+                    color: entryMouse.containsMouse ? root.barForeground : root.fadeColor
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fontCaption
+                  }
+
+                  Text {
+                    id: entry
+
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: modelData.label
+                    color: entryMouse.containsMouse ? root.barForeground : Color.popups.text
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fontSmall
+                  }
                 }
 
                 MouseArea {
@@ -969,15 +997,14 @@ Panel {
         }
       }
 
-      // With the field focused the dispatcher has to get entirely out of the way:
-      // "i" and "j" are text for the field and commands for the list.
       blocked: field.activeFocus
 
       // Esc on the settings page goes back to the list before closing: leaving the
       // whole drawer because you picked the wrong page costs reopening and finding
       // the widget again.
       onCloseRequested: {
-        if (root.settingsOpen) root.settingsOpen = false;
+        if (root.filePath !== "") root.closeFileMenu();
+        else if (root.settingsOpen) root.settingsOpen = false;
         else root.close();
       }
       onMoveRequested: function (dx, dy) {
