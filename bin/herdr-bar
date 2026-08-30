@@ -94,8 +94,16 @@ BUFFER_LINES = 90
 # worse than spending height.
 MAX_MESSAGE = 1200
 # How many messages each row carries. The list shows the last one; expanding
-# shows them all, which is why they all arrive in the same payload.
-MAX_MESSAGES = 4
+# shows every one of them, which is why they all arrive in the same payload.
+#
+# High enough to cover a whole screen of conversation, because that is all
+# there is: an agent on the alternate screen leaves no scrollback, so asking
+# for more lines returns the same content. There is nothing further back to
+# fetch as you scroll -- what fits on its screen is the history.
+#
+# It costs almost nothing: going from 4 to 20 grew the payload of nine agents
+# across two machines from 11 KB to 16 KB, because few buffers hold that many.
+MAX_MESSAGES = 20
 # How many context lines of the dialog come along. A ceiling because a large
 # diff cannot become the whole panel; the last ones because the request sits
 # against the question, and what is further up is history.

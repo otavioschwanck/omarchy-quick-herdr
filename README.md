@@ -157,18 +157,24 @@ the bar wants the counts and nothing else.
 ## Expanding a conversation
 
 Each row shows the last message, cut to a single line. **Right click** (or the
-chevron that appears under the cursor) opens the conversation: the last four
-messages, whole, with line wrapping. Whoever stopped on a question is born
-open — the question is why you opened the list.
+chevron that appears under the cursor) opens the conversation: every message on
+that agent's screen, whole, with line wrapping. Whoever stopped on a question is
+born open — the question is why you opened the list.
 
-The four messages arrive in the same payload as the list, always. Reading the
-terminal is one call, and pulling four messages out of it costs the same as
-pulling one — so expanding is instant, instead of a round trip that, on a
-remote machine, would be across the network.
+They arrive in the same payload as the list, always. Reading the terminal is one
+call, and pulling twenty messages out of it costs the same as pulling one — so
+expanding is instant, instead of a round trip that, on a remote machine, would
+be across the network.
 
-When the content exceeds the screen's height the panel stops growing and
-scrolls. Cutting would lose exactly the end of the conversation, which is the
-new part.
+There is nothing further back to load as you scroll, and no lazy loading would
+help: an agent on the alternate screen leaves no scrollback, so `pane read`
+returns the same content whether you ask for 90 lines or 5000. What fits on its
+screen is the history there is.
+
+An open conversation scrolls **inside its own row** rather than stretching it.
+A row tall enough to hold twenty messages stops being a row in a list, and the
+panel becomes one long column where you lose the other agents. It grows to half
+the panel and then scrolls in place, so the list around it stays a list.
 
 Messages are elided at rest and open whole under the cursor — the list stays
 scannable at a glance, and reading everything costs only pointing. They grow

@@ -1412,43 +1412,75 @@ Panel {
               // reply to, and replying needs the conversation, not the headline. Aligned
               // under the project name, not under the glyph, so the state column stays a
               // column.
-              Repeater {
-                model: Model.visibleMessages(row.modelData, row.expanded)
+              // Open, the conversation scrolls inside its own row rather than
+              // stretching it: a row tall enough to hold twenty messages stops
+              // being a row in a list, and the panel becomes one long column
+              // where you lose the other agents. It grows to the ceiling and
+              // then scrolls in place, so the list around it stays a list.
+              Flickable {
+                id: talk
 
-                Row {
-                  required property var modelData
+                // Half the panel, and never less than a few lines. Enough that
+                // an open conversation dominates without swallowing the list.
+                readonly property real ceiling: Math.max(Style.space(110), scroller.height * 0.5)
 
-                  width: content.width
-                  leftPadding: Style.space(20)
-                  spacing: Style.space(6)
+                width: content.width
+                height: row.expanded ? Math.min(talkColumn.implicitHeight, ceiling)
+                                     : talkColumn.implicitHeight
+                contentWidth: width
+                contentHeight: talkColumn.implicitHeight
+                // Clipping only matters once it can scroll; a closed row must
+                // not crop a message that already fits.
+                clip: row.expanded
+                boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                interactive: contentHeight > height
+                ScrollBar.vertical: ScrollBar {
+                  policy: talk.interactive ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+                }
 
-                  Text {
-                    // No verticalCenter: anchoring to the centre of a Row whose height depends on
-                    // this very text is circular, and Qt resolves it by holding the height at one
-                    // line -- which was exactly why wrapped text did not show.
-                    y: Style.space(1)
-                    width: Style.space(9)
-                    text: Model.voice(modelData.who)
-                    color: root.fadeColor
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fontCaption
-                  }
+                Column {
+                  id: talkColumn
 
-                  // Elided at rest, whole under the cursor: the list stays scannable at a glance,
-                  // and reading the full message costs only pointing at it. It grows downward,
-                  // so the row you are pointing at does not run from the pointer -- the ones
-                  // below move down.
-                  Text {
-                    width: parent.width - Style.space(38)
-                    text: modelData.text
-                    color: root.dimColor
-                    // Open or under the cursor, the message goes whole; closed and at rest, it
-                    // fits on one line. It grows downward, so the row you point at does not run
-                    // from the pointer.
-                    elide: row.expanded || row.highlighted ? Text.ElideNone : Text.ElideRight
-                    wrapMode: row.expanded || row.highlighted ? Text.WordWrap : Text.NoWrap
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fontCaption
+                  width: talk.width
+                  spacing: Style.space(2)
+
+                  Repeater {
+                    model: Model.visibleMessages(row.modelData, row.expanded)
+
+                    Row {
+                      required property var modelData
+
+                      width: talkColumn.width
+                      leftPadding: Style.space(20)
+                      spacing: Style.space(6)
+
+                      Text {
+                        // No verticalCenter: anchoring to the centre of a Row whose height
+                        // depends on this very text is circular, and Qt resolves it by holding
+                        // the height at one line -- which was exactly why wrapped text did not
+                        // show.
+                        y: Style.space(1)
+                        width: Style.space(9)
+                        text: Model.voice(modelData.who)
+                        color: root.fadeColor
+                        font.family: root.fontFamily
+                        font.pixelSize: root.fontCaption
+                      }
+
+                      Text {
+                        width: parent.width - Style.space(38)
+                        text: modelData.text
+                        color: root.dimColor
+                        // Open or under the cursor, the message goes whole; closed and at rest
+                        // it fits on one line, so the list stays scannable at a glance and
+                        // reading everything costs only pointing at it.
+                        elide: row.expanded || row.highlighted ? Text.ElideNone : Text.ElideRight
+                        wrapMode: row.expanded || row.highlighted ? Text.WordWrap : Text.NoWrap
+                        font.family: root.fontFamily
+                        font.pixelSize: root.fontCaption
+                      }
+                    }
                   }
                 }
               }
