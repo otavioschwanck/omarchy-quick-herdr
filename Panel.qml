@@ -32,6 +32,9 @@ Panel {
   property var machines: []
   property bool useLocal: true
   property string label: ""
+  // What the bar draws, as a template. Empty means the default, so clearing the
+  // field is a way back rather than a way to an empty widget.
+  property string barFormat: ""
   property int refreshSeconds: 4
   property int prSeconds: 180
   property int maxRows: 20
@@ -60,6 +63,7 @@ Panel {
     maxRows = Math.max(1, Number(setting("maxRows", 20)) || 20);
     hideWhenEmpty = setting("hideWhenEmpty", false) === true;
     fontScale = clampScale(Number(setting("fontScale", 1)) || 1);
+    barFormat = String(setting("barFormat", "") || "");
     refresh();
   }
 
@@ -559,6 +563,15 @@ Panel {
     setConfigJson("fontScale", String(next));
   }
 
+  // Persisted like the font size, and for the same reason: what the bar should
+  // say is a standing preference, not a thing you re-decide every session.
+  function setBarFormat(value) {
+    var wanted = String(value || "").trim();
+    if (wanted === barFormat) return;
+    barFormat = wanted;
+    setConfigJson("barFormat", JSON.stringify(wanted));
+  }
+
   function toggleLocal() {
     useLocal = !useLocal;
     setConfigJson("local", useLocal ? "true" : "false");
@@ -814,7 +827,7 @@ Panel {
     id: button
 
     bar: root.bar
-    text: Model.barText(root.counts, root.label, button.vertical)
+    text: Model.barText(root.counts, root.label, button.vertical, root.barFormat)
     // Blocked is the only state that asks for you now. The whole button turns
     // urgent because the bar is read at a glance, not number by number.
     active: (root.counts.blocked || 0) > 0
@@ -1378,6 +1391,100 @@ Panel {
               text = "";
               keyCatcher.forceActiveFocus();
               event.accepted = true;
+            }
+          }
+
+          PanelSectionHeader {
+            topPadding: Style.space(8)
+            text: "What the bar says"
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+          }
+
+          Column {
+            width: parent.width
+            leftPadding: Style.space(10)
+            rightPadding: Style.space(10)
+            spacing: Style.space(4)
+
+            TextField {
+              id: formatField
+
+              width: parent.width - Style.space(20)
+              // Seeded from the setting, not bound to it: bound, every keystroke
+              // would fight the value coming back from the config file.
+              text: root.barFormat
+              placeholderText: Model.barDefault() + "  (empty goes back to this)"
+              foreground: root.barForeground
+              accent: root.barForeground
+              font.family: root.fontFamily
+              font.pixelSize: root.fontSmall
+
+              onAccepted: {
+                root.setBarFormat(text);
+                keyCatcher.forceActiveFocus();
+              }
+
+              Keys.onEscapePressed: function (event) {
+                text = root.barFormat;
+                keyCatcher.forceActiveFocus();
+                event.accepted = true;
+              }
+            }
+
+            // What it will look like, from the counts that are on the bar right
+            // now. A template language you have to save and squint at the bar to
+            // check is a template language nobody will touch twice.
+            Text {
+              width: parent.width - Style.space(20)
+              text: "→ " + Model.barText(root.counts, root.label, false, formatField.text)
+              color: root.barForeground
+              elide: Text.ElideRight
+              font.family: root.fontFamily
+              font.pixelSize: root.fontSmall
+            }
+
+            Text {
+              width: parent.width - Style.space(20)
+              text: "{working} {blocked} {idle} {done} {total} {label} · ↵ saves"
+              color: root.fadeColor
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+            }
+
+            // One click back to the bar this widget shipped with before the
+            // default changed, because that is the template most people who
+            // touch this are reaching for.
+            Rectangle {
+              width: everything.implicitWidth + Style.space(12)
+              height: everything.implicitHeight + Style.space(6)
+              radius: Style.space(4)
+              color: everythingMouse.containsMouse ? root.hoverFill : "transparent"
+              border.width: 1
+              border.color: root.fadeColor
+
+              Text {
+                id: everything
+
+                anchors.centerIn: parent
+                text: "use all three counts"
+                color: everythingMouse.containsMouse ? root.barForeground : root.fadeColor
+                font.family: root.fontFamily
+                font.pixelSize: root.fontCaption
+              }
+
+              MouseArea {
+                id: everythingMouse
+
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  formatField.text = Model.barEverything();
+                  root.setBarFormat(formatField.text);
+                }
+              }
             }
           }
 

@@ -115,20 +115,68 @@ rm -f /tmp/omarchy-quick-herdr.log
 If you had remote machines on, `ControlPersist` closes the tunnels on its own
 within a few minutes; to close one now, `ssh -O exit <machine>`.
 
-## The three numbers
+## What the bar says
 
-| glyph | Herdr state | |
+By default, the Claude mark and one number: **how many agents are stuck**.
+
+```
+✳ 2
+```
+
+Three numbers was the first design and it was too much for where it lives. A
+bar is read sideways, at a glance, while you are doing something else, and of
+the three states only "how many are waiting on me" changes what you do next.
+The rest is one click away.
+
+Blocked is also the only state that asks for you **now**, so the whole button
+turns urgent while one exists.
+
+### Changing it
+
+Right click → **What the bar says**. It is a template, not a menu:
+
+| token | |
+|---|---|
+| `{blocked}` | stopped on a question or an approval |
+| `{working}` | running right now |
+| `{idle}` | ready to receive (`idle` + `done`) |
+| `{done}` | finished with nobody watching |
+| `{total}` | every agent |
+| `{label}` | this widget's label |
+
+Anything else in the field is literal, so the glyphs are yours to choose.
+`↵` saves, an empty field goes back to the default, and a preview under the
+field shows the result against the counts you have right now.
+
+Two spaces become a line break on a vertical bar — that is how a group is told
+from a gap when there is no width to spend.
+
+To get the original three-number bar back there is a button for it, or type:
+
+```
+▶ {working}  ◼ {blocked}  ○ {idle}
+```
+
+Counts are drawn even at zero. Hiding a zero shrinks the widget and shoves
+everything to its right along the bar every time an agent starts or stops, and
+stable width is worth more than two characters.
+
+A label set on the widget still appears even if your template never mentions
+`{label}` — it is what tells two instances apart, and a format change should
+not silently merge them.
+
+### The states
+
+| glyph in the list | Herdr state | |
 |---|---|---|
 | `▶` | `working` | running right now |
 | `◼` | `blocked` | stopped on a question or an approval |
-| `○` | `idle` + `done` | ready to receive |
+| `○` | `idle` | ready to receive |
+| `✓` | `done` | finished with nobody watching |
 
-`done` is the same `idle` underneath — it is the idle of work that finished
-with nobody watching. It counts as idle on the bar, and shows in the list as
-`✓`, because "finished while you were away" is the row you want to open first.
-
-Blocked is the only state that asks for you **now**, so the whole button turns
-urgent when one exists. The bar is read at a glance, not number by number.
+`done` is the same `idle` underneath. It counts as idle on the bar and keeps
+its own mark in the list, because "finished while you were away" is the row you
+want to open first.
 
 ### What a row is called
 
@@ -469,6 +517,7 @@ In `~/.config/omarchy/shell.json`, on the widget's entry:
 | `session` | `default` | Herdr session |
 | `interval` | 4 (8 with remotes) | seconds between count refreshes |
 | `prInterval` | 180 | seconds between PR lookups, only with the list open |
+| `barFormat` | `✳ {blocked}` | what the bar draws; empty means the default |
 | `maxRows` | 20 | rows in the list |
 | `hideWhenEmpty` | false | disappear from the bar when there is no agent |
 | `fontScale` | 1 | the panel's text size, 0.8 to 2.6 (the `+` / `−` on the settings page) |

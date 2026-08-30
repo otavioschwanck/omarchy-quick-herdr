@@ -25,7 +25,8 @@
       "interval": 4,
       "prInterval": 180,
       "maxRows": 20,
-      "hideWhenEmpty": false
+      "hideWhenEmpty": false,
+      "barFormat": "✳ {blocked}"
     },
     "schema": [
       {
@@ -37,6 +38,11 @@
         "key": "local",
         "type": "boolean",
         "label": "Include this machine's agents"
+      },
+      {
+        "key": "barFormat",
+        "type": "string",
+        "label": "What the bar says — {working} {blocked} {idle} {done} {total} {label}, any text around them (empty = ✳ {blocked})"
       },
       {
         "key": "label",

@@ -41,23 +41,57 @@ function voice(who) {
   return VOICES[who] || VOICES.agent;
 }
 
-// The bar's three numbers, always all three. Hiding a zero would shrink the
-// widget and shove the rest of the bar every time an agent starts or stops --
-// stable width is worth more than two characters.
+// What the bar says, as a template you can rewrite.
 //
-// Glyph and number take one space between them, groups take two: crammed
-// together, "▶2◼1○3" is a smudge you have to stop and decode, and the bar is
-// made to be read at a glance.
-function barText(counts, label, vertical) {
-  var c = counts || {};
-  var parts = [
-    GLYPHS.working + " " + (c.working || 0),
-    GLYPHS.blocked + " " + (c.blocked || 0),
-    GLYPHS.idle + " " + (c.ocioso || 0)
-  ];
+// The default is the Claude mark and the one number that asks something of
+// you. Three numbers was the first design and it was too much for the place it
+// lives: a bar is read at a glance, sideways, while you are doing something
+// else, and "how many are stuck" is the only one of the three that changes what
+// you do next. The rest is a click away.
+//
+// Counts are always drawn even at zero. Hiding a zero shrinks the widget and
+// shoves everything to its right along the bar every time an agent starts or
+// stops, and stable width is worth more than two characters.
+var BAR_DEFAULT = "✳ {blocked}";
 
-  if (vertical) return (label ? label + "\n" : "") + parts.join("\n");
-  return (label ? label + "  " : "") + parts.join("  ");
+// The old three-number bar, kept as the documented example of what a template
+// can say -- it is the most likely thing anyone will want back.
+var BAR_EVERYTHING = "▶ {working}  ◼ {blocked}  ○ {idle}";
+
+// The two templates the panel offers by name. Functions rather than the bare
+// variables because a .js imported into QML exposes what it is called through,
+// and the panel should not have to know which of the two it is.
+function barDefault() {
+  return BAR_DEFAULT;
+}
+
+function barEverything() {
+  return BAR_EVERYTHING;
+}
+
+function barText(counts, label, vertical, format) {
+  var c = counts || {};
+  var pattern = String(format === undefined || format === null ? "" : format).trim() || BAR_DEFAULT;
+
+  var filled = pattern
+    .replace(/\{working\}/g, String(c.working || 0))
+    .replace(/\{blocked\}/g, String(c.blocked || 0))
+    .replace(/\{idle\}/g, String(c.ocioso || 0))
+    .replace(/\{done\}/g, String(c.done || 0))
+    .replace(/\{total\}/g, String(c.total || 0))
+    .replace(/\{label\}/g, String(label || ""));
+
+  // A label that the template never asked for still has to appear: it is what
+  // tells two instances of this widget apart, and losing it to a format change
+  // would leave two identical widgets on the bar.
+  if (label && pattern.indexOf("{label}") < 0) {
+    filled = label + (vertical ? "\n" : "  ") + filled;
+  }
+
+  // Sideways there is no width to spend, so the gaps that separate groups
+  // become the breaks that stack them.
+  if (vertical) return filled.replace(/[ \t]{2,}/g, "\n").trim();
+  return filled.trim();
 }
 
 function tooltip(counts) {
