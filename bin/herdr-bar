@@ -975,7 +975,7 @@ def normal(value):
 def session_for(dirs, want_title):
     # The working directory comes first and the pane's directory second. With
     # git worktrees they differ, and it is the working one that is right: nine
-    # agents opened from ~/Projetos/api live in nine worktrees, each with its own
+    # agents opened from ~/projects/api live in nine worktrees, each with its own
     # session directory. Asking by the pane's directory found the one shared
     # folder and answered the same conversation for all nine.
     files = []

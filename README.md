@@ -150,7 +150,7 @@ Which session belongs to which pane is the one hard part, and the join is the
 title: Claude Code names the session and sets the terminal title from that name,
 so Herdr's pane title and the transcript's `ai-title` are the same string. With
 git worktrees the lookup uses the directory the agent actually works in, not the
-one the pane opened in — nine agents opened from `~/Projetos/api` live in nine
+one the pane opened in — nine agents opened from `~/projects/api` live in nine
 worktrees, and asking by the pane's directory answered the same conversation for
 all nine.
 
@@ -204,7 +204,7 @@ image goes as an image, so it pastes into Slack as the picture instead of as a
 string nobody can see. Anything else goes as its text. **Copy location** is the
 one you want for pasting into a terminal.
 
-A path written with an ellipsis is not a link. `.../otavio-pc/Gemfile` in prose
+A path written with an ellipsis is not a link. `.../workstation/Gemfile` in prose
 is a name with its middle cut out, and the regex read the last two dots of the
 "..." as a relative `..` — offering to open a file that never existed.
 
@@ -216,7 +216,7 @@ launches an editor with no terminal to draw in — clicking a `.rb` did nothing 
 all while clicking a `.png` worked. The handler's desktop entry is what decides.
 
 A path on another machine is copied with its machine in front
-(`otavio-pc:/home/...`), which is what actually opens it when pasted. Opening
+(`workstation:/home/...`), which is what actually opens it when pasted. Opening
 one fetches it here first, over the SSH connection the refresh already keeps
 open, into `~/.cache/omarchy-quick-herdr/files/<machine>/`. That copy is a copy:
 editing it does not edit the file on the other machine.

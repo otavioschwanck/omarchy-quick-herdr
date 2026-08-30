@@ -285,7 +285,7 @@ function contextHtml(lines) {
 // thumbnail, because "which screenshot was that" is not answerable from a
 // filename.
 
-// URLs are taken out of the way first: "https://github.com/AmFinance/api" is
+// URLs are taken out of the way first: "https://github.com/acme/api" is
 // full of slashes and is not a file.
 var RE_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi;
 
@@ -327,7 +327,7 @@ function trimPath(path) {
 }
 
 // Whether the match really starts here, or is the tail of something longer.
-// An elided path -- ".../otavio-pc/Gemfile", written that way in prose -- ends
+// An elided path -- ".../workstation/Gemfile", written that way in prose -- ends
 // with the regex reading the last two dots of "..." as a relative "..", and
 // offering a link to a file that never existed. The character in front settles
 // it: nothing may run into a path from the left.

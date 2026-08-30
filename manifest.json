@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "otavio.quick-herdr",
   "name": "Quick Herdr",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "author": "otavio",
   "description": "Herdr agents from every machine in the Omarchy bar: what they are doing, what they last said, and the prompts they are waiting on.",
   "kinds": [
