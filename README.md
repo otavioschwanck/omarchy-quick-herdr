@@ -23,6 +23,22 @@ queue the next task and stay where you were.
 The **#2313** appears on a row when `gh` finds a PR for the branch of the
 agent's directory, and takes you to it in the browser.
 
+**Right click on the widget opens its settings** — which machines it watches,
+and the panel's text size.
+
+| gesture | |
+|---|---|
+| click the widget | open the list |
+| **right click** the widget | settings: machines, text size |
+| click a row | go to that agent's tab |
+| **right click** a row | open its conversation |
+| click an option | answer the dialog |
+| click `#2313` | open the PR in the browser |
+| click `★` | make that agent the field's target |
+
+Right click means two things because there are two objects: on the bar it acts
+on the widget, on a row it acts on that agent.
+
 ## Install
 
 The plugin directory **is** the repository: that is how Omarchy expects git
