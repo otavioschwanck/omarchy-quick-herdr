@@ -227,6 +227,17 @@ That distinction is not decoration: on this desktop `text/plain` is handled by
 launches an editor with no terminal to draw in — clicking a `.rb` did nothing at
 all while clicking a `.png` worked. The handler's desktop entry is what decides.
 
+**Folders open too.** Here, in the file manager; on another machine, as a
+terminal standing in that directory over SSH — there is nothing sensible to
+copy across for a directory, and being in it is what you wanted. Copying a
+folder is refused rather than half-done, and points you at Copy location.
+
+**A thumbnail can be dragged** into any other window, the way a file is dragged
+out of a file manager: it carries `text/uri-list`, which is what everything else
+reads a dropped file as. Only for pictures that are actually on this machine —
+the other end receives a path, and a path to a file on another machine resolves
+to nothing there.
+
 A path on another machine is copied with its machine in front
 (`workstation:/home/...`), which is what actually opens it when pasted. Opening
 one fetches it here first, over the SSH connection the refresh already keeps

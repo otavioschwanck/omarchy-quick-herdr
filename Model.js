@@ -386,6 +386,13 @@ function copiedNote(bytes, mime) {
   return (String(mime || "").indexOf("image/") === 0 ? "image copied · " : "file copied · ") + human;
 }
 
+// A file:// URL, which is what every other application understands a dragged
+// file to be. encodeURI and not encodeURIComponent: the slashes are structure
+// and have to survive, only the spaces and accents need escaping.
+function fileUrl(path) {
+  return "file://" + encodeURI(withoutLine(path));
+}
+
 function hasPath(text) {
   return pathsIn(text).length > 0;
 }

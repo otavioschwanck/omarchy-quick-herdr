@@ -1953,6 +1953,8 @@ Panel {
                               model: row.expanded ? Model.imagesIn(message.modelData.text) : []
 
                               Rectangle {
+                                id: chip
+
                                 required property var modelData
 
                                 // Only what actually loaded: a picture on another machine is
@@ -1966,12 +1968,27 @@ Panel {
                                 border.width: 1
                                 border.color: thumbMouse.containsMouse ? root.barForeground : root.fadeColor
 
+                                // Draggable into any other window, the way a file is dragged
+                                // out of a file manager. It is the same picture and the same
+                                // gesture, and having to open the menu, copy the location and
+                                // paste it somewhere is three steps standing in for one.
+                                //
+                                // text/uri-list is what everything else reads a dragged file
+                                // as; the thumbnail itself is what flies under the pointer.
+                                Drag.active: dragging
+                                Drag.dragType: Drag.Automatic
+                                Drag.supportedActions: Qt.CopyAction
+                                Drag.mimeData: ({ "text/uri-list": Model.fileUrl(chip.modelData) })
+                                Drag.imageSource: shot.source
+
+                                property bool dragging: false
+
                                 Image {
                                   id: shot
 
                                   x: 1
                                   y: 1
-                                  source: "file://" + Model.withoutLine(modelData)
+                                  source: "file://" + Model.withoutLine(chip.modelData)
                                   sourceSize.height: Math.round(Style.space(38) * root.fontScale)
                                   fillMode: Image.PreserveAspectFit
                                   asynchronous: true
@@ -1984,9 +2001,36 @@ Panel {
                                   anchors.fill: parent
                                   hoverEnabled: true
                                   cursorShape: Qt.PointingHandCursor
+
+                                  // Pressing is not yet dragging. Without a threshold the
+                                  // click that opens the menu would start a drag on the
+                                  // pixel of movement any hand makes while clicking.
+                                  property point origin: Qt.point(0, 0)
+                                  readonly property real threshold: Style.space(6)
+
+                                  onPressed: function (evento) {
+                                    origin = Qt.point(evento.x, evento.y);
+                                  }
+                                  onPositionChanged: function (evento) {
+                                    if (!pressed || chip.dragging) return;
+
+                                    var dx = evento.x - origin.x;
+                                    var dy = evento.y - origin.y;
+                                    if (Math.sqrt(dx * dx + dy * dy) < threshold) return;
+
+                                    // Only a picture that is really here can be dragged: the
+                                    // other end receives a path, and a path to a file on
+                                    // another machine resolves to nothing there.
+                                    if (row.modelData.machine) return;
+                                    chip.dragging = true;
+                                  }
+                                  onReleased: chip.dragging = false
+                                  onCanceled: chip.dragging = false
+
                                   onClicked: function (evento) {
+                                    if (chip.dragging) return;
                                     var at = mapToItem(keyCatcher, evento.x, evento.y);
-                                    root.openFileMenu(modelData, row.modelData.machine, at.x, at.y);
+                                    root.openFileMenu(chip.modelData, row.modelData.machine, at.x, at.y);
                                   }
                                 }
                               }

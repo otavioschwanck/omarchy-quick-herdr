@@ -2062,6 +2062,23 @@ def cmd_open(args):
     if not path:
         fail("no file")
 
+    path = tidy_path(path)
+
+    # A directory is not something to fetch. Locally it opens in the file
+    # manager; on another machine there is nothing sensible to copy here, and
+    # what you actually want is to be standing in it -- so it opens a terminal
+    # there. Trying to scp one is what produced "not a regular file".
+    if is_a_folder(path, target):
+        argv = folder_opener(path, target)
+        try:
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError as falha:
+            fail("could not open the folder: %s" % falha)
+
+        log_event("open-folder", path=path, remote=target)
+        reply(opened=path, folder=True)
+
     local, erro = here_copy_of(path, target)
     if erro:
         fail(erro)
@@ -2088,6 +2105,10 @@ def cmd_copy_file(args):
     target = option(args, "--remote") or ""
     if not path:
         fail("no file")
+
+    path = tidy_path(path)
+    if is_a_folder(path, target):
+        fail("that is a folder — copy its location instead")
 
     local, erro = here_copy_of(path, target)
     if erro:
@@ -2130,15 +2151,33 @@ def cmd_copy_file(args):
     reply(copied=local, mime=mime, bytes=len(blob))
 
 
+def tidy_path(path):
+    """The path without the line number the link carried, and with ~ resolved."""
+    path = re.sub(r":\d+(?::\d+)?$", "", str(path or ""))
+    # A trailing slash names the same directory and breaks `scp`, which reads it
+    # as "the contents of".
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return os.path.expanduser(path) if path.startswith("~") else path
+
+
+def is_a_folder(path, target):
+    """Whether the path is a directory, asking the machine that has it."""
+    if not target:
+        return os.path.isdir(path)
+
+    use_remote(target)
+    code, _, _ = run(ssh_prefix() + ["test", "-d", shlex.quote(path)], TIMEOUT_SSH)
+    return code == 0
+
+
 def here_copy_of(path, target):
     """The file on this machine, fetching it first when it lives on another.
 
     Returns (local path, error). Shared by opening and copying, which want the
     same thing and used to disagree about how to get it.
     """
-    path = re.sub(r":\d+(?::\d+)?$", "", path)
-    if path.startswith("~"):
-        path = os.path.expanduser(path)
+    path = tidy_path(path)
 
     if not target:
         return (path, "" if os.path.exists(path) else "no such file: %s" % path)
@@ -2201,6 +2240,32 @@ def wants_a_terminal(path):
             pass
         return False
     return False
+
+
+def folder_opener(path, target):
+    """How to open a directory: here, the file manager; there, a shell in it."""
+    if not target:
+        return ["xdg-open", path]
+
+    # A login shell, so the prompt and the tools are the ones that machine's
+    # own setup provides rather than the bare non-interactive minimum.
+    remote_command = "cd %s && exec $SHELL -l" % shlex.quote(path)
+
+    # Over the control socket the refresh already keeps open. The terminal is
+    # launched through uwsm-app, which does not carry SSH_AUTH_SOCK, so an ssh
+    # of its own has no agent to authenticate with and dies with 255 the moment
+    # the window appears. Riding the established master needs no key at all.
+    connection = [
+        "ssh", "-t",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=%s/ssh-%%r@%%h-%%p" % CACHE_DIR,
+        "-o", "ControlPersist=300",
+        target, remote_command,
+    ]
+
+    terminal = "/usr/share/omarchy/bin/omarchy-launch-terminal"
+    launcher = [terminal, "--"] if os.path.exists(terminal) else ["xdg-terminal-exec"]
+    return launcher + connection
 
 
 def opener_for(path):
