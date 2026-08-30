@@ -1537,6 +1537,10 @@ Panel {
             readonly property bool isDefault: modelData.pane_id === root.defaultPane
                                               && modelData.machine === root.defaultMachine
             readonly property string pr: Model.prLabel(modelData)
+            // Whether this row has a title of its own. Herdr leaves it empty when
+            // it would only repeat the project, and then the project has to look
+            // like the name rather than like a qualifier of one.
+            readonly property bool titled: String(modelData.title || "") !== ""
             readonly property bool expanded: root.isExpanded(modelData)
 
             width: column.width
@@ -1595,10 +1599,13 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                   width: Math.min(implicitWidth, Style.space(150))
                   text: row.modelData.project
-                  color: root.barForeground
+                  // A qualifier when there is a title, the name itself when
+                  // there is not: with no title the project is all the row has
+                  // to be called, and it has to carry the row on its own.
+                  color: row.titled ? root.dimColor : root.barForeground
                   elide: Text.ElideRight
                   font.family: root.fontFamily
-                  font.pixelSize: root.fontBody
+                  font.pixelSize: row.titled ? root.fontSmall : root.fontBody
                 }
 
                 // Which machine the row came from. Beside the project because
@@ -1615,11 +1622,15 @@ Panel {
                   font.pixelSize: root.fontCaption
                 }
 
-                // The terminal title is what tells two tabs of the same project apart; it
-                // yields width to the rest and disappears when it would repeat the project.
-                // The width discounts the star even when it is hidden: reserving the space
-                // costs some slack on the right and keeps the row from re-laying out every
-                // time the cursor passes over it.
+                // The title is what the row is about, and it is what you are looking
+                // for: the project is a directory basename and the machine is where it
+                // runs, but "Omarchy plugin integração HERDR" is the thing itself. So it
+                // is the headline here and the other two are the breadcrumb before it --
+                // which is the opposite of how this row was first built.
+                //
+                // The width discounts the star even when it is hidden: reserving the
+                // space costs some slack on the right and keeps the row from re-laying
+                // out every time the cursor passes over it.
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width
@@ -1630,10 +1641,11 @@ Panel {
                          - Style.space(26)
                          - Style.space(20)
                   text: row.modelData.title
-                  color: root.dimColor
+                  color: root.barForeground
                   elide: Text.ElideRight
                   font.family: root.fontFamily
-                  font.pixelSize: root.fontSmall
+                  font.pixelSize: root.fontBody
+                  font.bold: true
                 }
 
                 // Open and close the conversation. It appears under the cursor and stays while

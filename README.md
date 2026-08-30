@@ -130,6 +130,18 @@ with nobody watching. It counts as idle on the bar, and shows in the list as
 Blocked is the only state that asks for you **now**, so the whole button turns
 urgent when one exists. The bar is read at a glance, not number by number.
 
+### What a row is called
+
+The **title** is the headline: bright, bold, and the widest thing on the row.
+The project and the machine sit before it, dim and small.
+
+That is the opposite of how this row was first built, and the first way was
+wrong. The project is a directory basename and the machine is where it runs;
+"Omarchy plugin integração HERDR" is the thing itself, and it is what you are
+scanning the list for. When Herdr leaves the title empty — it does when the
+title would only repeat the project — the project takes the headline back,
+because then it is all the row has to be called.
+
 ## The messages
 
 One message per row, which is what a closed row shows.
