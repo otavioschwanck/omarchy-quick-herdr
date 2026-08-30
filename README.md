@@ -132,49 +132,77 @@ urgent when one exists. The bar is read at a glance, not number by number.
 
 ## The messages
 
-One message per agent, and three on the starred one — it is the one you will
-reply to, and replying needs the conversation, not the headline.
+One message per row, which is what a closed row shows.
 
-What can be read is what is on the terminal's screen: an agent on the
-alternate screen leaves no scrollback, so asking for more lines brings no more
-history. That matches the purpose — the list shows what you would see if you
-focused the tab, no more and no less.
+They do not come from the terminal. They used to, and it cost the two things
+this list needs most. A terminal screen carries no clock, so no message could
+say **when** it happened; and an agent runs on the alternate screen, which keeps
+no scrollback — asking `pane read` for 5000 lines returns the same thirty it
+returns for 90. There was nothing further back to read, ever.
 
-Only the first paragraph of each message comes through. After it comes the
-detail — lists, tables, code blocks — which in one popup line would be noise.
+Claude Code writes every session to `~/.claude/projects/<cwd>/<id>.jsonl`, one
+JSON object per line, each with its timestamp. That is the real history:
+complete, dated, and already on disk. The terminal is still read, but only for
+the blocked dialog — a question and its options are drawn on the screen and
+exist nowhere else.
 
-A working agent shows the action of the moment (`Write(Panel.qml)`), because
-that is what Claude Code is drawing there; a stopped agent shows the last
-thing it told you. That is the useful distinction: for one that is running you
-want to know what it is doing, and for one that stopped, what is missing.
+Which session belongs to which pane is the one hard part, and the join is the
+title: Claude Code names the session and sets the terminal title from that name,
+so Herdr's pane title and the transcript's `ai-title` are the same string. With
+git worktrees the lookup uses the directory the agent actually works in, not the
+one the pane opened in — nine agents opened from `~/Projetos/api` live in nine
+worktrees, and asking by the pane's directory answered the same conversation for
+all nine.
 
-Only the first agents in the list get a terminal read per refresh (24, or
-`maxRows` if that is smaller). Each read is one call; on the same machine that
-is microseconds, but over SSH they are round trips, and a session with thirty
-agents cannot stall the bar. And no read happens with the popup closed — there
-the bar wants the counts and nothing else.
+An agent that is not Claude Code, or whose session cannot be identified without
+guessing, falls back to the terminal text — worse, but never another agent's
+conversation shown as if it were this one.
 
 ## Expanding a conversation
 
 Each row shows the last message, cut to a single line. **Right click** (or the
-chevron that appears under the cursor) opens the conversation: every message on
-that agent's screen, whole, with line wrapping. Whoever stopped on a question is
-born open — the question is why you opened the list.
+chevron that appears under the cursor, or `o` on the keyboard) opens the
+conversation. Whoever stopped on a question is born open — the question is why
+you opened the list.
 
-They arrive in the same payload as the list, always. Reading the terminal is one
-call, and pulling twenty messages out of it costs the same as pulling one — so
-expanding is instant, instead of a round trip that, on a remote machine, would
-be across the network.
+An open conversation scrolls **inside its own row** rather than stretching it,
+with its own scrollbar on the right. A row tall enough to hold the whole thing
+stops being a row in a list, and the panel becomes one long column where you
+lose the other agents.
 
-There is nothing further back to load as you scroll, and no lazy loading would
-help: an agent on the alternate screen leaves no scrollback, so `pane read`
-returns the same content whether you ask for 90 lines or 5000. What fits on its
-screen is the history there is.
+**Fifteen messages, and then the terminal.** Past that a button offers to open
+the agent where it runs. Reading a whole conversation is what the terminal is
+for; this list exists to tell you which one to go to. The ceiling is also what
+keeps an open row cheap — fifty messages laid out as rich text on every refresh
+cost ten times the CPU of the whole panel.
 
-An open conversation scrolls **inside its own row** rather than stretching it.
-A row tall enough to hold twenty messages stops being a row in a list, and the
-panel becomes one long column where you lose the other agents. It grows to half
-the panel and then scrolls in place, so the list around it stays a list.
+### How long it waited
+
+Two messages two seconds apart and two messages two hours apart read
+identically once they are lines on a screen. The transcript knows the
+difference, so the panel draws it: the **distance** between two messages is how
+long the pause was, with a line down the gap and the wait written beside it.
+
+A couple of pixels when the reply came straight back, up to fifteen when it ran
+into hours. The scale is logarithmic — linear would spend its whole range inside
+the first hour and then draw every longer pause the same, which is exactly the
+distinction worth keeping. Under ten minutes there is no label: the spacing
+already says it.
+
+Every message also carries its clock, in the margin rather than in the sentence
+— a timestamp inside the text gets read as part of it.
+
+### Files it mentions
+
+Every path in an open conversation is a link. Clicking one offers **Open** and
+**Copy location**, and paths that name an image also get a small thumbnail,
+because a filename does not answer "which screenshot was that".
+
+A path on another machine is copied with its machine in front
+(`otavio-pc:/home/...`), which is what actually opens it when pasted; opening
+one fetches it here first. A slash alone does not make a link — "uma
+print/imagem" is ordinary prose, so a path has to have more than one segment or
+a real extension.
 
 Messages are elided at rest and open whole under the cursor — the list stays
 scannable at a glance, and reading everything costs only pointing. They grow
@@ -372,6 +400,8 @@ With the popup open:
 |---|---|
 | `↑` `↓` / `j` `k` | move |
 | `↵` | go to the agent |
+| `o` | open/close the conversation |
+| `d` `u` | scroll the open conversation |
 | `1`…`9` | answer an option, on a blocked row |
 | `i` | write in the field (`esc` goes back to the list) |
 | `*` | mark/unmark the field's default |

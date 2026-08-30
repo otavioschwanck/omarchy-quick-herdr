@@ -75,6 +75,10 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color urgentColor: bar ? bar.urgent : Color.urgent
   readonly property color dimColor: Qt.darker(barForeground, 1.5)
+  // Links have to read as links against the message they sit in, which is
+  // already dimmed: the accent is the one colour in the palette that is not a
+  // shade of the text around it.
+  readonly property color linkColor: Color.accent
   readonly property color fadeColor: Qt.darker(barForeground, 1.8)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -133,8 +137,125 @@ Panel {
     // re-evaluates bindings when the property itself changes.
     var next_ = {};
     for (var k in expandedRows) next_[k] = expandedRows[k];
-    next_[keyOf(row_)] = !isExpanded(row_);
+    var opening = !isExpanded(row_);
+    next_[keyOf(row_)] = opening;
     expandedRows = next_;
+
+    if (opening) loadHistory(row_);
+  }
+
+  // ---------------------------------------------------------------- files
+  //
+  // A path in a conversation is a thing you want to act on, not a string to
+  // read. Clicking one offers the two things anyone actually wants: put it on
+  // the clipboard, or open it.
+  property string filePath: ""
+  property string fileMachine: ""
+  property real fileX: 0
+  property real fileY: 0
+
+  function openFileMenu(path, machine, x, y) {
+    filePath = String(path || "");
+    fileMachine = String(machine || "");
+    fileX = x;
+    fileY = y;
+  }
+
+  function closeFileMenu() {
+    filePath = "";
+  }
+
+  // A remote path is copied with its machine in front. Pasted into a terminal
+  // that is what opens it; without the prefix it is a path to a file that is
+  // not there, which is worse than useless because it looks right.
+  function copyFile() {
+    var what = fileMachine ? fileMachine + ":" + filePath : filePath;
+    if (bar) bar.run("printf %s " + root.shq(what) + " | wl-copy");
+    note("location copied");
+    closeFileMenu();
+  }
+
+  function openFile() {
+    var args = ["open", "--path", filePath];
+    if (fileMachine) args.push("--remote", fileMachine);
+    openProc.command = argv(args);
+    openProc.running = true;
+    closeFileMenu();
+  }
+
+  // ------------------------------------------------------------- history
+  //
+  // The refresh carries one message per row, which is all a closed row shows.
+  // Opening one goes and reads its session transcript: fifty messages, dated,
+  // and then twenty-five more each time you reach the top of them. Carrying
+  // fifty for every agent on every refresh would put a few hundred kilobytes
+  // across the SSH link every couple of seconds to draw one line each.
+  property var history: ({})
+  property string historyKey: ""
+
+  function historyOf(row_) {
+    var got = row_ ? history[keyOf(row_)] : null;
+    return got ? got.messages : [];
+  }
+
+  function hasMore(row_) {
+    var got = row_ ? history[keyOf(row_)] : null;
+    // Never asked yet counts as "there may be more": the first read is what
+    // finds out.
+    return got ? got.more : true;
+  }
+
+  function loadHistory(row_) {
+    if (!row_ || historyProc.running) return;
+    if (history[keyOf(row_)]) return;
+
+    historyKey = keyOf(row_);
+
+    var args = ["history",
+                "--pane", String(row_.pane_id || ""),
+                // The directory the agent actually works in, then the one the
+                // pane opened in. With git worktrees they differ, and only the
+                // first one finds the right session.
+                "--cwd", String(row_.pr_cwd || row_.cwd || ""),
+                "--cwd2", String(row_.cwd || ""),
+                "--title", String(row_.title || row_.project || ""),
+                "--limit", "15"];
+    if (row_.machine) args.push("--remote", String(row_.machine));
+
+    historyProc.command = argv(args);
+    historyProc.running = true;
+  }
+
+  function applyHistory(payload) {
+    var data = parse(payload);
+    if (!data) return;
+
+    var next_ = {};
+    for (var k in history) next_[k] = history[k];
+
+    next_[historyKey] = { messages: data.messages || [], more: !!data.more };
+    history = next_;
+  }
+
+  // Opening a conversation exists on the right mouse button. On a panel you
+  // drive with the arrows, needing the mouse for the one thing the list is for
+  // is a gap, not a shortcut nobody asked for.
+  function toggleCursor() {
+    if (cursorRow) toggleExpanded(cursorRow);
+  }
+
+  // Scroll the open conversation by most of a screenful -- most, not all, so a
+  // line stays behind as the seam and you can tell you moved rather than jumped.
+  function scrollConversation(direction) {
+    var item = rowsRepeater.itemAt(cursor);
+    if (!item || !item.conversation) return false;
+
+    var talk_ = item.conversation;
+    if (talk_.contentHeight <= talk_.height) return false;
+
+    talk_.contentY = Math.max(0, Math.min(talk_.contentHeight - talk_.height,
+                                          talk_.contentY + direction * talk_.height * 0.8));
+    return true;
   }
 
   property string defaultPane: ""
@@ -451,6 +572,25 @@ Panel {
   }
 
   Process {
+    id: openProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var data = root.parse(text);
+        if (data && data.ok === false) root.note(String(data.error), true);
+      }
+    }
+  }
+
+  Process {
+    id: historyProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyHistory(text)
+    }
+  }
+
+  Process {
     id: prsProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -740,6 +880,95 @@ Panel {
 
       anchors.fill: parent
 
+      // ---------- what to do with a file ----------
+      // Declared first, shown on top: the z is what puts it over the list, and
+      // being first in the file keeps it out of the way of everything that
+      // reads in order below.
+      Item {
+        anchors.fill: parent
+        visible: root.filePath !== ""
+        z: 50
+
+        // Clicking anywhere else puts it away. A menu you have to aim at to
+        // dismiss is a menu that is in the way.
+        MouseArea {
+          anchors.fill: parent
+          onClicked: root.closeFileMenu()
+        }
+
+        Rectangle {
+          // Kept inside the panel: opened from a link near the right edge it
+          // would otherwise hang off the side where it cannot be clicked.
+          x: Math.max(Style.space(6),
+                      Math.min(root.fileX, keyCatcher.width - width - Style.space(6)))
+          y: Math.max(Style.space(6),
+                      Math.min(root.fileY + Style.space(8), keyCatcher.height - height - Style.space(6)))
+          width: Math.min(Style.space(340) * root.fontScale, keyCatcher.width - Style.space(12))
+          height: menuColumn.implicitHeight + Style.space(10)
+          radius: Style.cornerRadius
+          color: Qt.rgba(root.hoverFill.r, root.hoverFill.g, root.hoverFill.b, 1)
+          border.width: 1
+          border.color: root.fadeColor
+
+          Column {
+            id: menuColumn
+
+            x: Style.space(5)
+            y: Style.space(5)
+            width: parent.width - Style.space(10)
+            spacing: Style.space(2)
+
+            Text {
+              width: parent.width
+              text: root.fileMachine ? root.fileMachine + ":" + root.filePath : root.filePath
+              color: root.fadeColor
+              elide: Text.ElideMiddle
+              font.family: root.fontFamily
+              font.pixelSize: Math.max(8, root.fontCaption * 0.85)
+            }
+
+            Repeater {
+              model: [
+                { label: "Open", action: "open" },
+                { label: "Copy location", action: "copy" }
+              ]
+
+              Rectangle {
+                required property var modelData
+
+                width: menuColumn.width
+                height: entry.implicitHeight + Style.space(6)
+                radius: Style.space(4)
+                color: entryMouse.containsMouse ? root.hoverFill : "transparent"
+
+                Text {
+                  id: entry
+
+                  x: Style.space(4)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.label
+                  color: root.barForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fontSmall
+                }
+
+                MouseArea {
+                  id: entryMouse
+
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (modelData.action === "open") root.openFile();
+                    else root.copyFile();
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
       // With the field focused the dispatcher has to get entirely out of the way:
       // "i" and "j" are text for the field and commands for the list.
       blocked: field.activeFocus
@@ -766,6 +995,9 @@ Panel {
         if (!row_) return;
 
         if (t === "*") { root.setDefault(row_); return; }
+        if (t === "o") { root.toggleCursor(); return; }
+        if (t === "d") { root.scrollConversation(1); return; }
+        if (t === "u") { root.scrollConversation(-1); return; }
 
         // 1..9 answers the dialog of the row under the cursor. It is the position in
         // the list that counts, not the agent's key: unnumbered dialogs have no key at
@@ -1237,6 +1469,16 @@ Panel {
             required property var modelData
             required property int index
 
+            // The keyboard scrolls this from the outside: a Repeater delegate is
+            // not addressable otherwise, and a conversation you can open with the
+            // keyboard but only read with the mouse is half a gesture.
+            property alias conversation: talk
+
+            // Named once here rather than recomputed in the Repeater: each
+            // message needs the one before it to know how long the pause was.
+            readonly property var talkMessages: Model.visibleMessages(row.modelData, row.expanded,
+                                                              root.historyOf(row.modelData))
+
             readonly property bool highlighted: mouse.containsMouse || root.cursor === index
             readonly property bool isDefault: modelData.pane_id === root.defaultPane
                                               && modelData.machine === root.defaultMachine
@@ -1435,50 +1677,256 @@ Panel {
                 boundsBehavior: Flickable.StopAtBounds
                 flickableDirection: Flickable.VerticalFlick
                 interactive: contentHeight > height
+
+                // The wheel is handled here rather than left to the Flickable.
+                // Nested inside the panel's own Flickable, the default delivery
+                // is a coin toss: the outer one can take the event and scroll
+                // the whole list while the pointer sits inside an open
+                // conversation that has more to show. Accepting it here settles
+                // who moves -- the thing under the pointer.
+                WheelHandler {
+                  enabled: talk.interactive
+                  onWheel: function (event) {
+                    var step = event.angleDelta.y !== 0 ? event.angleDelta.y : event.angleDelta.x;
+                    talk.contentY = Math.max(0, Math.min(talk.contentHeight - talk.height,
+                                                         talk.contentY - step));
+                  }
+                }
+
+                // Always on while it can scroll, never a hover-only hint: the
+                // bar is the only thing that says there is more conversation
+                // below, and a scrollbar you have to discover by accident is
+                // not saying it.
                 ScrollBar.vertical: ScrollBar {
-                  policy: talk.interactive ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+                  policy: talk.interactive ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
                 }
 
                 Column {
                   id: talkColumn
 
                   width: talk.width
-                  spacing: Style.space(2)
+                  spacing: 0
 
-                  Repeater {
-                    model: Model.visibleMessages(row.modelData, row.expanded)
+                  // The conversation stops at fifteen. Reading further is what
+                  // the terminal is for -- this list exists to tell you which
+                  // agent to go to, and going there is one click away rather
+                  // than a scroll that never ends.
+                  Item {
+                    visible: row.expanded && root.hasMore(row.modelData)
+                    width: talkColumn.width
+                    height: visible ? older.implicitHeight + Style.space(8) : 0
 
-                    Row {
-                      required property var modelData
-
-                      width: talkColumn.width
-                      leftPadding: Style.space(20)
-                      spacing: Style.space(6)
+                    Rectangle {
+                      x: Style.space(46)
+                      width: older.implicitWidth + Style.space(12)
+                      height: older.implicitHeight + Style.space(5)
+                      radius: Style.space(4)
+                      color: olderMouse.containsMouse ? root.hoverFill : "transparent"
+                      border.width: 1
+                      border.color: root.fadeColor
 
                       Text {
-                        // No verticalCenter: anchoring to the centre of a Row whose height
-                        // depends on this very text is circular, and Qt resolves it by holding
-                        // the height at one line -- which was exactly why wrapped text did not
-                        // show.
-                        y: Style.space(1)
-                        width: Style.space(9)
-                        text: Model.voice(modelData.who)
-                        color: root.fadeColor
+                        id: older
+
+                        anchors.centerIn: parent
+                        text: "older messages — open in terminal"
+                        color: olderMouse.containsMouse ? root.barForeground : root.fadeColor
                         font.family: root.fontFamily
-                        font.pixelSize: root.fontCaption
+                        font.pixelSize: Math.max(8, root.fontCaption * 0.85)
+                      }
+
+                      MouseArea {
+                        id: olderMouse
+
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.goTo(row.modelData)
+                      }
+                    }
+                  }
+
+                  Repeater {
+                    model: row.talkMessages
+
+                    Item {
+                      id: message
+
+                      required property var modelData
+                      required property int index
+
+                      readonly property var previous: message.index > 0 ? row.talkMessages[message.index - 1] : null
+                      // The pause before this message, as distance. Closed rows
+                      // show one message and have no pause to draw.
+                      readonly property real gap: row.expanded && message.index > 0
+                                                  ? Model.timeGap(message.previous, message.modelData) * root.fontScale
+                                                  : 0
+                      readonly property string waited: row.expanded && message.index > 0
+                                                       ? Model.gapLabel(message.previous, message.modelData) : ""
+
+                      width: talkColumn.width
+                      implicitHeight: gap + body.implicitHeight + Style.space(2)
+
+                      // The line down the pause. It starts where the message above
+                      // ended and stops where this one begins, so the wait is
+                      // something you see in the margin rather than something you
+                      // work out from two clocks.
+                      Rectangle {
+                        x: Style.space(46)
+                        width: Math.max(1, Style.space(1) * 0.5)
+                        height: message.gap
+                        visible: message.gap > 0
+                        color: root.fadeColor
+                        opacity: 0.45
                       }
 
                       Text {
-                        width: parent.width - Style.space(38)
-                        text: modelData.text
-                        color: root.dimColor
-                        // Open or under the cursor, the message goes whole; closed and at rest
-                        // it fits on one line, so the list stays scannable at a glance and
-                        // reading everything costs only pointing at it.
-                        elide: row.expanded || row.highlighted ? Text.ElideNone : Text.ElideRight
-                        wrapMode: row.expanded || row.highlighted ? Text.WordWrap : Text.NoWrap
+                        // Only on pauses long enough to be worth a word. On every
+                        // gap it would be a column of noise down the margin.
+                        visible: message.waited !== ""
+                        x: Style.space(52)
+                        y: Math.max(0, message.gap / 2 - implicitHeight / 2)
+                        text: message.waited
+                        color: root.fadeColor
+                        opacity: 0.8
                         font.family: root.fontFamily
-                        font.pixelSize: root.fontCaption
+                        font.pixelSize: Math.max(8, root.fontCaption * 0.8)
+                      }
+
+                      Row {
+                        id: body
+
+                        y: message.gap
+                        width: talkColumn.width
+                        leftPadding: Style.space(20)
+                        spacing: Style.space(6)
+
+                        Text {
+                          // The clock, in the margin rather than in the sentence: a
+                          // time stamp inside the text is read as part of it.
+                          y: Style.space(1)
+                          width: Style.space(26)
+                          horizontalAlignment: Text.AlignRight
+                          text: Model.clockOf(message.modelData.ts)
+                          color: root.fadeColor
+                          opacity: 0.7
+                          font.family: root.fontFamily
+                          font.pixelSize: Math.max(8, root.fontCaption * 0.8)
+                        }
+
+                        Text {
+                          // No verticalCenter: anchoring to the centre of a Row whose height
+                          // depends on this very text is circular, and Qt resolves it by holding
+                          // the height at one line -- which was exactly why wrapped text did not
+                          // show.
+                          y: Style.space(1)
+                          width: Style.space(9)
+                          text: Model.voice(message.modelData.who)
+                          color: root.fadeColor
+                          font.family: root.fontFamily
+                          font.pixelSize: root.fontCaption
+                        }
+
+                        Column {
+                          width: talkColumn.width - Style.space(75)
+                          spacing: Style.space(4)
+
+                          Text {
+                            id: said
+
+                            width: parent.width
+                            // Rich text only where it is read. A closed row shows one elided
+                            // line, and eliding is a plain-text measurement -- asking for both
+                            // gives a line that neither wraps nor cuts where it should.
+                            // Rich text only when the message actually mentions a file.
+                            // Laying out rich text is many times the cost of plain, and most
+                            // messages have nothing in them to link -- paying that on every
+                            // line of every open conversation is what made the panel crawl.
+                            readonly property bool linked: row.expanded && Model.hasPath(message.modelData.text)
+                            textFormat: linked ? Text.RichText : Text.PlainText
+                            text: linked ? Model.messageHtml(message.modelData.text, root.linkColor)
+                                         : message.modelData.text
+                            color: root.dimColor
+                            // Open or under the cursor, the message goes whole; closed and at rest
+                            // it fits on one line, so the list stays scannable at a glance and
+                            // reading everything costs only pointing at it.
+                            elide: row.expanded || row.highlighted ? Text.ElideNone : Text.ElideRight
+                            wrapMode: row.expanded || row.highlighted ? Text.WordWrap : Text.NoWrap
+                            font.family: root.fontFamily
+                            font.pixelSize: root.fontCaption
+
+                            // Passive on purpose: it reads where the pointer is without
+                            // taking the click, which still has to reach the link under it.
+                            HoverHandler { id: pointer }
+
+                            onLinkActivated: function (link) {
+                              var at = said.mapToItem(keyCatcher, pointer.point.position.x,
+                                                      pointer.point.position.y);
+                              root.openFileMenu(link, row.modelData.machine, at.x, at.y);
+                            }
+                            onLinkHovered: function (link) {
+                              said.cursorShape = link ? Qt.PointingHandCursor : Qt.ArrowCursor;
+                            }
+
+                            property int cursorShape: Qt.ArrowCursor
+                            MouseArea {
+                              anchors.fill: parent
+                              acceptedButtons: Qt.NoButton
+                              cursorShape: said.cursorShape
+                            }
+                          }
+
+                          // Thumbnails for the pictures it mentioned. A filename does not
+                          // answer "which screenshot was that", and the answer is right
+                          // there on disk.
+                          Row {
+                            visible: row.expanded
+                            spacing: Style.space(4)
+
+                            Repeater {
+                              model: row.expanded ? Model.imagesIn(message.modelData.text) : []
+
+                              Rectangle {
+                                required property var modelData
+
+                                // Only what actually loaded: a picture on another machine is
+                                // not on this one, and a broken frame says nothing a missing
+                                // one does not say better.
+                                visible: shot.status === Image.Ready
+                                width: visible ? shot.width + 2 : 0
+                                height: visible ? shot.height + 2 : 0
+                                radius: Style.space(3)
+                                color: "transparent"
+                                border.width: 1
+                                border.color: thumbMouse.containsMouse ? root.barForeground : root.fadeColor
+
+                                Image {
+                                  id: shot
+
+                                  x: 1
+                                  y: 1
+                                  source: "file://" + Model.withoutLine(modelData)
+                                  sourceSize.height: Math.round(Style.space(38) * root.fontScale)
+                                  fillMode: Image.PreserveAspectFit
+                                  asynchronous: true
+                                  smooth: true
+                                }
+
+                                MouseArea {
+                                  id: thumbMouse
+
+                                  anchors.fill: parent
+                                  hoverEnabled: true
+                                  cursorShape: Qt.PointingHandCursor
+                                  onClicked: function (evento) {
+                                    var at = mapToItem(keyCatcher, evento.x, evento.y);
+                                    root.openFileMenu(modelData, row.modelData.machine, at.x, at.y);
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
                       }
                     }
                   }
@@ -1623,7 +2071,8 @@ Panel {
           width: parent.width
           text: root.settingsOpen
                 ? Model.settingsHint(root.hosts)
-                : Model.hint(root.rows, root.defaultRow, field.activeFocus, root.cursorRow)
+                : Model.hint(root.rows, root.defaultRow, field.activeFocus, root.cursorRow,
+                              root.cursorRow && root.isExpanded(root.cursorRow))
           color: root.fadeColor
           font.family: root.fontFamily
           font.pixelSize: root.fontCaption

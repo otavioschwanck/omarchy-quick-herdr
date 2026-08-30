@@ -167,12 +167,62 @@ function unlistedMachines(machines, hosts) {
   return (machines || []).filter(function (m) { return known.indexOf(m) < 0; });
 }
 
-// The messages a row shows: the last one when collapsed, all of them when
-// expanded. They all arrived in the same payload, so expanding costs no round
-// trip.
-function visibleMessages(row, expanded) {
+// The messages a row shows: the last one when collapsed, and when open the
+// deeper history that opening it went and fetched -- falling back to the one
+// the refresh carried, so an open row is never briefly empty.
+function visibleMessages(row, expanded, loaded) {
   var messages = (row && row.messages) || [];
-  return expanded ? messages : messages.slice(-1);
+  if (!expanded) return messages.slice(-1);
+  return (loaded && loaded.length) ? loaded : messages;
+}
+
+// ------------------------------------------------------------------- time
+//
+// A transcript loses the one thing the room had: two messages two seconds
+// apart and two messages two hours apart read identically once they are lines
+// on a screen. So the distance between them carries it -- a couple of pixels
+// when the reply came straight back, up to fifteen when the wait ran into
+// hours, with a line drawn down the gap.
+
+var GAP_MIN = 2;
+var GAP_MAX = 15;
+// Where the scale tops out. Logarithmic rather than linear: linear would spend
+// the whole range inside the first hour and then draw every longer pause the
+// same, which is exactly the distinction worth keeping.
+var GAP_SATURATES = 180;
+
+function minutesBetween(before, after) {
+  var a = Date.parse(before || "");
+  var b = Date.parse(after || "");
+  if (isNaN(a) || isNaN(b)) return -1;
+  return Math.max(0, (b - a) / 60000);
+}
+
+function timeGap(previous, current) {
+  var minutes = minutesBetween(previous && previous.ts, current && current.ts);
+  if (minutes < 0) return GAP_MIN;
+  var share = Math.log(1 + minutes) / Math.log(1 + GAP_SATURATES);
+  return GAP_MIN + (GAP_MAX - GAP_MIN) * Math.min(1, share);
+}
+
+// Only worth writing when the pause is worth noticing: a label on every gap
+// would be noise down the whole margin, and under ten minutes the spacing
+// already says it.
+function gapLabel(previous, current) {
+  var minutes = minutesBetween(previous && previous.ts, current && current.ts);
+  if (minutes < 10) return "";
+  if (minutes < 60) return Math.round(minutes) + "m";
+
+  var hours = minutes / 60;
+  if (hours < 24) return (hours < 10 ? String(Math.round(hours * 10) / 10) : String(Math.round(hours))) + "h";
+  return Math.round(hours / 24) + "d";
+}
+
+function clockOf(ts) {
+  var t = Date.parse(ts || "");
+  if (isNaN(t)) return "";
+  var d = new Date(t);
+  return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
 }
 
 // ------------------------------------------------------------------ colors
@@ -227,6 +277,114 @@ function contextHtml(lines) {
   return out.join("<br>");
 }
 
+// ------------------------------------------------------------------ files
+//
+// An agent's conversation is mostly about files, and a path you have to select
+// out of a terminal by hand is the one thing a panel can fix for nothing. Every
+// path it mentions becomes a link; the ones that are images also get a
+// thumbnail, because "which screenshot was that" is not answerable from a
+// filename.
+
+// URLs are taken out of the way first: "https://github.com/AmFinance/api" is
+// full of slashes and is not a file.
+var RE_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi;
+
+// Two shapes count as a path. Anything rooted -- / or ~/ or ./ -- and anything
+// with a directory in front of a real extension, which is how a path is written
+// when it is relative to the repository. Bare words are not paths: "src" and
+// "config" are ordinary English in a sentence about code.
+// A slash alone does not make a path. "uma print/imagem" and "entrada/saida"
+// are ordinary Portuguese, and linking them turns prose into a minefield of
+// dead links. So a path has to be more than one segment, or carry a real
+// extension.
+var SEGMENT = "[\\w.@+%-]+";
+var LINE = "(?::\\d+(?::\\d+)?)?";
+var RE_PATH = new RegExp(
+  // rooted, with a directory in it: /home/otavio/a.rb, ~/.config/nvim, ./bin/x
+  "(?:~|\\.{1,2})?\\/(?:" + SEGMENT + "\\/)+" + SEGMENT + LINE +
+  // rooted, one segment, but named like a file: /tmp.png
+  "|(?:~|\\.{1,2})?\\/" + SEGMENT + "\\.[A-Za-z0-9]{1,8}" + LINE +
+  // relative to the repository: app/models/user.rb
+  "|(?:" + SEGMENT + "\\/)+" + SEGMENT + "\\.[A-Za-z0-9]{1,8}" + LINE,
+  "g");
+
+var RE_IMAGE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+
+// A path may carry the line it was found on. That belongs in the link and in
+// what gets copied, but not in the question "is this a picture".
+function withoutLine(path) {
+  return String(path || "").replace(/:\d+(?::\d+)?$/, "");
+}
+
+function isImage(path) {
+  return RE_IMAGE.test(withoutLine(path));
+}
+
+// Trailing punctuation belongs to the sentence, not to the name: "see src/a.rb."
+// ends in a full stop and the file does not.
+function trimPath(path) {
+  return String(path || "").replace(/[.,;:)\]}'"]+$/, "");
+}
+
+function pathsIn(text) {
+  var clean = String(text || "").replace(RE_URL, function (url) {
+    return new Array(url.length + 1).join("\u0000");
+  });
+
+  var found = [];
+  var match;
+  RE_PATH.lastIndex = 0;
+  while ((match = RE_PATH.exec(clean)) !== null) {
+    var path = trimPath(match[0]);
+    // A lone "/" or "a/b" with nothing to it is not worth a link.
+    if (path.length < 3 || path.indexOf("/") < 0) continue;
+    if (found.indexOf(path) < 0) found.push(path);
+  }
+  return found;
+}
+
+// Rich text costs real time to lay out, and most messages have nothing in them
+// to link. This is the cheap question that keeps them on the plain path.
+function hasPath(text) {
+  return pathsIn(text).length > 0;
+}
+
+function imagesIn(text) {
+  return pathsIn(text).filter(isImage);
+}
+
+// The message as rich text, with its paths as links. Escaping and indentation
+// come first and the links last: a path holds none of the characters escaping
+// touches, so linking afterwards cannot land inside a tag it just made.
+function messageHtml(text, linkColor) {
+  var lines = String(text || "").split("\n");
+  var out = [];
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = keepSpaces(lines[i], true);
+    var masked = line.replace(RE_URL, function (url) {
+      return new Array(url.length + 1).join("\u0000");
+    });
+
+    var built = "";
+    var at = 0;
+    var match;
+    RE_PATH.lastIndex = 0;
+    while ((match = RE_PATH.exec(masked)) !== null) {
+      var raw = match[0];
+      var path = trimPath(raw);
+      if (path.length < 3 || path.indexOf("/") < 0) continue;
+
+      built += line.slice(at, match.index);
+      built += '<a href="' + path + '" style="color:' + linkColor + '">' + path + "</a>";
+      at = match.index + path.length;
+    }
+    out.push(built + line.slice(at));
+  }
+
+  return out.join("<br>");
+}
+
 function hasOptions(row) {
   return !!(row && row.options && row.options.length);
 }
@@ -273,13 +431,15 @@ function prLabel(row) {
 
 // The help text changes with what you can do right now: an empty list has
 // nothing to navigate, and a field with no target has nowhere to send.
-function hint(rows, target, writing, underCursor) {
+function hint(rows, target, writing, underCursor, openRow) {
   if (writing) {
     if (target && target.status === "blocked") return "↵ rejects the request and sends this · ⇧↵ new line · esc back";
     return "↵ send · ⇧↵ new line · esc back to the list";
   }
   if (!rows || !rows.length) return "no agents · r refresh";
   if (hasOptions(underCursor)) return "1…9 answer · ↵ go · i write something else";
+  if (openRow) return "o close · d/u scroll it · ↵ go";
+  if (underCursor) return "↑↓ move · o read · ↵ go · ★ default";
   if (target) return "↑↓ move · ↵ go · ★ default · i write";
   return "↑↓ move · ↵ go · ★ pick the default";
 }

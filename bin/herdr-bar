@@ -866,6 +866,208 @@ def question_from(above):
     return re.sub(r"\s+", " ", joined).strip()[:MAX_QUESTION]
 
 
+# ------------------------------------------------------- conversation history
+#
+# The messages do not come from the terminal. They used to, and it cost the two
+# things this list needs most: the screen carries no clock, so no message could
+# say when it happened, and an agent runs on the alternate screen, which keeps
+# no scrollback -- asking `pane read` for 5000 lines returns the same thirty it
+# returns for 90. There was nothing further back to fetch, ever.
+#
+# Claude Code writes every session to ~/.claude/projects/<encoded cwd>/<id>.jsonl,
+# one JSON object per line, each with its timestamp. That is the real history:
+# complete, dated, and already on disk. The terminal is still read for the
+# blocked dialog, which is a thing on the screen and nowhere else.
+#
+# Which file belongs to which pane is the one hard part. The join is the title:
+# Claude Code names the session and sets the terminal title from that name, so
+# Herdr's pane title and the transcript's last `ai-title` are the same string.
+# Fifteen messages, and past that the terminal. Reading a whole conversation is
+# what the terminal is for; this list exists to tell you which one to go to. The
+# ceiling is also what keeps an open row cheap -- fifty messages of rich text
+# laid out on every refresh was slower than anything the panel does.
+TRANSCRIPT_FIRST = 15
+
+# The reader runs identically here and over SSH, so it is a self-contained
+# script rather than a function: one process per machine per refresh answers
+# for every agent on it, instead of a round trip each.
+TRANSCRIPT_SCRIPT = r"""
+import json, os, re, sys, glob
+
+ROOT = os.path.expanduser("~/.claude/projects")
+START = 256 * 1024
+
+
+def tail(path, size):
+    with open(path, "rb") as fh:
+        fh.seek(0, 2)
+        total = fh.tell()
+        fh.seek(max(0, total - size))
+        raw = fh.read()
+    # A tail almost always starts mid-line; that fragment is not JSON.
+    if total > size:
+        cut = raw.find(b"\n")
+        raw = raw[cut + 1:] if cut >= 0 else b""
+    return raw.decode("utf-8", "replace"), total <= size
+
+
+def text_of(block):
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict) and block.get("type") == "text":
+        return block.get("text") or ""
+    return ""
+
+
+def parse(raw):
+    out = []
+    title = ""
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+
+        if d.get("type") == "ai-title":
+            title = d.get("aiTitle") or title
+            continue
+        if d.get("type") not in ("user", "assistant"):
+            continue
+        # A subagent's conversation is not this pane's conversation.
+        if d.get("isSidechain"):
+            continue
+
+        content = (d.get("message") or {}).get("content")
+        blocks = content if isinstance(content, list) else [content]
+        body = "\n".join(t for t in (text_of(b) for b in blocks) if t).strip()
+        if not body:
+            continue
+        # Machine-addressed envelopes: reminders, command wrappers, the hook
+        # output the model reads and nobody writes.
+        if body.startswith("<") and body.endswith(">"):
+            continue
+
+        out.append({"who": "you" if d.get("type") == "user" else "agent",
+                    "ts": d.get("timestamp") or "", "text": body})
+
+    # The same prompt is written twice when it was queued and then sent. They
+    # are not two messages and must not draw two gaps on the timeline.
+    clean = []
+    for m in out:
+        if any(o["who"] == m["who"] and o["text"] == m["text"] for o in clean[-4:]):
+            continue
+        clean.append(m)
+    return clean, title
+
+
+def normal(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def session_for(dirs, want_title):
+    # The working directory comes first and the pane's directory second. With
+    # git worktrees they differ, and it is the working one that is right: nine
+    # agents opened from ~/Projetos/api live in nine worktrees, each with its own
+    # session directory. Asking by the pane's directory found the one shared
+    # folder and answered the same conversation for all nine.
+    files = []
+    own = False
+    for index, cwd in enumerate(dirs):
+        if not cwd:
+            continue
+        folder = os.path.join(ROOT, re.sub(r"[^A-Za-z0-9]", "-", cwd))
+        files = sorted(glob.glob(os.path.join(folder, "*.jsonl")),
+                       key=os.path.getmtime, reverse=True)[:6]
+        if files:
+            # The first directory is where the agent actually works. With git
+            # worktrees that is its own checkout, which belongs to this one
+            # agent -- so whatever sessions are in it are its sessions.
+            own = index == 0 and len(dirs) > 1 and dirs[0] != dirs[1]
+            break
+    if not files:
+        return ""
+    if not want_title or own:
+        return files[0]
+
+    for path in files:
+        try:
+            raw, _ = tail(path, 64 * 1024)
+        except OSError:
+            continue
+        if normal(parse(raw)[1]) == normal(want_title):
+            return path
+
+    # Nothing matched the title. With a single session in the directory it is
+    # that one -- a worktree holds one agent, and Herdr shows the branch name
+    # where Claude Code would put its own. With several, guessing means showing
+    # one agent's conversation on another agent's row, which is worse than
+    # showing none: the terminal text is still there to fall back to.
+    return files[0] if len(files) == 1 else ""
+
+
+def history(dirs, want_title, limit, skip):
+    path = session_for(dirs, want_title)
+    if not path:
+        return {"messages": [], "more": False, "found": False}
+
+    need = limit + skip
+    size = START
+    while True:
+        try:
+            raw, whole = tail(path, size)
+        except OSError:
+            return {"messages": [], "more": False, "found": False}
+        messages = parse(raw)[0]
+        if len(messages) >= need + 1 or whole or size > 32 * 1024 * 1024:
+            break
+        size *= 4
+
+    end = len(messages) - skip
+    start = max(0, end - limit)
+    return {"messages": messages[start:end] if end > 0 else [],
+            "more": start > 0 or not whole,
+            "found": True}
+
+
+answer = {}
+for item in json.loads(sys.stdin.read()):
+    answer[item["key"]] = history(item.get("dirs") or [], item.get("title") or "",
+                                  int(item.get("limit") or 50), int(item.get("skip") or 0))
+sys.stdout.write(json.dumps(answer))
+"""
+
+
+def transcripts(wanted):
+    """Answer several agents' history at once, here or on the machine in scope."""
+    if not wanted:
+        return {}
+
+    argv = ["python3", "-c", TRANSCRIPT_SCRIPT]
+    if remote():
+        argv = ssh_prefix() + ["python3", "-c", shlex.quote(TRANSCRIPT_SCRIPT)]
+
+    try:
+        done = subprocess.run(
+            argv, input=json.dumps(wanted), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=TIMEOUT_SSH if remote() else TIMEOUT_HERDR,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as erro:
+        log_event("transcript-fail", error=str(erro))
+        return {}
+
+    if done.returncode != 0:
+        log_event("transcript-fail", code=done.returncode, err=(done.stderr or "")[:200])
+        return {}
+    try:
+        return json.loads(done.stdout or "{}")
+    except ValueError:
+        return {}
+
+
 def read_terminal(pane, how_many, blocked_):
     """One read per agent: from it come the messages and, if stopped, the dialog."""
     # `pane read --format ansi` rather than `agent read`: same screen, but with
@@ -1712,18 +1914,40 @@ def one_snapshot(target, with_messages):
         return {"ok": False, "error": err}
 
     if with_messages:
-        # Three messages for the field's target and one for the rest: it is the one
-        # you will reply to, and replying needs the conversation, not the headline.
+        # The terminal is still read, but only for the dialog: a blocked agent's
+        # question and its options are drawn on the screen and exist nowhere else.
         for line in data["rows"][:MAX_READS]:
-            # Always the last four, not just the one that will show: reading the terminal
-            # is one call, and pulling four messages out of it costs the same as pulling
-            # one. So expanding a row is instant instead of a round trip -- over SSH, a
-            # round trip across the network.
-            messages, forma = read_terminal(line["pane_id"], MAX_MESSAGES, line["status"] == "blocked")
-            line["messages"] = messages
+            fallback, forma = read_terminal(line["pane_id"], MAX_MESSAGES, line["status"] == "blocked")
+            line["messages"] = fallback
             line["question"] = forma["question"]
             line["options"] = forma["options"]
             line["context"] = forma["context"]
+
+        # One message per row is all a closed row shows, and a refresh that
+        # carried fifty for every agent would put a few hundred kilobytes across
+        # the SSH link every couple of seconds to draw one line each. A blocked
+        # row opens by itself, so that one arrives ready to read.
+        wanted = []
+        for line in data["rows"][:MAX_READS]:
+            if line["kind"] != "claude":
+                continue
+            wanted.append({
+                "key": line["pane_id"],
+                "dirs": [line["pr_cwd"], line["cwd"]],
+                "title": line["title"] or line["project"],
+                "limit": TRANSCRIPT_FIRST if line["status"] == "blocked" else 1,
+                "skip": 0,
+            })
+
+        answers = transcripts(wanted)
+        for line in data["rows"][:MAX_READS]:
+            got = answers.get(line["pane_id"])
+            # Only when the transcript actually answered: an agent that is not
+            # Claude Code, or whose session file cannot be found, keeps the
+            # terminal text -- worse, but not nothing.
+            if got and got.get("found") and got.get("messages"):
+                line["messages"] = got["messages"]
+                line["more"] = bool(got.get("more"))
 
     data["ok"] = True
     return data
@@ -1820,6 +2044,87 @@ def resolve_global_default(lines):
     return (("", ""), "morto")
 
 
+def cmd_open(args):
+    """Open a file the conversation mentioned, wherever it lives.
+
+    A remote path names a file that is not on this machine, so opening it
+    directly would fail on a name that looks perfectly right. It is copied here
+    first and the copy is what opens -- read-only by nature: editing it would
+    edit a copy, and the panel does not pretend otherwise.
+    """
+    path = option(args, "--path") or ""
+    target = option(args, "--remote") or ""
+    if not path:
+        fail("no file")
+
+    # The line number belongs to the link, not to the filename.
+    path = re.sub(r":\d+(?::\d+)?$", "", path)
+    if path.startswith("~"):
+        path = os.path.expanduser(path)
+
+    local = path
+    if target:
+        use_remote(target)
+        folder = os.path.join(CACHE_DIR, "files", re.sub(r"[^A-Za-z0-9]", "-", target))
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as erro:
+            fail("cannot create the cache: %s" % erro)
+
+        local = os.path.join(folder, os.path.basename(path) or "file")
+        done = run(["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                    "%s:%s" % (target, path), local], TIMEOUT_SSH)
+        if done.returncode != 0:
+            fail(error_from(done.returncode, done.stdout, done.stderr) or
+                 "could not fetch %s from %s" % (path, target))
+
+    if not os.path.exists(local):
+        fail("no such file: %s" % path)
+
+    try:
+        subprocess.Popen(["xdg-open", local],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as erro:
+        fail("could not open: %s" % erro)
+
+    log_event("open", path=local, remote=target)
+    reply(opened=local)
+
+
+def cmd_history(args):
+    """One agent's conversation, deeper than the refresh carries.
+
+    Two calls, one gesture each. Opening a row asks for the first fifty;
+    reaching the top of those asks for twenty-five older ones, with `--skip`
+    saying how many are already on screen. The refresh keeps carrying one
+    message per row, so neither of these is paid for by anybody who is only
+    looking at the list.
+    """
+    target = option(args, "--remote") or ""
+    pane = option(args, "--pane") or ""
+    cwd = option(args, "--cwd") or ""
+    title = option(args, "--title") or ""
+    skip = int(option(args, "--skip") or 0)
+    limit = int(option(args, "--limit") or TRANSCRIPT_FIRST)
+
+    if not cwd:
+        fail("no directory for this agent")
+
+    use_remote(target)
+    answer = transcripts([{"key": pane or "one", "dirs": [cwd, option(args, "--cwd2") or ""],
+                           "title": title, "limit": limit, "skip": skip}])
+    got = answer.get(pane or "one") or {}
+
+    if not got.get("found"):
+        # Not an error worth a red line: an agent that is not Claude Code has no
+        # transcript to read, and saying so once is better than retrying forever.
+        reply(messages=[], more=False, found=False,
+              error="no session transcript for this agent")
+
+    reply(messages=got.get("messages") or [], more=bool(got.get("more")), found=True)
+
+
 def cmd_pick(args):
     """Grava o target do campo, que now precisa dizer tambem de qual machine."""
     if not args or args[0] == "-":
@@ -1903,6 +2208,8 @@ COMMANDS = {
     "hosts": cmd_hosts,
     "config": cmd_config,
     "all": cmd_all,
+    "history": cmd_history,
+    "open": cmd_open,
     "pick": cmd_pick,
     "disconnect": cmd_disconnect,
 }
