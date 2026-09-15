@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "otavio.quick-herdr",
   "name": "Quick Herdr",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "author": "otavio",
-  "description": "Herdr agents from every machine in the Omarchy bar: what they are doing, what they last said, and the prompts they are waiting on.",
+  "description": "Herdr agents from every machine in the Omarchy bar: name, status and a star for favorites; click a row to jump to it.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Quick Herdr",
-    "description": "Herdr agents, local and over SSH; click to go to the tab, right click to open the conversation, and the field sends a prompt without focusing",
+    "description": "Herdr agents, local and over SSH; click a row to go to its tab, click the star to favorite it, right click the widget for settings",
     "category": "Info",
     "allowMultiple": true,
     "defaultSection": "right",
@@ -23,7 +23,6 @@
       "label": "",
       "session": "default",
       "interval": 4,
-      "prInterval": 180,
       "maxRows": 20,
       "hideWhenEmpty": false,
       "barFormat": "✳ {blocked}"
@@ -58,11 +57,6 @@
         "key": "interval",
         "type": "number",
         "label": "Seconds between count refreshes"
-      },
-      {
-        "key": "prInterval",
-        "type": "number",
-        "label": "Seconds between PR lookups (only with the list open)"
       },
       {
         "key": "maxRows",

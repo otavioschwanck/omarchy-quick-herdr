@@ -141,10 +141,6 @@ TIMEOUT_STDIN = 5
 # in the list, where you can mark what finished while you were away.
 STATUSES = ("working", "blocked", "idle", "done", "unknown")
 
-# List order: what asks for you now, then what is moving, then what finished
-# while you were away, then what is simply waiting.
-URGENCY = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4}
-
 SESSION = DEFAULT_SESSION
 
 # The current machine is per thread, not per module: machines are queried in
@@ -897,10 +893,24 @@ TRANSCRIPT_FIRST = 15
 # script rather than a function: one process per machine per refresh answers
 # for every agent on it, instead of a round trip each.
 TRANSCRIPT_SCRIPT = r"""
-import json, os, re, sys, glob
+import calendar, json, os, re, sys, glob
+from datetime import datetime
 
 ROOT = os.path.expanduser("~/.claude/projects")
 START = 256 * 1024
+
+
+def parse_iso(ts):
+    # "2026-09-13T23:19:11.567Z" -> unix time, or 0 for anything else.
+    # Not datetime.fromisoformat: it only learned to read a trailing "Z" in
+    # 3.11, and this runs on whatever python3 a remote machine happens to have.
+    try:
+        clean = str(ts or "").rstrip("Z")
+        fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in clean else "%Y-%m-%dT%H:%M:%S"
+        parsed = datetime.strptime(clean, fmt)
+        return calendar.timegm(parsed.timetuple()) + parsed.microsecond / 1e6
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def tail(path, size):
@@ -1016,7 +1026,7 @@ def session_for(dirs, want_title):
 def history(dirs, want_title, limit, skip):
     path = session_for(dirs, want_title)
     if not path:
-        return {"messages": [], "more": False, "found": False}
+        return {"messages": [], "more": False, "found": False, "last_ts": 0}
 
     need = limit + skip
     size = START
@@ -1024,17 +1034,24 @@ def history(dirs, want_title, limit, skip):
         try:
             raw, whole = tail(path, size)
         except OSError:
-            return {"messages": [], "more": False, "found": False}
+            return {"messages": [], "more": False, "found": False, "last_ts": 0}
         messages = parse(raw)[0]
         if len(messages) >= need + 1 or whole or size > 32 * 1024 * 1024:
             break
         size *= 4
 
+    # "How long has this agent been quiet" is the newest message's own
+    # timestamp, not the file's mtime: the file can be touched by a line that
+    # is not a message at all (an ai-title on its own), and the mtime would
+    # then call a conversation that has been silent for days "just now".
+    last_ts = parse_iso(messages[-1]["ts"]) if messages else 0
+
     end = len(messages) - skip
     start = max(0, end - limit)
     return {"messages": messages[start:end] if end > 0 else [],
             "more": start > 0 or not whole,
-            "found": True}
+            "found": True,
+            "last_ts": last_ts}
 
 
 answer = {}
@@ -1109,6 +1126,27 @@ def tab_labels(instantaneo):
     return mapa
 
 
+def workspace_info(instantaneo):
+    """workspace_id -> (label, number).
+
+    `number` is the order Herdr itself lists workspaces in -- 1, 2, 3 -- and is
+    what "herdr" order sorts by now. It is not the same as the digits inside
+    `workspace_id` ("wD", "wJ"): those are opaque ids, not a sequence, and a
+    regex pulled no number at all out of a letter-only one, so every
+    letter-only workspace tied for the same rank and fell back to whatever
+    order the raw agent list happened to already be in.
+    """
+    mapa = {}
+    for i, ws in enumerate(instantaneo.get("workspaces") or []):
+        wid = str(ws.get("workspace_id") or "")
+        if not wid:
+            continue
+        label = str(ws.get("label") or "").strip()
+        number = ws.get("number")
+        mapa[wid] = (label, int(number) if isinstance(number, (int, float)) else i)
+    return mapa
+
+
 def short_name(cwd):
     """Project name from the cwd. Home becomes "~".
 
@@ -1122,7 +1160,7 @@ def short_name(cwd):
     return os.path.basename(cwd.rstrip("/"))
 
 
-def agent_row(agent, tabs, prs):
+def agent_row(agent, tabs, prs, workspaces):
     cwd = str(agent.get("cwd") or "")
     # Two directories, two purposes. `cwd` is where the pane opened and gives
     # the project its name; `foreground_cwd` is where the agent actually is,
@@ -1135,6 +1173,24 @@ def agent_row(agent, tabs, prs):
     title = str(agent.get("terminal_title_stripped") or agent.get("terminal_title") or "").strip()
     project = tabs.get(agent.get("tab_id")) or short_name(cwd)
 
+    ws_label, ws_number = workspaces.get(str(agent.get("workspace_id") or ""), ("", 0))
+
+    # What Claude Code itself calls the session -- set by /rename, and worth
+    # showing whenever it says something the terminal title and the project
+    # do not: the title is Herdr's own guess (the terminal's title bar, which
+    # Claude Code also happens to set from the same ai-title heuristic most
+    # of the time), and /rename is the one place an agent can override that
+    # guess on purpose.
+    claude_title = str(agent.get("claude_session_title") or "").strip()
+
+    # The one identifier that survives two agents sharing a plain directory
+    # with no worktree of its own to tell them apart: Herdr's own id for the
+    # session, stable for as long as it is the same conversation regardless
+    # of which pane or directory it is attached to right now. Empty for an
+    # agent kind that does not report one.
+    session = agent.get("agent_session")
+    session_id = str(session.get("value") or "") if isinstance(session, dict) else ""
+
     status = str(agent.get("agent_status") or "unknown")
     if status not in STATUSES:
         status = "unknown"
@@ -1145,7 +1201,18 @@ def agent_row(agent, tabs, prs):
         "pane_id": str(agent.get("pane_id") or ""),
         "tab_id": str(agent.get("tab_id") or ""),
         "workspace_id": str(agent.get("workspace_id") or ""),
+        "workspace_number": ws_number,
+        # Empty only when it repeats what the agent itself is already saying
+        # (its title, or its /rename) -- not when it merely matches the
+        # project, which is a name Herdr derived from the folder, not one the
+        # agent gave. A workspace kept its own label even while the agent
+        # inside it moved on to a different title or got renamed, and that is
+        # exactly the case worth surfacing: same folder, but the workspace
+        # still calls it something the agent no longer does.
+        "workspace_label": "" if ws_label in (title, claude_title) else ws_label,
+        "session_title": "" if claude_title in (project, title) else claude_title,
         "kind": str(agent.get("agent") or ""),
+        "session_id": session_id,
         "status": status,
         "cwd": cwd,
         "pr_cwd": work_cwd,
@@ -1189,11 +1256,12 @@ def build_snapshot():
 
     instantaneo = (resultado or {}).get("snapshot") or {}
     tabs = tab_labels(instantaneo)
+    workspaces = workspace_info(instantaneo)
     cache = read_json(pr_cache_path())
     prs = prs_by_cwd(cache)
 
-    lines = [agent_row(a, tabs, prs) for a in instantaneo.get("agents") or []]
-    lines.sort(key=lambda l: (numbers_in(l["workspace_id"]), numbers_in(l["tab_id"]), numbers_in(l["pane_id"])))
+    lines = [agent_row(a, tabs, prs, workspaces) for a in instantaneo.get("agents") or []]
+    lines.sort(key=lambda l: (l["workspace_number"], numbers_in(l["tab_id"]), numbers_in(l["pane_id"])))
 
     counts = {key: 0 for key in STATUSES}
     for line in lines:
@@ -1918,6 +1986,28 @@ def one_snapshot(target, with_messages):
     if err:
         return {"ok": False, "error": err}
 
+    # One transcript lookup per agent, title included, covers both jobs below.
+    # The title is not optional here: several agents can share one plain,
+    # non-worktree directory (two tabs opened in the same repo, no branch of
+    # its own), and without matching it to the one this pane actually is, the
+    # busiest of them would lend its last-activity -- and, with messages on,
+    # its conversation -- to all its neighbours in that directory.
+    wanted = [
+        {
+            "key": line["pane_id"],
+            "dirs": [line["pr_cwd"], line["cwd"]],
+            "title": line["title"] or line["project"],
+            "limit": TRANSCRIPT_FIRST if (with_messages and line["status"] == "blocked") else 1,
+            "skip": 0,
+        }
+        for line in data["rows"][:MAX_READS] if line["kind"] == "claude"
+    ]
+    answers = transcripts(wanted) if wanted else {}
+
+    for line in data["rows"]:
+        got = answers.get(line["pane_id"])
+        line["last_activity"] = (got.get("last_ts") or 0) if got else 0
+
     if with_messages:
         # The terminal is still read, but only for the dialog: a blocked agent's
         # question and its options are drawn on the screen and exist nowhere else.
@@ -1932,19 +2022,6 @@ def one_snapshot(target, with_messages):
         # carried fifty for every agent would put a few hundred kilobytes across
         # the SSH link every couple of seconds to draw one line each. A blocked
         # row opens by itself, so that one arrives ready to read.
-        wanted = []
-        for line in data["rows"][:MAX_READS]:
-            if line["kind"] != "claude":
-                continue
-            wanted.append({
-                "key": line["pane_id"],
-                "dirs": [line["pr_cwd"], line["cwd"]],
-                "title": line["title"] or line["project"],
-                "limit": TRANSCRIPT_FIRST if line["status"] == "blocked" else 1,
-                "skip": 0,
-            })
-
-        answers = transcripts(wanted)
         for line in data["rows"][:MAX_READS]:
             got = answers.get(line["pane_id"])
             # Only when the transcript actually answered: an agent that is not
@@ -2004,16 +2081,12 @@ def cmd_all(args):
         if not target:
             gh = str(data.get("gh") or "")
 
-    # Whoever is waiting on you first, then whoever is doing something, then
-    # whoever finished, then the quiet ones. A stable sort, so inside each
-    # state the rows keep the order Herdr itself shows (workspace, tab, pane)
-    # and a machine's block does not shuffle on its own.
-    #
-    # The cost is real: a row moves when its agent changes state, which can
-    # pull it out from under the cursor. That is the trade for the blocked one
-    # always being the first thing you read.
-    lines.sort(key=lambda l: URGENCY.get(l.get("status"), len(URGENCY)))
-
+    # Not sorted by urgency here: the widget does its own sorting now, with a
+    # choice of order, and one of those choices is explicitly "whatever order
+    # Herdr itself shows" (workspace, tab, pane, in the sequence build_snapshot
+    # already put them in, one machine's block after another). Re-sorting here
+    # would hand that option a lie -- rows already shuffled by status before
+    # they ever reached it.
     alvo_padrao, reason = resolve_global_default(lines)
     for line in lines:
         line["is_default"] = (line["machine"], line["pane_id"]) == alvo_padrao

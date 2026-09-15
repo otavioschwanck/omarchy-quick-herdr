@@ -7,8 +7,11 @@ import qs.Ui
 import "Model.js" as Model
 
 // Bar widget: how many Herdr agents are running, stopped on a question and
-// idle -- across as many machines as you turn on -- and a list to read each
-// one's conversation, go to it, or answer without leaving the bar.
+// idle -- across as many machines as you turn on. Each row is a name and a
+// status, sortable by status, name or the order Herdr itself returns; a star
+// marks a favorite, which always floats to the top. Clicking a row is the
+// only gesture it has: it goes to that agent's Herdr tab and closes the
+// popup.
 //
 // All traffic goes through bin/herdr-bar, which returns one line of JSON. The
 // helper exists because one click here becomes several chained calls -- focus
@@ -36,10 +39,25 @@ Panel {
   // field is a way back rather than a way to an empty widget.
   property string barFormat: ""
   property int refreshSeconds: 4
-  property int prSeconds: 180
   property int maxRows: 20
   property bool hideWhenEmpty: false
   property real fontScale: 1
+  // The popup's own width, in Style.space units -- separate from fontScale,
+  // which only grows the text. A workspace tag, a session tag and a machine
+  // tag can now all sit on one row beside the title, and 560 was already
+  // tight for that before any of them showed up.
+  property int panelWidth: 840
+  // How the list is ordered, and who is starred to the top of it regardless.
+  property string sortMode: "status"
+  property var favorites: []
+  // The threshold is a standing preference; whether it is applied right now is
+  // not -- reopening the list to find half of it hidden from a forgotten click
+  // is worse than clicking the toggle again.
+  property int hideInactiveDays: 3
+  property bool hideInactive: false
+  // A live search, not a setting: it resets with the popup, the same way the
+  // stale toggle does.
+  property string filterQuery: ""
 
   function applySettings() {
     session = String(setting("session", "default") || "default");
@@ -59,11 +77,14 @@ Panel {
     // end.
     var floor = list.length > 0 ? 5 : 2;
     refreshSeconds = Math.max(floor, Number(setting("interval", list.length > 0 ? 8 : 4)) || floor);
-    prSeconds = Math.max(30, Number(setting("prInterval", 180)) || 180);
     maxRows = Math.max(1, Number(setting("maxRows", 20)) || 20);
     hideWhenEmpty = setting("hideWhenEmpty", false) === true;
     fontScale = clampScale(Number(setting("fontScale", 1)) || 1);
+    panelWidth = Math.max(300, Number(setting("panelWidth", 840)) || 840);
     barFormat = String(setting("barFormat", "") || "");
+    sortMode = String(setting("sortMode", "status") || "status");
+    favorites = Model.favoritesFrom(setting("favorites", []));
+    hideInactiveDays = Math.max(1, Number(setting("hideInactiveDays", 3)) || 3);
     refresh();
   }
 
@@ -79,18 +100,14 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color urgentColor: bar ? bar.urgent : Color.urgent
   readonly property color dimColor: Qt.darker(barForeground, 1.5)
-  // Links have to read as links against the message they sit in, which is
-  // already dimmed: the accent is the one colour in the palette that is not a
-  // shade of the text around it.
-  readonly property color linkColor: Color.accent
   readonly property color fadeColor: Qt.darker(barForeground, 1.8)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   // The panel's own type scale. The bar keeps the theme's size -- it is one
   // slot among many and cannot grow without shoving its neighbours -- but the
-  // popup is a window of its own, and a conversation is meant to be read, not
-  // squinted at. The floor is where the layout still holds; the ceiling is
-  // where the panel already fills the screen and more would only cut content.
+  // popup is a window of its own. The floor is where the layout still holds;
+  // the ceiling is where the panel already fills the screen and more would
+  // only cut content.
   readonly property real minScale: 0.8
   readonly property real maxScale: 2.6
 
@@ -105,6 +122,31 @@ Panel {
   // ---------------------------------------------------------------- state
   property var counts: ({})
   property var rows: []
+  // The search narrows first, and the stale count below is measured against
+  // this -- not against every row -- so typing "api" does not make the "N
+  // hidden" counter claim credit for rows the search itself put out of view.
+  readonly property var queriedRows: Model.filterByQuery(rows, filterQuery)
+  // What the list actually draws: blocked and favorites first, then the
+  // chosen order.
+  readonly property var displayRows:
+    Model.sortRows(Model.filterActive(queriedRows, hideInactiveDays, hideInactive, favorites), sortMode, favorites)
+  // Sorting, favorites and the search never change how many of the queried
+  // rows there are -- only the stale filter does -- so the difference in
+  // count is exactly what it hid. The number is what makes the toggle
+  // legible when it hides nothing: with every agent active right now,
+  // clicking it has to say so, not sit silent and look unclicked.
+  readonly property int hiddenCount: hideInactive ? Math.max(0, queriedRows.length - displayRows.length) : 0
+  // What the list actually draws: a header per project, once, ahead of its
+  // rows -- so "api" is not the first word read on every one of a dozen
+  // rows in a row.
+  // Grouped by project for "name" and "herdr"; flat for "status", where the
+  // whole point is urgency across every project at once, and a header would
+  // pull a project's idle rows up to keep its one busy agent company.
+  readonly property var renderItems: Model.renderItemsFor(displayRows, sortMode, favorites)
+  // The rows alone, in the same order renderItems just drew them in -- what
+  // the keyboard cursor actually counts against, so it agrees with what
+  // grouping put on screen instead of the pre-grouping sort order.
+  readonly property var visualRows: Model.rowsOf(renderItems)
   // Progressive backoff while the list is closed. A tick costs ~60ms of CPU, of
   // which 5ms is the data -- the rest is interpreter startup, paid again on
   // every refresh. In a quiet session that is pure waste, so each cycle with no
@@ -118,168 +160,9 @@ Panel {
     opened ? refreshSeconds * 1000
            : Math.min(refreshSeconds * 1000 * Math.pow(2, quietTicks), 60000)
 
-  // Open rows, by (machine, pane). An open row shows the last messages instead
-  // of only the last one; whoever stopped on a question is born open, because
-  // the question is why you opened the list.
-  property var expandedRows: ({})
-
-  function keyOf(row_) {
-    return (row_.machine || "") + "\u0000" + row_.pane_id;
-  }
-
-  function isExpanded(row_) {
-    var key = keyOf(row_);
-    if (key in expandedRows) return expandedRows[key] === true;
-    // Whoever stopped on a question is born open: the question is why you opened
-    // the list. A click on the chevron still closes it, because the key then
-    // exists with "false".
-    return !!(row_.options && row_.options.length);
-  }
-
-  function toggleExpanded(row_) {
-    // Reassigning the whole object rather than touching one key: QML only
-    // re-evaluates bindings when the property itself changes.
-    var next_ = {};
-    for (var k in expandedRows) next_[k] = expandedRows[k];
-    var opening = !isExpanded(row_);
-    next_[keyOf(row_)] = opening;
-    expandedRows = next_;
-
-    if (opening) loadHistory(row_);
-  }
-
-  // ---------------------------------------------------------------- files
-  //
-  // A path in a conversation is a thing you want to act on, not a string to
-  // read. Clicking one offers the two things anyone actually wants: put it on
-  // the clipboard, or open it.
-  property string filePath: ""
-  property string fileMachine: ""
-  property real fileX: 0
-  property real fileY: 0
-
-  function openFileMenu(path, machine, x, y) {
-    filePath = String(path || "");
-    fileMachine = String(machine || "");
-    fileX = x;
-    fileY = y;
-  }
-
-  function closeFileMenu() {
-    filePath = "";
-  }
-
-  // A remote path is copied with its machine in front. Pasted into a terminal
-  // that is what opens it; without the prefix it is a path to a file that is
-  // not there, which is worse than useless because it looks right.
-  function copyFile() {
-    var what = fileMachine ? fileMachine + ":" + filePath : filePath;
-    if (bar) bar.run("printf %s " + root.shq(what) + " | wl-copy");
-    note("location copied");
-    closeFileMenu();
-  }
-
-  // The file itself, not the path to it. Copying the location is for pasting
-  // into a terminal; this is for everywhere else -- an image lands in Slack as
-  // the picture rather than as a string nobody can see.
-  function copyFileContents() {
-    var args = ["copy-file", "--path", filePath];
-    if (fileMachine) args.push("--remote", fileMachine);
-    copyFileProc.command = argv(args);
-    copyFileProc.running = true;
-    note(fileMachine ? "fetching " + Model.baseName(filePath) + "…" : "copying…");
-    closeFileMenu();
-  }
-
-  function openFile() {
-    var args = ["open", "--path", filePath];
-    if (fileMachine) args.push("--remote", fileMachine);
-    openProc.command = argv(args);
-    openProc.running = true;
-    closeFileMenu();
-  }
-
-  // ------------------------------------------------------------- history
-  //
-  // The refresh carries one message per row, which is all a closed row shows.
-  // Opening one goes and reads its session transcript: fifty messages, dated,
-  // and then twenty-five more each time you reach the top of them. Carrying
-  // fifty for every agent on every refresh would put a few hundred kilobytes
-  // across the SSH link every couple of seconds to draw one line each.
-  property var history: ({})
-  property string historyKey: ""
-
-  function historyOf(row_) {
-    var got = row_ ? history[keyOf(row_)] : null;
-    return got ? got.messages : [];
-  }
-
-  function hasMore(row_) {
-    var got = row_ ? history[keyOf(row_)] : null;
-    // Never asked yet counts as "there may be more": the first read is what
-    // finds out.
-    return got ? got.more : true;
-  }
-
-  function loadHistory(row_) {
-    if (!row_ || historyProc.running) return;
-    if (history[keyOf(row_)]) return;
-
-    historyKey = keyOf(row_);
-
-    var args = ["history",
-                "--pane", String(row_.pane_id || ""),
-                // The directory the agent actually works in, then the one the
-                // pane opened in. With git worktrees they differ, and only the
-                // first one finds the right session.
-                "--cwd", String(row_.pr_cwd || row_.cwd || ""),
-                "--cwd2", String(row_.cwd || ""),
-                "--title", String(row_.title || row_.project || ""),
-                "--limit", "15"];
-    if (row_.machine) args.push("--remote", String(row_.machine));
-
-    historyProc.command = argv(args);
-    historyProc.running = true;
-  }
-
-  function applyHistory(payload) {
-    var data = parse(payload);
-    if (!data) return;
-
-    var next_ = {};
-    for (var k in history) next_[k] = history[k];
-
-    next_[historyKey] = { messages: data.messages || [], more: !!data.more };
-    history = next_;
-  }
-
-  // Opening a conversation exists on the right mouse button. On a panel you
-  // drive with the arrows, needing the mouse for the one thing the list is for
-  // is a gap, not a shortcut nobody asked for.
-  function toggleCursor() {
-    if (cursorRow) toggleExpanded(cursorRow);
-  }
-
-  // Scroll the open conversation by most of a screenful -- most, not all, so a
-  // line stays behind as the seam and you can tell you moved rather than jumped.
-  function scrollConversation(direction) {
-    var item = rowsRepeater.itemAt(cursor);
-    if (!item || !item.conversation) return false;
-
-    var talk_ = item.conversation;
-    if (talk_.contentHeight <= talk_.height) return false;
-
-    talk_.contentY = Math.max(0, Math.min(talk_.contentHeight - talk_.height,
-                                          talk_.contentY + direction * talk_.height * 0.8));
-    return true;
-  }
-
-  property string defaultPane: ""
-  property string defaultMachine: ""
   // One entry per machine queried, with its error when it failed: with several
   // on, "something failed" without saying which helps nobody.
   property var machineStates: []
-  property string ghState: ""
   property string helperError: ""
 
   // Settings page, opened with a right click on the bar. It lives in the same
@@ -288,50 +171,40 @@ Panel {
   property bool settingsOpen: false
   property var hosts: []
 
-  // The chosen option that opened a field instead of answering on its own, and
-  // its agent. While this is set, the panel's field writes in there rather than
-  // sending a new prompt.
-  property var pendingOption: null
-  property string pendingPane: ""
-  property string pendingMachine: ""
-
-  function cancelPending() {
-    pendingOption = null;
-    pendingPane = "";
-    pendingMachine = "";
+  // Marking and unmarking a favorite is purely local: it never touches Herdr,
+  // only this widget's own corner of shell.json.
+  function toggleFavorite(row_) {
+    if (!row_) return;
+    var key = Model.favoriteKeyOf(row_);
+    var list_ = favorites.slice();
+    var at = list_.indexOf(key);
+    if (at >= 0) list_.splice(at, 1);
+    else list_.push(key);
+    favorites = list_;
+    setConfigJson("favorites", JSON.stringify(Model.favoritesToConfig(list_)));
   }
 
-  // The command the error hint suggests, ready for the clipboard. It covers both
-  // the persistent error and the passing notice: both come from the same helper
-  // and carry the fix in backticks for the same reason.
-  readonly property string errorCommand: Model.commandFrom(
-    helperError !== "" ? helperError : (statusIsError ? status : "")
-  )
-  property bool copied: false
+  readonly property var sortModes: ["status", "name", "recent", "herdr"]
 
-  // The bar exposes `run` but not `shellQuote` -- trusting it gave
-  // "Property 'shellQuote' is not a function" and swallowed the whole action,
-  // silently for whoever clicked. Quoting here depends on nobody else's API.
-  function shq(value) {
-    return "'" + String(value === undefined || value === null ? "" : value).replace(/'/g, "'\\''") + "'";
+  function cycleSortMode() {
+    var at = sortModes.indexOf(sortMode);
+    var next_ = sortModes[(at + 1) % sortModes.length];
+    sortMode = next_;
+    setConfigJson("sortMode", JSON.stringify(next_));
   }
 
-  function copyCommand(command) {
-    if (!command || !bar) return;
-    // printf and not echo: the command can contain a backslash, and echo would
-    // interpret it before the text reached the clipboard.
-    bar.run("printf %s " + root.shq(command) + " | wl-copy");
-    copied = true;
-    copiedTimer.restart();
+  function toggleHideInactive() {
+    hideInactive = !hideInactive;
   }
 
-  Timer {
-    id: copiedTimer
-    interval: 2500
-    onTriggered: root.copied = false
+  function setHideInactiveDays(value) {
+    var n = Math.max(1, Math.round(Number(value)) || hideInactiveDays);
+    if (n === hideInactiveDays) return;
+    hideInactiveDays = n;
+    setConfigJson("hideInactiveDays", String(n));
   }
 
-  // Passing notice under the field ("sent to bot", "blocked").
+  // Passing notice under the list ("machine turned off", a settings error).
   property string status: ""
   property bool statusIsError: false
 
@@ -353,8 +226,8 @@ Panel {
     onTriggered: if (root.opened) keyCatcher.forceActiveFocus()
   }
 
-  // Commands that apply to the whole widget: the aggregated list, the field's
-  // target, the settings. They take no machine.
+  // Commands that apply to the whole widget: the aggregated list, the
+  // settings. They take no machine.
   function argv(args) {
     var bottom = [root.helper];
     if (root.session !== "default") bottom = bottom.concat(["--session", root.session]);
@@ -369,35 +242,15 @@ Panel {
     return bottom.concat(args);
   }
 
-  // Messages cost one terminal read per agent, and only show in the list: with
-  // the popup closed the bar wants the counts and nothing else.
   function refresh() {
     if (snapshotProc.running) return;
 
     var args = ["all"];
-    if (root.opened) args.push("--messages");
     if (root.useLocal) args.push("--local");
     for (var i = 0; i < root.machines.length; i++) args.push("--remote", root.machines[i]);
 
     snapshotProc.command = argv(args);
     snapshotProc.running = true;
-  }
-
-  // PRs have their own rhythm: the snapshot reads only the cache, and this is
-  // the command that goes to GitHub. Running both on the same timer would put
-  // one network call per repository every few seconds, for a number that almost
-  // never changes.
-  function refreshPrs() {
-    if (prsProc.running) return;
-
-    // The same machine list as the snapshot: the lookup runs where each
-    // repository lives, so a remote machine gets its numbers too.
-    var args = ["prs"];
-    if (root.useLocal) args.push("--local");
-    for (var i = 0; i < root.machines.length; i++) args.push("--remote", root.machines[i]);
-
-    prsProc.command = argv(args);
-    prsProc.running = true;
   }
 
   function apply(payload) {
@@ -411,9 +264,6 @@ Panel {
 
     helperError = data.ok === false ? String(data.error || "helper error") : "";
     counts = data.counts || ({});
-    ghState = String(data.gh || "");
-    defaultPane = String(data.default || "");
-    defaultMachine = String(data.default_machine || "");
     machineStates = data.machines || [];
 
     var list = data.rows || [];
@@ -428,84 +278,12 @@ Panel {
   }
 
   // -------------------------------------------------------------- actions
-  // Each action has its own Process: a Process runs one command at a time, and
-  // sending text while the snapshot is in flight is the normal case, not the
-  // exception.
 
   function goTo(row_) {
     if (!row_) return;
     focusProc.command = argvFor(row_.machine, ["focus", row_.pane_id]);
     focusProc.running = true;
     close();
-  }
-
-  function setDefault(row_) {
-    if (!row_) return;
-    // Clicking the star of the current target unmarks it: it is the only gesture
-    // left for going back to having no default, and the field needs that state to
-    // say it has nowhere to send.
-    //
-    // "." is the local machine: an empty argument in argv would be
-    // indistinguishable from no argument at all.
-    var atual = row_.pane_id === root.defaultPane && row_.machine === root.defaultMachine;
-    defaultProc.command = argv(
-      atual ? ["pick", "-"] : ["pick", row_.machine || ".", row_.pane_id, row_.cwd || ""]
-    );
-    defaultProc.running = true;
-
-    // Marking the target and writing to it are the same gesture split in two, and
-    // the second was a wasted click. Unmarking focuses nothing: the field has just
-    // lost its destination.
-    if (!atual) field.forceActiveFocus();
-  }
-
-  function send(text) {
-    var target_ = root.defaultPane;
-    if (!target_) {
-      note("pick a default in the list (★)", true);
-      return;
-    }
-    if (!text || !text.trim()) return;
-
-    sendProc.payload = text.trim();
-    sendProc.command = argvFor(root.defaultMachine, ["send", target_]);
-    sendProc.running = true;
-  }
-
-  // Answering a dialog presses the option and keeps the panel open: the agent
-  // will change state next, and watching that happen is half the reason to
-  // answer from here instead of going to the tab.
-  function answer(row_, option) {
-    if (!row_ || !option) return;
-    answerProc.command = argvFor(row_.machine, ["answer", row_.pane_id, String(option.index), String(option.label)]);
-    answerProc.running = true;
-  }
-
-  // An option like "No, and tell Claude what to do differently" or "Chat about
-  // this" answers nothing on its own: it opens a field and waits. Pressing the
-  // key and stopping there would leave the agent stuck on an empty input, so the
-  // panel asks for the text before touching the dialog.
-  function pickOption(row_, option) {
-    if (!row_ || !option) return;
-    if (option.prompts === true) {
-      pendingOption = option;
-      pendingPane = row_.pane_id;
-      pendingMachine = row_.machine || "";
-      field.text = "";
-      field.forceActiveFocus();
-      return;
-    }
-    answer(row_, option);
-  }
-
-  function sendPending(text) {
-    if (!pendingOption || !text || !text.trim()) return;
-    answerTextProc.payload = text.trim();
-    answerTextProc.command = argvFor(pendingMachine, [
-      "answer", pendingPane, String(pendingOption.index), String(pendingOption.label), "--with-text"
-    ]);
-    answerTextProc.running = true;
-    cancelPending();
   }
 
   // ------------------------------------------------------------ configuration
@@ -521,7 +299,7 @@ Panel {
     configProc.running = true;
   }
 
-  // For what is not text -- the boolean of "this machine".
+  // For what is not text -- the boolean of "this machine", the favorites list.
   function setConfigJson(key, raw) {
     configJsonProc.command = argv(["config", "set", String(key), String(raw), "--json"]);
     configJsonProc.running = true;
@@ -563,6 +341,13 @@ Panel {
     setConfigJson("fontScale", String(next));
   }
 
+  function setPanelWidth(value) {
+    var n = Math.max(300, Math.round(Number(value)) || panelWidth);
+    if (n === panelWidth) return;
+    panelWidth = n;
+    setConfigJson("panelWidth", String(n));
+  }
+
   // Persisted like the font size, and for the same reason: what the bar should
   // say is a standing preference, not a thing you re-decide every session.
   function setBarFormat(value) {
@@ -578,13 +363,10 @@ Panel {
     refresh();
   }
 
-  function openPr(url) {
-    if (!url) return;
-    if (bar) bar.run("omarchy-launch-webapp " + root.shq(url));
-    close();
-  }
-
   // ------------------------------------------------------------- processes
+  // Each action has its own Process: a Process runs one command at a time, and
+  // sending the next one while a call is in flight is the normal case, not the
+  // exception.
   Process {
     id: snapshotProc
     stdout: StdioCollector {
@@ -593,46 +375,6 @@ Panel {
     }
     onExited: function (code) {
       if (code !== 0 && code !== null) root.helperError = "helper exited with " + code;
-    }
-  }
-
-  Process {
-    id: copyFileProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var data = root.parse(text);
-        if (!data) return;
-        if (data.ok === false) root.note(String(data.error), true);
-        else root.note(Model.copiedNote(data.bytes, data.mime));
-      }
-    }
-  }
-
-  Process {
-    id: openProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var data = root.parse(text);
-        if (data && data.ok === false) root.note(String(data.error), true);
-      }
-    }
-  }
-
-  Process {
-    id: historyProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyHistory(text)
-    }
-  }
-
-  Process {
-    id: prsProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.refresh()
     }
   }
 
@@ -679,49 +421,6 @@ Panel {
     }
   }
 
-  // The text goes on stdin for the same reason as a normal send: argv shows up
-  // in the `ps` of every process on the machine.
-  Process {
-    id: answerTextProc
-
-    property string payload: ""
-
-    stdinEnabled: true
-    onStarted: {
-      write(payload);
-      payload = "";
-      // Closing stdin is what ends the helper's read: the prompt can be several
-      // lines now, so it reads to EOF rather than stopping at the first break.
-      // The helper also has a deadline, so a pipe left open costs a delay and
-      // not a hang -- but the close is what makes it immediate.
-      stdinEnabled = false;
-    }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var data = root.parse(text);
-        if (!data) return;
-        if (data.ok === false) root.note(String(data.error), true);
-        else root.note("wrote in “" + String(data.answered) + "”", false);
-        root.refresh();
-      }
-    }
-  }
-
-  Process {
-    id: answerProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var data = root.parse(text);
-        if (!data) return;
-        if (data.ok === false) root.note(String(data.error), true);
-        else root.note("answered “" + String(data.answered) + "”", false);
-        root.refresh();
-      }
-    }
-  }
-
   Process {
     id: focusProc
     stdout: StdioCollector {
@@ -729,48 +428,6 @@ Panel {
       onStreamFinished: {
         var data = root.parse(text);
         if (data && data.ok === false) root.note(String(data.error), true);
-      }
-    }
-  }
-
-  Process {
-    id: defaultProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var data = root.parse(text);
-        if (data && data.ok === false) root.note(String(data.error), true);
-        root.refresh();
-      }
-    }
-  }
-
-  // The prompt goes on stdin and never on argv: argv shows up in the `ps` of
-  // every process on the machine, and an agent prompt tends to carry paths,
-  // client names and snippets of code.
-  Process {
-    id: sendProc
-
-    property string payload: ""
-
-    stdinEnabled: true
-    onStarted: {
-      write(payload);
-      payload = "";
-      // Closing stdin is what ends the helper's read: the prompt can be several
-      // lines now, so it reads to EOF rather than stopping at the first break.
-      // The helper also has a deadline, so a pipe left open costs a delay and
-      // not a hang -- but the close is what makes it immediate.
-      stdinEnabled = false;
-    }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var data = root.parse(text);
-        if (!data) return;
-        if (data.ok === false) root.note(String(data.error), true);
-        else root.note("sent to " + Model.nameOf(Model.findPane(root.rows, String(data.pane_id || ""))), false);
-        root.refresh();
       }
     }
   }
@@ -791,34 +448,24 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  Timer {
-    interval: root.prSeconds * 1000
-    // Network only while the list is in view: closed, the PR number appears
-    // nowhere and the call would be pure waste.
-    running: root.opened
-    repeat: true
-    onTriggered: root.refreshPrs()
-  }
-
   onOpenedChanged: {
     if (opened) {
       quietTicks = 0;
       refresh();
       if (settingsOpen) loadHosts();
-      else refreshPrs();
-      cursor = rows.length ? 0 : -1;
-      field.text = "";
-      cancelPending();
-      // The panel primes its own keyboard focus when it maps, and a visible QQC
-      // TextField takes it at that instant. Claiming the list back afterwards is
-      // what makes the popup open navigable: writing is one extra gesture ("i"),
-      // not the default.
+      cursor = visualRows.length ? 0 : -1;
+      // The panel primes its own keyboard focus when it maps, and claiming the
+      // list back after a beat is what makes the popup navigable right away.
       claimList.restart();
     } else {
       status = "";
-      field.text = "";
       settingsOpen = false;
-      cancelPending();
+      filterQuery = "";
+      // Typing into it is what breaks its binding to filterQuery -- same as
+      // any TextField here -- so clearing the property alone stops filtering
+      // but leaves the old text sitting in the box. This is what actually
+      // empties it back out.
+      filterField.text = "";
     }
   }
 
@@ -859,16 +506,20 @@ Panel {
   property int cursor: -1
 
   function moveCursor(delta) {
-    if (!rows.length) {
+    if (!visualRows.length) {
       cursor = -1;
       return;
     }
     var nxt = cursor + delta;
-    if (nxt < 0) nxt = rows.length - 1;
-    if (nxt >= rows.length) nxt = 0;
+    if (nxt < 0) nxt = visualRows.length - 1;
+    if (nxt >= visualRows.length) nxt = 0;
     cursor = nxt;
   }
 
+  // rows.length, not displayRows.length: sorting never changes the count, and at
+  // the very first assignment of `rows` during construction, `displayRows`'s own
+  // binding may not be installed yet -- `rows` itself, being what just changed, is
+  // always the one guaranteed to be there.
   onRowsChanged: if (cursor >= rows.length) cursor = rows.length - 1
 
   // With the list scrolling, arrow navigation could take the cursor out of view:
@@ -879,7 +530,12 @@ Panel {
   function revealCursor() {
     if (!scroller.interactive || cursor < 0) return;
 
-    var item = rowsRepeater.itemAt(cursor);
+    // rowsRepeater addresses renderItems, which now has a header mixed in
+    // ahead of every group -- not the same position as the flat cursor.
+    var pos = Model.visualIndexOf(renderItems, cursor);
+    if (pos < 0) return;
+
+    var item = rowsRepeater.itemAt(pos);
     if (!item) return;
 
     var top = item.mapToItem(column, 0, 0).y;
@@ -891,8 +547,7 @@ Panel {
 
   onCursorChanged: revealCursor()
 
-  readonly property var defaultRow: Model.findRow(rows, defaultMachine, defaultPane)
-  readonly property var cursorRow: cursor >= 0 && cursor < rows.length ? rows[cursor] : null
+  readonly property var cursorRow: cursor >= 0 && cursor < visualRows.length ? visualRows[cursor] : null
 
   // The machine tag only shows when more than one answered: with a single
   // machine the column would repeat the same word on every row.
@@ -907,10 +562,11 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    // Much wider than the status panels: here every row carries a whole sentence
-    // of conversation, and a dialog's question goes whole. Width bought here is
-    // height saved -- and height is what is scarce in a popup hanging off the bar.
-    contentWidth: panel.fittedContentWidth(Style.space(780) * root.fontScale)
+    // Configurable on the settings page: a workspace tag, a session tag and
+    // a machine tag can all sit on one row beside the title now, and how
+    // much of that fits before the title itself gets squeezed depends on
+    // the monitor and on taste.
+    contentWidth: panel.fittedContentWidth(Style.space(root.panelWidth) * root.fontScale)
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -918,165 +574,31 @@ Panel {
 
       anchors.fill: parent
 
-      // ---------- what to do with a file ----------
-      // Declared first, drawn on top: z is what puts it over the list, and
-      // keeping it out of the way here leaves the list reading in order below.
-      Item {
-        anchors.fill: parent
-        visible: root.filePath !== ""
-        z: 50
-
-        // Clicking anywhere else puts it away. A menu you have to aim at to
-        // dismiss is a menu that is in the way.
-        MouseArea {
-          anchors.fill: parent
-          onClicked: root.closeFileMenu()
-        }
-
-        BorderSurface {
-          // Kept inside the panel: opened from a link near an edge it would
-          // otherwise hang off the side, where it cannot be clicked.
-          x: Math.max(Style.spacing.sm,
-                      Math.min(root.fileX, keyCatcher.width - width - Style.spacing.sm))
-          y: Math.max(Style.spacing.sm,
-                      Math.min(root.fileY + Style.spacing.sm,
-                               keyCatcher.height - height - Style.spacing.sm))
-          width: Math.min(Style.space(320) * root.fontScale, keyCatcher.width - Style.spacing.sm * 2)
-          height: card.implicitHeight + Style.spacing.md * 2
-          radius: Style.cornerRadius
-          color: Color.popups.background
-          borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border,
-                                                Color.popups.border, Math.max(1, Style.space(2)))
-
-          Column {
-            id: card
-
-            x: Style.spacing.md
-            y: Style.spacing.md
-            width: parent.width - Style.spacing.md * 2
-            spacing: Style.spacing.sm
-
-            // The name first, because that is what you clicked and what you
-            // recognise; the whole location under it, for when two files share
-            // a name -- which in a repository is most of them.
-            Text {
-              width: parent.width
-              text: Model.baseName(root.filePath)
-              color: Color.popups.text
-              elide: Text.ElideMiddle
-              font.family: root.fontFamily
-              font.pixelSize: root.fontSmall
-            }
-
-            Text {
-              width: parent.width
-              text: Model.whereItIs(root.filePath, root.fileMachine)
-              color: root.fadeColor
-              elide: Text.ElideMiddle
-              font.family: root.fontFamily
-              font.pixelSize: Math.max(8, root.fontCaption * 0.85)
-            }
-
-            Item { width: 1; height: Math.round(Style.spacing.sm / 2) }
-
-            Repeater {
-              model: [
-                { label: "Open", glyph: "\uf08e", action: "open" },
-                { label: "Copy file", glyph: "\uf15c", action: "file" },
-                { label: "Copy location", glyph: "\uf0c5", action: "copy" }
-              ]
-
-              Rectangle {
-                required property var modelData
-
-                width: card.width
-                height: entry.implicitHeight + Style.spacing.sm * 2
-                radius: Style.space(4)
-                color: entryMouse.containsMouse ? root.hoverFill : "transparent"
-
-                Row {
-                  x: Style.spacing.sm
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.spacing.sm
-
-                  Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: Style.space(14)
-                    text: modelData.glyph
-                    color: entryMouse.containsMouse ? root.barForeground : root.fadeColor
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fontCaption
-                  }
-
-                  Text {
-                    id: entry
-
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: modelData.label
-                    color: entryMouse.containsMouse ? root.barForeground : Color.popups.text
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fontSmall
-                  }
-                }
-
-                MouseArea {
-                  id: entryMouse
-
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    if (modelData.action === "open") root.openFile();
-                    else if (modelData.action === "file") root.copyFileContents();
-                    else root.copyFile();
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      blocked: field.activeFocus
+      blocked: manualTarget.activeFocus || formatField.activeFocus || daysField.activeFocus
+               || filterField.activeFocus || widthField.activeFocus
 
       // Esc on the settings page goes back to the list before closing: leaving the
       // whole drawer because you picked the wrong page costs reopening and finding
       // the widget again.
       onCloseRequested: {
-        if (root.filePath !== "") root.closeFileMenu();
-        else if (root.settingsOpen) root.settingsOpen = false;
+        if (root.settingsOpen) root.settingsOpen = false;
         else root.close();
       }
       onMoveRequested: function (dx, dy) {
         if (dy !== 0) root.moveCursor(dy);
       }
       onActivateRequested: {
-        if (root.cursor >= 0 && root.cursor < root.rows.length)
-          root.goTo(root.rows[root.cursor]);
+        if (root.cursor >= 0 && root.cursor < root.visualRows.length)
+          root.goTo(root.visualRows[root.cursor]);
       }
       onTextKey: function (t) {
-        if (t === "i") { field.forceActiveFocus(); return; }
-        if (t === "r") { root.refresh(); root.refreshPrs(); return; }
+        if (t === "r") { root.refresh(); return; }
+        if (t === "/" && !root.settingsOpen) { filterField.forceActiveFocus(); return; }
 
         var row_ = root.cursorRow;
-        if (!row_) return;
-
-        if (t === "*") { root.setDefault(row_); return; }
-        if (t === "o") { root.toggleCursor(); return; }
-        if (t === "d") { root.scrollConversation(1); return; }
-        if (t === "u") { root.scrollConversation(-1); return; }
-
-        // 1..9 answers the dialog of the row under the cursor. It is the position in
-        // the list that counts, not the agent's key: unnumbered dialogs have no key at
-        // all, and the list is what you are looking at.
-        var n = "123456789".indexOf(t);
-        if (n >= 0 && Model.hasOptions(row_) && n < row_.options.length)
-          root.pickOption(row_, row_.options[n]);
+        if (t === "*" && row_) root.toggleFavorite(row_);
       }
 
-      // An open row grows, and four messages of a long conversation exceed the
-      // screen's height. The panel stops growing and starts scrolling: cutting would
-      // lose exactly the end of the conversation, which is the new part.
       Flickable {
         id: scroller
 
@@ -1099,7 +621,7 @@ Panel {
         Item {
           width: parent.width
           // The height has to fit both sides. With only the title's, the right-hand row
-          // overflowed: it appeared on top of the text field, and the click on the glyph
+          // overflowed: it appeared on top of the list, and the click on the sort label
           // fell outside the parent's bounds -- in Qt Quick a child outside the parent's
           // rectangle draws, but receives no mouse.
           implicitHeight: Math.max(header.implicitHeight, rightSide.implicitHeight)
@@ -1127,91 +649,50 @@ Panel {
             id: rightSide
 
             anchors.right: parent.right
-            // Centred rather than baseline-aligned: PanelSectionHeader has a topPadding of
-            // its own (reserving the overshoot of Nerd Font glyphs), and aligning to the
-            // baseline pushed this row below it, over the field's border.
+            // The scrollbar overlays the column's own right edge rather than
+            // reserving its own space -- without this margin it sat right on
+            // top of the gear icon, which nothing under it could then be
+            // clicked through.
+            anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
             visible: !root.settingsOpen
             spacing: Style.space(10)
 
+            // Bold only while something is blocked: the counts are the
+            // quietest thing here otherwise, and bolding "0 working" every
+            // time made them read louder than the panel's own title.
             Text {
-              text: Model.tooltip(root.counts)
+              anchors.verticalCenter: parent.verticalCenter
+              text: Model.summary(root.counts)
               color: (root.counts.blocked || 0) > 0 ? root.urgentColor : root.dimColor
               font.family: root.fontFamily
               font.pixelSize: root.fontCaption
-              font.bold: true
+              font.bold: (root.counts.blocked || 0) > 0
             }
 
-          }
-        }
+            // Settings, reachable without knowing right click on the bar
+            // opens the same page -- that gesture stays, this is just the
+            // door to it that is actually visible once the list is already
+            // open.
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "⚙"
+              color: settingsMouse.containsMouse ? root.barForeground : root.dimColor
+              font.family: root.fontFamily
+              font.pixelSize: root.fontBody
 
-        // ---------- send field ----------
-        // It sits above the list because it is the panel's cheapest gesture: it sends
-        // one line and does not take you away from where you are.
-        // A TextArea and not the kit's TextField: a prompt is not always one
-        // line. Enter sends, shift+enter breaks the line, and the field grows
-        // with what you wrote -- up to a ceiling, because a pasted essay must
-        // not push the whole list off the screen.
-        //
-        // The styling is copied from qs.Ui.TextField on purpose, so the two
-        // inputs of this panel look like the same control.
-        TextArea {
-          id: field
-
-          readonly property color accentColor: root.pendingOption ? root.urgentColor : root.barForeground
-          readonly property var borderSpec: Border.controlSpec(
-            activeFocus ? "focus" : (hovered ? "hover-cursor" : "normal"),
-            root.barForeground, accentColor)
-
-          width: parent.width
-          height: Math.min(implicitHeight, Style.space(190))
-          visible: !root.settingsOpen
-          enabled: root.pendingOption !== null || root.defaultPane !== ""
-          placeholderText: root.pendingOption
-                           ? Model.optionPlaceholder(root.pendingOption)
-                           : Model.placeholder(root.defaultRow, root.rows.length > 0)
-
-          color: root.barForeground
-          placeholderTextColor: Qt.darker(root.barForeground, 1.6)
-          selectionColor: Style.selectionFillFor(root.barForeground, accentColor)
-          selectedTextColor: root.barForeground
-          wrapMode: TextArea.Wrap
-          font.family: root.fontFamily
-          font.pixelSize: root.fontSmall
-
-          leftPadding: Style.spacing.controlPaddingX + Border.left(borderSpec)
-          rightPadding: Style.spacing.controlPaddingX + Border.right(borderSpec)
-          topPadding: Style.spacing.inputPaddingY + Border.top(borderSpec)
-          bottomPadding: Style.spacing.inputPaddingY + Border.bottom(borderSpec)
-
-          // The lit border is what separates "writing inside a dialog" from
-          // "sending a new prompt": they are different destinations in the
-          // same field.
-          background: BorderSurface {
-            color: Style.controlFill(field.activeFocus, field.hovered,
-                                     root.barForeground, field.accentColor)
-            borderSpec: field.borderSpec
-            radius: Style.cornerRadius
-          }
-
-          Keys.onPressed: function (event) {
-            if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return;
-
-            // Shift+Enter falls through to the TextArea, which inserts the
-            // break and grows the field on its own.
-            if (event.modifiers & Qt.ShiftModifier) return;
-
-            if (root.pendingOption) root.sendPending(text);
-            else root.send(text);
-            text = "";
-            event.accepted = true;
-          }
-
-          Keys.onEscapePressed: function (event) {
-            text = "";
-            root.cancelPending();
-            keyCatcher.forceActiveFocus();
-            event.accepted = true;
+              MouseArea {
+                id: settingsMouse
+                anchors.fill: parent
+                anchors.margins: -Style.space(4)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.settingsOpen = true;
+                  root.loadHosts();
+                }
+              }
+            }
           }
         }
 
@@ -1224,6 +705,202 @@ Panel {
           font.pixelSize: root.fontCaption
           horizontalAlignment: Text.AlignHCenter
           elide: Text.ElideRight
+        }
+
+        // ---------- toolbar: search, filter and sort ----------
+        // Its own section, not the header: the header is information (title,
+        // counts), this is action (what changes the list below it) -- and the
+        // rule after it separates a toolbar from a list, not a header from a
+        // button hanging off it.
+        TextField {
+          id: filterField
+
+          visible: !root.settingsOpen && root.rows.length > 0
+          width: parent.width
+          text: root.filterQuery
+          placeholderText: "filter by name or project…"
+          foreground: root.barForeground
+          accent: root.barForeground
+          font.family: root.fontFamily
+          font.pixelSize: root.fontCaption
+
+          // Live, not committed on enter: a search you have to press a key to
+          // apply is a search half the point of typing has already left.
+          // Narrowing the list resets the cursor to its first row, so typing
+          // a name and pressing enter goes there without ever touching the
+          // mouse or leaving the field to move it by hand.
+          onTextChanged: {
+            root.filterQuery = text;
+            root.cursor = root.visualRows.length ? 0 : -1;
+          }
+
+          // ctrl+n / ctrl+p walk the results the same as the arrows would,
+          // without leaving the field -- "n"/"p" rather than up/down because
+          // those are what a text field already reads as cursor movement
+          // inside the line, and stealing them would break editing the query
+          // itself.
+          Keys.onPressed: function (event) {
+            if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                && !(event.modifiers & Qt.ShiftModifier)) {
+              if (root.cursor >= 0 && root.cursor < root.visualRows.length)
+                root.goTo(root.visualRows[root.cursor]);
+              event.accepted = true;
+            } else if (event.key === Qt.Key_N && (event.modifiers & Qt.ControlModifier)) {
+              root.moveCursor(1);
+              event.accepted = true;
+            } else if (event.key === Qt.Key_P && (event.modifiers & Qt.ControlModifier)) {
+              root.moveCursor(-1);
+              event.accepted = true;
+            }
+          }
+
+          Keys.onEscapePressed: function (event) {
+            text = "";
+            keyCatcher.forceActiveFocus();
+            event.accepted = true;
+          }
+        }
+
+        // A little more air than the column's own spacing gives every other
+        // pair of rows: the field has a visible border of its own, and
+        // without this the toolbar right under it reads as glued to it
+        // rather than as the next, separate thing.
+        Item {
+          visible: !root.settingsOpen && root.rows.length > 0
+          width: 1
+          height: Style.space(4)
+        }
+
+        Item {
+          visible: !root.settingsOpen && root.rows.length > 0
+          width: parent.width
+          implicitHeight: hideToggle.implicitHeight
+
+          component Pill: Rectangle {
+            id: pill
+
+            property alias label: pillLabel.text
+            property bool active: false
+            signal clicked
+
+            implicitWidth: pillLabel.implicitWidth + Style.space(16)
+            implicitHeight: pillLabel.implicitHeight + Style.space(8)
+            radius: Style.space(5)
+            // Filled solid when active, not just a lit border: a border that
+            // only changes color reads as hover, and this has to still read as
+            // "on" once the pointer has moved off it.
+            color: pill.active ? root.barForeground : (pillMouse.containsMouse ? root.hoverFill : "transparent")
+            border.width: pill.active ? 0 : 1
+            border.color: root.fadeColor
+
+            Text {
+              id: pillLabel
+              anchors.centerIn: parent
+              color: pill.active ? Color.popups.background : (pillMouse.containsMouse ? root.barForeground : root.dimColor)
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+              font.bold: pill.active
+            }
+
+            MouseArea {
+              id: pillMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: pill.clicked()
+            }
+          }
+
+          Row {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(8)
+
+            Pill {
+              id: hideToggle
+              label: "hide inactive ≥"
+              active: root.hideInactive
+              onClicked: root.toggleHideInactive()
+            }
+
+            TextField {
+              id: daysField
+
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(34)
+              text: String(root.hideInactiveDays)
+              foreground: root.barForeground
+              accent: root.barForeground
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+
+              // Live, the same as the search field: a threshold you have to
+              // press Enter to apply is one that reads as broken the moment
+              // anyone just types a number and looks at the list instead.
+              onTextChanged: {
+                var n = parseInt(text, 10);
+                if (!isNaN(n) && n > 0) root.setHideInactiveDays(n);
+              }
+
+              Keys.onEscapePressed: function (event) {
+                text = String(root.hideInactiveDays);
+                keyCatcher.forceActiveFocus();
+                event.accepted = true;
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "days"
+              color: root.dimColor
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+            }
+
+            // Silent when off, and when on but nothing qualifies -- "0 hidden"
+            // is still an answer. Without it, a threshold nothing crosses
+            // looks exactly like a click that did nothing.
+            Text {
+              visible: root.hideInactive
+              anchors.verticalCenter: parent.verticalCenter
+              text: "· " + root.hiddenCount + " hidden"
+              color: root.dimColor
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+            }
+          }
+
+          // The order in force, moved down from the header: it changes the
+          // list, same as the toggle beside it, so it belongs on this side of
+          // the rule -- not up with the title and the counts, which only
+          // report.
+          Pill {
+            anchors.right: parent.right
+            // Same reason as the settings gear: the scrollbar overlays the
+            // column's edge instead of reserving room, and sat right on top
+            // of this pill without the margin.
+            anchors.rightMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            label: Model.sortLabel(root.sortMode)
+            onClicked: root.cycleSortMode()
+          }
+        }
+
+        // Breathing room around the rule between the toolbar and the list it
+        // acts on, so it reads as a separator between two sections rather
+        // than a line the first row's hover fill is bumping into.
+        Item {
+          visible: !root.settingsOpen && root.rows.length > 0
+          width: parent.width
+          height: Style.space(10)
+
+          Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width
+            height: 1
+            color: root.fadeColor
+            opacity: 0.4
+          }
         }
 
         // ---------- settings ----------
@@ -1529,7 +1206,7 @@ Panel {
             }
 
             StepButton {
-              glyph: "\uf068"
+              glyph: ""
               step: -0.1
             }
 
@@ -1544,8 +1221,53 @@ Panel {
             }
 
             StepButton {
-              glyph: "\uf067"
+              glyph: ""
               step: 0.1
+            }
+          }
+
+          PanelSectionHeader {
+            topPadding: Style.space(8)
+            text: "Panel width"
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+          }
+
+          Row {
+            spacing: Style.space(8)
+            leftPadding: Style.space(10)
+
+            TextField {
+              id: widthField
+
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(50)
+              text: String(root.panelWidth)
+              foreground: root.barForeground
+              accent: root.barForeground
+              font.family: root.fontFamily
+              font.pixelSize: root.fontSmall
+
+              // Live, the same as the other number fields here: nothing to
+              // press enter on, just a value that takes hold as you type it.
+              onTextChanged: {
+                var n = parseInt(text, 10);
+                if (!isNaN(n) && n >= 300) root.setPanelWidth(n);
+              }
+
+              Keys.onEscapePressed: function (event) {
+                text = String(root.panelWidth);
+                keyCatcher.forceActiveFocus();
+                event.accepted = true;
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "how wide the popup opens, independent of the text size above"
+              color: root.fadeColor
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
             }
           }
 
@@ -1562,9 +1284,14 @@ Panel {
 
         // ---------- list ----------
         Text {
-          visible: !root.settingsOpen && root.rows.length === 0
+          visible: !root.settingsOpen && root.displayRows.length === 0
           width: parent.width
-          text: root.helperError !== "" ? root.helperError : "No agents in the Herdr session."
+          text: root.helperError !== "" ? root.helperError
+                : (root.filterQuery !== "" && root.rows.length > 0)
+                  ? "Nothing matches “" + root.filterQuery + "”."
+                  : (root.hideInactive && root.rows.length > 0)
+                    ? "Nothing active in the last " + root.hideInactiveDays + " day(s) -- the rest is hidden."
+                    : "No agents in the Herdr session."
           color: root.helperError !== "" ? root.urgentColor : root.barForeground
           opacity: root.helperError !== "" ? 1 : 0.6
           font.family: root.fontFamily
@@ -1572,700 +1299,234 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        // The fix, ready to paste. A command you have to retype out of a popup is not a
-        // hint, it is a lead -- and a line of `ssh-copy-id` with a Tailscale machine
-        // name is exactly the sort of thing you mistype twice before getting right.
-        Rectangle {
-          visible: !root.settingsOpen && root.errorCommand !== ""
-          width: parent.width
-          implicitHeight: Style.space(26)
-          radius: Style.space(6)
-          color: copyMouse.containsMouse ? root.hoverFill : "transparent"
-          border.width: 1
-          border.color: root.fadeColor
-
-          MouseArea {
-            id: copyMouse
-
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: root.copyCommand(root.errorCommand)
-          }
-
-          Row {
-            anchors.fill: parent
-            anchors.leftMargin: Style.space(10)
-            anchors.rightMargin: Style.space(10)
-            spacing: Style.space(8)
-
-            Text {
-              anchors.verticalCenter: parent.verticalCenter
-              text: root.copied ? "✓" : "⧉"
-              color: root.copied ? root.barForeground : root.dimColor
-              font.family: root.fontFamily
-              font.pixelSize: root.fontSmall
-            }
-
-            Text {
-              anchors.verticalCenter: parent.verticalCenter
-              width: parent.width - Style.space(40)
-              text: root.copied ? "copied" : root.errorCommand
-              color: copyMouse.containsMouse || root.copied ? root.barForeground : root.dimColor
-              elide: Text.ElideRight
-              font.family: root.fontFamily
-              font.pixelSize: root.fontSmall
-            }
-          }
-        }
-
         Repeater {
           id: rowsRepeater
 
-          model: root.settingsOpen ? [] : root.rows
+          model: root.settingsOpen ? [] : root.renderItems
 
           Rectangle {
             id: row
 
             required property var modelData
-            required property int index
 
-            // The keyboard scrolls this from the outside: a Repeater delegate is
-            // not addressable otherwise, and a conversation you can open with the
-            // keyboard but only read with the mouse is half a gesture.
-            property alias conversation: talk
+            // null on a header entry: nothing below reads it without also
+            // checking modelData.isHeader first.
+            readonly property var agent: modelData.isHeader ? null : modelData.row
+            // The header's own position in renderItems is not a position in
+            // the flat, ungrouped list the cursor counts against -- it isn't
+            // one of the rows at all, so it has no cursor index.
+            readonly property int navIndex: modelData.isHeader ? -1 : modelData.index
 
-            // Named once here rather than recomputed in the Repeater: each
-            // message needs the one before it to know how long the pause was.
-            readonly property var talkMessages: Model.visibleMessages(row.modelData, row.expanded,
-                                                              root.historyOf(row.modelData))
-
-            readonly property bool highlighted: mouse.containsMouse || root.cursor === index
-            readonly property bool isDefault: modelData.pane_id === root.defaultPane
-                                              && modelData.machine === root.defaultMachine
-            readonly property string pr: Model.prLabel(modelData)
+            readonly property bool highlighted: !modelData.isHeader && (mouse.containsMouse || root.cursor === navIndex)
+            readonly property bool favorited: !modelData.isHeader && Model.isFavorite(root.favorites, agent)
             // Whether this row has a title of its own. Herdr leaves it empty when
             // it would only repeat the project, and then the project has to look
             // like the name rather than like a qualifier of one.
-            readonly property bool titled: String(modelData.title || "") !== ""
-            readonly property bool expanded: root.isExpanded(modelData)
+            readonly property bool titled: !modelData.isHeader && String(agent.title || "") !== ""
 
             width: column.width
-            implicitHeight: content.implicitHeight + Style.space(10)
+            implicitHeight: row.modelData.isDivider
+                            ? Style.space(10)
+                            : modelData.isHeader
+                              ? header.implicitHeight + Style.space(10)
+                              : content.implicitHeight + Style.space(10)
             radius: Style.space(6)
             color: row.highlighted ? root.hoverFill : "transparent"
 
+            // One header per project: the name every row under it used to
+            // repeat, given once instead. Not interactive -- there is no
+            // single agent it would go to.
+            Text {
+              id: header
+
+              visible: row.modelData.isHeader && !row.modelData.isDivider
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              // "" is a real project -- an agent running in an unnamed
+              // directory -- and still needs a header, not a blank gap.
+              text: (row.modelData.isHeader && !row.modelData.isDivider) ? (row.modelData.label || "(no project)") : ""
+              color: root.fadeColor
+              font.family: root.fontFamily
+              font.pixelSize: root.fontCaption
+              font.bold: true
+            }
+
+            // The line "status" and "recent" owe the end of the favorites
+            // section: those two orders draw the rest of the list flat, with
+            // no project header of its own to mark where favorites stop and
+            // everyone else starts.
+            Rectangle {
+              visible: row.modelData.isDivider === true
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width
+              height: 1
+              color: root.fadeColor
+              opacity: 0.4
+            }
+
             // Declared before the content on purpose: in QML whatever comes later sits on
-            // top and gets the click first, and the PR number and the star need to win
-            // against this area covering the whole row.
+            // top and gets the click first, and the star needs to win against this area
+            // covering the whole row.
             MouseArea {
               id: mouse
 
+              visible: !row.modelData.isHeader
               anchors.fill: parent
               hoverEnabled: true
-              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              acceptedButtons: Qt.LeftButton
               cursorShape: Qt.PointingHandCursor
-              onEntered: root.cursor = row.index
-              onClicked: function (evento) {
-                // Right opens the conversation, left goes to it. Reading what happened and
-                // deciding whether it is worth going are two gestures, and spending the go
-                // click to find out is expensive: it closes the panel.
-                if (evento.button === Qt.RightButton) root.toggleExpanded(row.modelData);
-                else root.goTo(row.modelData);
-              }
+              onEntered: root.cursor = row.navIndex
+              onClicked: root.goTo(row.agent)
             }
 
-            Column {
+            Row {
               id: content
 
+              visible: !row.modelData.isHeader
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(10)
-              spacing: Style.space(2)
+              spacing: Style.space(8)
 
-              // ----- identification -----
-              Row {
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(12)
+                text: row.agent ? Model.glyph(row.agent.status) : ""
+                // Blocked and working are the two states worth the eye
+                // stopping on, and now the only two drawn at full strength --
+                // in a list where most rows sit idle, that used to be a wall
+                // of the same grey with nothing to catch on.
+                color: row.agent && row.agent.status === "blocked" ? root.urgentColor
+                       : row.agent && row.agent.status === "working" ? Color.accent
+                       : root.barForeground
+                opacity: row.agent && (row.agent.status === "blocked" || row.agent.status === "working") ? 1
+                         : row.agent && row.agent.status === "done" ? 0.7
+                         : 0.25
+                font.family: root.fontFamily
+                font.pixelSize: root.fontBody
+              }
+
+              // The project no longer repeats here when there is a title: the
+              // header above the group already named it. It only carries its
+              // own name on the row when there is no title to hand that job
+              // to -- and Row reclaims the width the moment it is hidden.
+              Text {
+                id: project_
+
+                visible: !row.titled
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.min(implicitWidth, Style.space(150))
+                text: row.agent ? row.agent.project : ""
+                color: root.barForeground
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fontBody
+              }
+
+              // Herdr's own workspace name -- empty whenever it would only
+              // repeat the project or the title, which is most of the time:
+              // Herdr seeds a new workspace's name from whatever first ran in
+              // it. What is left once that is filtered out is the one you
+              // actually renamed, like a "MEGABRAIN" grouping several agents
+              // that share no project or title of their own.
+              Text {
+                id: workspaceTag
+
+                visible: text !== ""
+                anchors.verticalCenter: parent.verticalCenter
+                // A share of the panel's own width rather than a fixed cap:
+                // that fixed number was sized for the old, narrower default,
+                // and elided names that had room to fit once the panel grew.
+                width: Math.min(implicitWidth, root.panelWidth * 0.18)
+                text: row.agent ? (row.agent.workspace_label || "") : ""
+                color: root.fadeColor
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fontCaption
+                font.italic: true
+              }
+
+              // What Claude Code itself calls the session, set with /rename --
+              // empty whenever it would only repeat the project or the title,
+              // which is most of the time: the title is often the same guess
+              // Claude Code already made on its own. Plain, not italic like
+              // the workspace tag beside it, so the two read as two different
+              // kinds of name rather than one.
+              Text {
+                id: sessionTag
+
+                visible: text !== ""
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.min(implicitWidth, root.panelWidth * 0.22)
+                text: row.agent ? (row.agent.session_title || "") : ""
+                color: root.fadeColor
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fontCaption
+              }
+
+              // Which machine the row came from. Beside the project because
+              // that is what it qualifies -- two machines can hold a project
+              // of the same name, and then the name alone stops identifying.
+              Text {
+                id: machineTag
+
+                visible: text !== ""
+                anchors.verticalCenter: parent.verticalCenter
+                text: row.agent ? Model.machineBadge(row.agent.machine, root.severalMachines) : ""
+                color: root.fadeColor
+                font.family: root.fontFamily
+                font.pixelSize: root.fontCaption
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
                 width: parent.width
-                spacing: Style.space(8)
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(12)
-                  text: Model.glyph(row.modelData.status)
-                  color: row.modelData.status === "blocked" ? root.urgentColor : root.barForeground
-                  opacity: row.modelData.status === "idle" || row.modelData.status === "unknown" ? 0.45 : 1
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontBody
-                }
-
-                Text {
-                  id: project_
-
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Math.min(implicitWidth, Style.space(150))
-                  text: row.modelData.project
-                  // A qualifier when there is a title, the name itself when
-                  // there is not: with no title the project is all the row has
-                  // to be called, and it has to carry the row on its own.
-                  color: row.titled ? root.dimColor : root.barForeground
-                  elide: Text.ElideRight
-                  font.family: root.fontFamily
-                  font.pixelSize: row.titled ? root.fontSmall : root.fontBody
-                }
-
-                // Which machine the row came from. Beside the project because
-                // that is what it qualifies -- two machines can hold a project
-                // of the same name, and then the name alone stops identifying.
-                Text {
-                  id: machineTag
-
-                  visible: text !== ""
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: Model.machineBadge(row.modelData.machine, root.severalMachines)
-                  color: root.fadeColor
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontCaption
-                }
-
-                // The title is what the row is about, and it is what you are looking
-                // for: the project is a directory basename and the machine is where it
-                // runs, but "Omarchy plugin integração HERDR" is the thing itself. So it
-                // is the headline here and the other two are the breadcrumb before it --
-                // which is the opposite of how this row was first built.
-                //
-                // The width discounts the star even when it is hidden: reserving the
-                // space costs some slack on the right and keeps the row from re-laying
-                // out every time the cursor passes over it.
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: parent.width
-                         - Style.space(20)
-                         - project_.width
-                         - (machineTag.visible ? machineTag.width + Style.space(8) : 0)
-                         - (row.pr !== "" ? Style.space(50) : 0)
-                         - Style.space(26)
-                         - Style.space(20)
-                  text: row.modelData.title
-                  color: root.barForeground
-                  elide: Text.ElideRight
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontBody
-                  font.bold: true
-                }
-
-                // Open and close the conversation. It appears under the cursor and stays while
-                // the row is open -- otherwise an open row with the mouse far away would have
-                // no visible gesture to close it.
-                Text {
-                  visible: row.highlighted || row.expanded
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: row.expanded ? "\uf077" : "\uf078"
-                  color: root.barForeground
-                  opacity: chevronMouse.containsMouse ? 0.9 : 0.4
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontCaption
-
-                  MouseArea {
-                    id: chevronMouse
-
-                    anchors.fill: parent
-                    anchors.margins: -Style.space(4)
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.toggleExpanded(row.modelData)
-                  }
-                }
-
-                Text {
-                  visible: row.pr !== ""
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: row.pr
-                  color: prMouse.containsMouse ? root.barForeground : root.dimColor
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontSmall
-                  font.underline: prMouse.containsMouse
-
-                  MouseArea {
-                    id: prMouse
-
-                    anchors.fill: parent
-                    anchors.margins: -Style.space(4)
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.openPr(row.modelData.pr_url)
-                  }
-                }
-
-                // The text field's target. Filled on the current target, hollow under the
-                // cursor: a star on every row would be noise in a list built to be read at a
-                // glance.
-                Text {
-                  visible: row.isDefault || row.highlighted
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: row.isDefault ? "★" : "☆"
-                  color: root.barForeground
-                  opacity: row.isDefault ? 0.9 : (starMouse.containsMouse ? 0.9 : 0.4)
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontBody
-
-                  MouseArea {
-                    id: starMouse
-
-                    anchors.fill: parent
-                    anchors.margins: -Style.space(4)
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.setDefault(row.modelData)
-                  }
-                }
+                       - Style.space(20)
+                       - (project_.visible ? project_.width + Style.space(8) : 0)
+                       - (workspaceTag.visible ? workspaceTag.width + Style.space(8) : 0)
+                       - (sessionTag.visible ? sessionTag.width + Style.space(8) : 0)
+                       - (machineTag.visible ? machineTag.width + Style.space(8) : 0)
+                       - Style.space(26)
+                text: row.agent ? row.agent.title : ""
+                // Blocked already sits at the top of every order; the color
+                // is what makes it read as urgent once it is there, not just
+                // early -- the same red the glyph already wears.
+                color: row.agent && row.agent.status === "blocked" ? root.urgentColor : root.barForeground
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fontBody
+                font.bold: true
               }
 
-              // ----- what was said -----
-              // One message per agent and three for the field's own: it is the one you will
-              // reply to, and replying needs the conversation, not the headline. Aligned
-              // under the project name, not under the glyph, so the state column stays a
-              // column.
-              // Open, the conversation scrolls inside its own row rather than
-              // stretching it: a row tall enough to hold twenty messages stops
-              // being a row in a list, and the panel becomes one long column
-              // where you lose the other agents. It grows to the ceiling and
-              // then scrolls in place, so the list around it stays a list.
-              Flickable {
-                id: talk
+              // The favorite, filled when set and hollow under the cursor: a star on
+              // every row would be noise in a list built to be read at a glance.
+              //
+              // Always visible, never just opacity 0 -- and not "visible: false" when at
+              // rest: a Row repositions around a child the moment its visible flips, and
+              // that shifted the title under the pointer on every hover. Opacity alone
+              // reserves the same slot whether it is showing or not.
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: row.favorited ? "★" : "☆"
+                color: root.barForeground
+                opacity: row.favorited ? 0.9
+                         : row.highlighted ? (starMouse.containsMouse ? 0.9 : 0.4)
+                         : 0
+                font.family: root.fontFamily
+                font.pixelSize: root.fontBody
 
-                // Half the panel, and never less than a few lines. Enough that
-                // an open conversation dominates without swallowing the list.
-                readonly property real ceiling: Math.max(Style.space(110), scroller.height * 0.5)
+                MouseArea {
+                  id: starMouse
 
-                width: content.width
-                height: row.expanded ? Math.min(talkColumn.implicitHeight, ceiling)
-                                     : talkColumn.implicitHeight
-                contentWidth: width
-                contentHeight: talkColumn.implicitHeight
-                // Clipping only matters once it can scroll; a closed row must
-                // not crop a message that already fits.
-                clip: row.expanded
-                boundsBehavior: Flickable.StopAtBounds
-                flickableDirection: Flickable.VerticalFlick
-                interactive: contentHeight > height
-
-                // The wheel is handled here rather than left to the Flickable.
-                // Nested inside the panel's own Flickable, the default delivery
-                // is a coin toss: the outer one can take the event and scroll
-                // the whole list while the pointer sits inside an open
-                // conversation that has more to show. Accepting it here settles
-                // who moves -- the thing under the pointer.
-                WheelHandler {
-                  enabled: talk.interactive
-                  onWheel: function (event) {
-                    var step = event.angleDelta.y !== 0 ? event.angleDelta.y : event.angleDelta.x;
-                    talk.contentY = Math.max(0, Math.min(talk.contentHeight - talk.height,
-                                                         talk.contentY - step));
-                  }
-                }
-
-                // Always on while it can scroll, never a hover-only hint: the
-                // bar is the only thing that says there is more conversation
-                // below, and a scrollbar you have to discover by accident is
-                // not saying it.
-                ScrollBar.vertical: ScrollBar {
-                  policy: talk.interactive ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
-                }
-
-                Column {
-                  id: talkColumn
-
-                  width: talk.width
-                  spacing: 0
-
-                  // The conversation stops at fifteen. Reading further is what
-                  // the terminal is for -- this list exists to tell you which
-                  // agent to go to, and going there is one click away rather
-                  // than a scroll that never ends.
-                  Item {
-                    visible: row.expanded && root.hasMore(row.modelData)
-                    width: talkColumn.width
-                    height: visible ? older.implicitHeight + Style.space(8) : 0
-
-                    Rectangle {
-                      x: Style.space(46)
-                      width: older.implicitWidth + Style.space(12)
-                      height: older.implicitHeight + Style.space(5)
-                      radius: Style.space(4)
-                      color: olderMouse.containsMouse ? root.hoverFill : "transparent"
-                      border.width: 1
-                      border.color: root.fadeColor
-
-                      Text {
-                        id: older
-
-                        anchors.centerIn: parent
-                        text: "older messages — open in terminal"
-                        color: olderMouse.containsMouse ? root.barForeground : root.fadeColor
-                        font.family: root.fontFamily
-                        font.pixelSize: Math.max(8, root.fontCaption * 0.85)
-                      }
-
-                      MouseArea {
-                        id: olderMouse
-
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.goTo(row.modelData)
-                      }
-                    }
-                  }
-
-                  Repeater {
-                    model: row.talkMessages
-
-                    Item {
-                      id: message
-
-                      required property var modelData
-                      required property int index
-
-                      readonly property var previous: message.index > 0 ? row.talkMessages[message.index - 1] : null
-                      // The pause before this message, as distance. Closed rows
-                      // show one message and have no pause to draw.
-                      readonly property real gap: row.expanded && message.index > 0
-                                                  ? Model.timeGap(message.previous, message.modelData) * root.fontScale
-                                                  : 0
-                      readonly property string waited: row.expanded && message.index > 0
-                                                       ? Model.gapLabel(message.previous, message.modelData) : ""
-
-                      width: talkColumn.width
-                      implicitHeight: gap + body.implicitHeight + Style.space(2)
-
-                      // The line down the pause. It starts where the message above
-                      // ended and stops where this one begins, so the wait is
-                      // something you see in the margin rather than something you
-                      // work out from two clocks.
-                      Rectangle {
-                        x: Style.space(46)
-                        width: Math.max(1, Style.space(1) * 0.5)
-                        height: message.gap
-                        visible: message.gap > 0
-                        color: root.fadeColor
-                        opacity: 0.45
-                      }
-
-                      Text {
-                        // Only on pauses long enough to be worth a word. On every
-                        // gap it would be a column of noise down the margin.
-                        visible: message.waited !== ""
-                        x: Style.space(52)
-                        y: Math.max(0, message.gap / 2 - implicitHeight / 2)
-                        text: message.waited
-                        color: root.fadeColor
-                        opacity: 0.8
-                        font.family: root.fontFamily
-                        font.pixelSize: Math.max(8, root.fontCaption * 0.8)
-                      }
-
-                      Row {
-                        id: body
-
-                        y: message.gap
-                        width: talkColumn.width
-                        leftPadding: Style.space(20)
-                        spacing: Style.space(6)
-
-                        Text {
-                          // The clock, in the margin rather than in the sentence: a
-                          // time stamp inside the text is read as part of it.
-                          y: Style.space(1)
-                          width: Style.space(26)
-                          horizontalAlignment: Text.AlignRight
-                          text: Model.clockOf(message.modelData.ts)
-                          color: root.fadeColor
-                          opacity: 0.7
-                          font.family: root.fontFamily
-                          font.pixelSize: Math.max(8, root.fontCaption * 0.8)
-                        }
-
-                        Text {
-                          // No verticalCenter: anchoring to the centre of a Row whose height
-                          // depends on this very text is circular, and Qt resolves it by holding
-                          // the height at one line -- which was exactly why wrapped text did not
-                          // show.
-                          y: Style.space(1)
-                          width: Style.space(9)
-                          text: Model.voice(message.modelData.who)
-                          color: root.fadeColor
-                          font.family: root.fontFamily
-                          font.pixelSize: root.fontCaption
-                        }
-
-                        Column {
-                          width: talkColumn.width - Style.space(75)
-                          spacing: Style.space(4)
-
-                          Text {
-                            id: said
-
-                            width: parent.width
-                            // Rich text only where it is read. A closed row shows one elided
-                            // line, and eliding is a plain-text measurement -- asking for both
-                            // gives a line that neither wraps nor cuts where it should.
-                            // Rich text only when the message actually mentions a file.
-                            // Laying out rich text is many times the cost of plain, and most
-                            // messages have nothing in them to link -- paying that on every
-                            // line of every open conversation is what made the panel crawl.
-                            readonly property bool linked: row.expanded && Model.hasPath(message.modelData.text)
-                            textFormat: linked ? Text.RichText : Text.PlainText
-                            text: linked ? Model.messageHtml(message.modelData.text, root.linkColor)
-                                         : message.modelData.text
-                            color: root.dimColor
-                            // Open or under the cursor, the message goes whole; closed and at rest
-                            // it fits on one line, so the list stays scannable at a glance and
-                            // reading everything costs only pointing at it.
-                            elide: row.expanded || row.highlighted ? Text.ElideNone : Text.ElideRight
-                            wrapMode: row.expanded || row.highlighted ? Text.WordWrap : Text.NoWrap
-                            font.family: root.fontFamily
-                            font.pixelSize: root.fontCaption
-
-                            // Passive on purpose: it reads where the pointer is without
-                            // taking the click, which still has to reach the link under it.
-                            HoverHandler { id: pointer }
-
-                            onLinkActivated: function (link) {
-                              var at = said.mapToItem(keyCatcher, pointer.point.position.x,
-                                                      pointer.point.position.y);
-                              root.openFileMenu(link, row.modelData.machine, at.x, at.y);
-                            }
-                            onLinkHovered: function (link) {
-                              said.cursorShape = link ? Qt.PointingHandCursor : Qt.ArrowCursor;
-                            }
-
-                            property int cursorShape: Qt.ArrowCursor
-                            MouseArea {
-                              anchors.fill: parent
-                              acceptedButtons: Qt.NoButton
-                              cursorShape: said.cursorShape
-                            }
-                          }
-
-                          // Thumbnails for the pictures it mentioned. A filename does not
-                          // answer "which screenshot was that", and the answer is right
-                          // there on disk.
-                          Row {
-                            visible: row.expanded
-                            spacing: Style.space(4)
-
-                            Repeater {
-                              model: row.expanded ? Model.imagesIn(message.modelData.text) : []
-
-                              Rectangle {
-                                id: chip
-
-                                required property var modelData
-
-                                // Only what actually loaded: a picture on another machine is
-                                // not on this one, and a broken frame says nothing a missing
-                                // one does not say better.
-                                visible: shot.status === Image.Ready
-                                width: visible ? shot.width + 2 : 0
-                                height: visible ? shot.height + 2 : 0
-                                radius: Style.space(3)
-                                color: "transparent"
-                                border.width: 1
-                                border.color: thumbMouse.containsMouse ? root.barForeground : root.fadeColor
-
-                                // Draggable into any other window, the way a file is dragged
-                                // out of a file manager. It is the same picture and the same
-                                // gesture, and having to open the menu, copy the location and
-                                // paste it somewhere is three steps standing in for one.
-                                //
-                                // text/uri-list is what everything else reads a dragged file
-                                // as; the thumbnail itself is what flies under the pointer.
-                                Drag.active: dragging
-                                Drag.dragType: Drag.Automatic
-                                Drag.supportedActions: Qt.CopyAction
-                                Drag.mimeData: ({ "text/uri-list": Model.fileUrl(chip.modelData) })
-                                Drag.imageSource: shot.source
-
-                                property bool dragging: false
-
-                                Image {
-                                  id: shot
-
-                                  x: 1
-                                  y: 1
-                                  source: "file://" + Model.withoutLine(chip.modelData)
-                                  sourceSize.height: Math.round(Style.space(38) * root.fontScale)
-                                  fillMode: Image.PreserveAspectFit
-                                  asynchronous: true
-                                  smooth: true
-                                }
-
-                                MouseArea {
-                                  id: thumbMouse
-
-                                  anchors.fill: parent
-                                  hoverEnabled: true
-                                  cursorShape: Qt.PointingHandCursor
-
-                                  // Pressing is not yet dragging. Without a threshold the
-                                  // click that opens the menu would start a drag on the
-                                  // pixel of movement any hand makes while clicking.
-                                  property point origin: Qt.point(0, 0)
-                                  readonly property real threshold: Style.space(6)
-
-                                  onPressed: function (evento) {
-                                    origin = Qt.point(evento.x, evento.y);
-                                  }
-                                  onPositionChanged: function (evento) {
-                                    if (!pressed || chip.dragging) return;
-
-                                    var dx = evento.x - origin.x;
-                                    var dy = evento.y - origin.y;
-                                    if (Math.sqrt(dx * dx + dy * dy) < threshold) return;
-
-                                    // Only a picture that is really here can be dragged: the
-                                    // other end receives a path, and a path to a file on
-                                    // another machine resolves to nothing there.
-                                    if (row.modelData.machine) return;
-                                    chip.dragging = true;
-                                  }
-                                  onReleased: chip.dragging = false
-                                  onCanceled: chip.dragging = false
-
-                                  onClicked: function (evento) {
-                                    if (chip.dragging) return;
-                                    var at = mapToItem(keyCatcher, evento.x, evento.y);
-                                    root.openFileMenu(chip.modelData, row.modelData.machine, at.x, at.y);
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-
-              // ----- what it is asking -----
-              Column {
-                // A question with no recognisable option is still a question: a "[y/N]" yields
-                // no button, but it yields the sentence you need to read before going to the
-                // tab to answer.
-                visible: Model.hasOptions(row.modelData)
-                         || row.modelData.question !== ""
-                         || (row.modelData.context || []).length > 0
-                width: content.width
-                topPadding: visible ? Style.space(4) : 0
-                spacing: Style.space(4)
-
-                // The dialog's body: the command it wants to run, the "Tip:" that changes what
-                // you would choose, the description. "Do you want to proceed?" on its own is
-                // not a question -- it is the half of it that informs nothing.
-                //
-                // One single Text rather than one per line: the breaks already come in the
-                // text, and it is the bar's monospaced font that keeps the command block
-                // aligned as it was on screen.
-                Text {
-                  visible: (row.modelData.context || []).length > 0
-                  x: Style.space(20)
-                  width: content.width - Style.space(20)
-                  // RichText because the colors come from the terminal: Claude Code already
-                  // highlighted the diff and the command block, and repainting here would mean
-                  // guessing again what the other end already knows.
-                  textFormat: Text.RichText
-                  text: Model.contextHtml(row.modelData.context)
-                  color: root.fadeColor
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontCaption
-                }
-
-                Text {
-                  visible: row.modelData.question !== ""
-                  x: Style.space(20)
-                  width: content.width - Style.space(20)
-                  text: row.modelData.question
-                  color: root.barForeground
-                  // Whole, not elided: this sentence is what you decide on, and half a question
-                  // is worse than none -- the half that survives looks like the whole question
-                  // and you answer something else.
-                  wrapMode: Text.WordWrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fontSmall
-                }
-
-                // One option per row, full width, text that wraps instead of eliding. In a row
-                // the short labels would fit, but "Yes, and always allow access to /home/..."
-                // -- exactly the one carrying the decision -- would arrive cut at "/hom…",
-                // which is a yes with no object. Height spent here is the height of the choice.
-                Column {
-                  x: Style.space(20)
-                  width: content.width - Style.space(20)
-                  spacing: Style.space(3)
-
-                  Repeater {
-                    model: row.modelData.options || []
-
-                    Rectangle {
-                      id: option
-
-                      required property var modelData
-                      required property int index
-
-                      readonly property string badge: Model.badge(modelData)
-
-                      width: parent.width
-                      implicitHeight: label_.implicitHeight + Style.space(10)
-                      radius: Style.space(5)
-                      color: optionMouse.containsMouse ? root.hoverFill : "transparent"
-                      border.width: 1
-                      // The chosen one already has the dialog's own cursor; the lit border repeats
-                      // that here so the Enter you would press over there has a visible equivalent
-                      // here.
-                      border.color: option.modelData.selected ? root.barForeground : root.fadeColor
-
-                      MouseArea {
-                        id: optionMouse
-
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onEntered: root.cursor = row.index
-                        onClicked: root.pickOption(row.modelData, option.modelData)
-                      }
-
-                      Text {
-                        // Numbered gets the key badge; a cursor list gets no number at all, because
-                        // there is no key to type there -- the widget walks the arrows for you.
-                        visible: option.badge !== ""
-                        x: Style.space(10)
-                        y: Style.space(5)
-                        width: Style.space(14)
-                        text: option.badge
-                        color: root.barForeground
-                        font.family: root.fontFamily
-                        font.pixelSize: root.fontSmall
-                        font.bold: true
-                      }
-
-                      Text {
-                        id: label_
-
-                        x: Style.space(10) + (option.badge !== "" ? Style.space(20) : 0)
-                        y: Style.space(5)
-                        width: option.width - x - Style.space(10)
-                        text: option.modelData.label
-                        color: optionMouse.containsMouse ? root.barForeground : root.dimColor
-                        wrapMode: Text.WordWrap
-                        font.family: root.fontFamily
-                        font.pixelSize: root.fontSmall
-                      }
-                    }
-                  }
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.toggleFavorite(row.agent)
                 }
               }
             }
@@ -2275,21 +1536,9 @@ Panel {
         // ---------- footer ----------
         Text {
           width: parent.width
-          visible: !root.settingsOpen && text !== ""
-          text: Model.ghNotice(root.ghState)
-          color: root.fadeColor
-          font.family: root.fontFamily
-          font.pixelSize: root.fontCaption
-          horizontalAlignment: Text.AlignHCenter
-          elide: Text.ElideRight
-        }
-
-        Text {
-          width: parent.width
           text: root.settingsOpen
                 ? Model.settingsHint(root.hosts)
-                : Model.hint(root.rows, root.defaultRow, field.activeFocus, root.cursorRow,
-                              root.cursorRow && root.isExpanded(root.cursorRow))
+                : Model.hint(root.displayRows, root.cursorRow)
           color: root.fadeColor
           font.family: root.fontFamily
           font.pixelSize: root.fontCaption
