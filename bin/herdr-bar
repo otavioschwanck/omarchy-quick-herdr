@@ -83,10 +83,15 @@ MAX_TEXT = 32 * 1024
 MAX_REPOS_PER_RUN = 12
 MAX_CACHE_ENTRIES = 200
 
-# How many agents get a terminal read per refresh. Each read is one call;
-# locally that is microseconds, but over SSH they are round trips, and a
-# session with thirty agents cannot stall the bar.
-MAX_READS = 24
+# How many agents get a terminal read (blocked dialogs, with the list open)
+# or an activity lookup (every refresh) per tick. Each terminal read is one
+# call; locally that is microseconds, but over SSH they are round trips, and
+# a session with thirty agents cannot stall the bar. The activity lookup is
+# one batched call regardless of count, but still has to cover as many rows
+# as the widget means to show -- matches the default maxRows, so a busy
+# session's whole list gets real "last active" data, not "unknown" past the
+# fiftieth.
+MAX_READS = 50
 BUFFER_LINES = 90
 # Ceiling for one message. Deliberately high: it exists so a strange buffer
 # cannot dump a whole screen into the panel, not to shorten conversation --

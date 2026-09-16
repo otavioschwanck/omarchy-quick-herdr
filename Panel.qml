@@ -39,7 +39,11 @@ Panel {
   // field is a way back rather than a way to an empty widget.
   property string barFormat: ""
   property int refreshSeconds: 4
-  property int maxRows: 20
+  // A row is just a name, a status and a couple of tags now -- nowhere near
+  // the cost a message preview used to be -- so the ceiling can sit high
+  // enough that it is a safety margin against a truly pathological agent
+  // count, not something a normal, busy session actually runs into.
+  property int maxRows: 50
   property bool hideWhenEmpty: false
   property real fontScale: 1
   // The popup's own width, in Style.space units -- separate from fontScale,
@@ -77,7 +81,7 @@ Panel {
     // end.
     var floor = list.length > 0 ? 5 : 2;
     refreshSeconds = Math.max(floor, Number(setting("interval", list.length > 0 ? 8 : 4)) || floor);
-    maxRows = Math.max(1, Number(setting("maxRows", 20)) || 20);
+    maxRows = Math.max(1, Number(setting("maxRows", 50)) || 50);
     hideWhenEmpty = setting("hideWhenEmpty", false) === true;
     fontScale = clampScale(Number(setting("fontScale", 1)) || 1);
     panelWidth = Math.max(300, Number(setting("panelWidth", 840)) || 840);
@@ -126,16 +130,20 @@ Panel {
   // this -- not against every row -- so typing "api" does not make the "N
   // hidden" counter claim credit for rows the search itself put out of view.
   readonly property var queriedRows: Model.filterByQuery(rows, filterQuery)
+  readonly property var activeRows: Model.filterActive(queriedRows, hideInactiveDays, hideInactive, favorites)
+  // Sorting and the search never change how many of the queried rows there
+  // are -- only the stale filter does -- so the difference in count is
+  // exactly what it hid. The number is what makes the toggle legible when it
+  // hides nothing: with every agent active right now, clicking it has to say
+  // so, not sit silent and look unclicked. Measured before maxRows below, so
+  // a long list capped for room does not get counted here as "hidden" too.
+  readonly property int hiddenCount: hideInactive ? Math.max(0, queriedRows.length - activeRows.length) : 0
   // What the list actually draws: blocked and favorites first, then the
-  // chosen order.
-  readonly property var displayRows:
-    Model.sortRows(Model.filterActive(queriedRows, hideInactiveDays, hideInactive, favorites), sortMode, favorites)
-  // Sorting, favorites and the search never change how many of the queried
-  // rows there are -- only the stale filter does -- so the difference in
-  // count is exactly what it hid. The number is what makes the toggle
-  // legible when it hides nothing: with every agent active right now,
-  // clicking it has to say so, not sit silent and look unclicked.
-  readonly property int hiddenCount: hideInactive ? Math.max(0, queriedRows.length - displayRows.length) : 0
+  // chosen order -- and only then, once that order is settled, cut to
+  // maxRows. Capping any earlier kept whichever agents the backend's own
+  // workspace/tab/pane order happened to list last, blocked or favorited or
+  // not, instead of the ones that actually matter least under this sort.
+  readonly property var displayRows: Model.sortRows(activeRows, sortMode, favorites).slice(0, maxRows)
   // What the list actually draws: a header per project, once, ahead of its
   // rows -- so "api" is not the first word read on every one of a dozen
   // rows in a row.
@@ -266,8 +274,12 @@ Panel {
     counts = data.counts || ({});
     machineStates = data.machines || [];
 
-    var list = data.rows || [];
-    rows = list.slice(0, maxRows);
+    // Kept whole here, not sliced to maxRows: the backend's own order is
+    // just workspace/tab/pane, nothing to do with which agents matter right
+    // now, and cutting to it before sorting dropped whichever agents
+    // happened to sit last in that order -- blocked, favorited, or not.
+    // maxRows applies after sorting instead, on displayRows.
+    rows = data.rows || [];
 
     // The fingerprint is the counts, not the rows: with the list closed that is
     // all the bar draws, and a terminal title changing on its own is no reason to
@@ -1346,7 +1358,9 @@ Panel {
               // "" is a real project -- an agent running in an unnamed
               // directory -- and still needs a header, not a blank gap.
               text: (row.modelData.isHeader && !row.modelData.isDivider) ? (row.modelData.label || "(no project)") : ""
-              color: root.fadeColor
+              // Blocked keeps the same color its rows already wear, so the
+              // header reads as urgent too, not just early.
+              color: row.modelData.isUrgent ? root.urgentColor : root.fadeColor
               font.family: root.fontFamily
               font.pixelSize: root.fontCaption
               font.bold: true

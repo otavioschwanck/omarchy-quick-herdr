@@ -23,7 +23,7 @@
       "label": "",
       "session": "default",
       "interval": 4,
-      "maxRows": 20,
+      "maxRows": 50,
       "hideWhenEmpty": false,
       "barFormat": "✳ {blocked}"
     },

@@ -376,40 +376,45 @@ function flattenRows(rows) {
   return out;
 }
 
-// What the list actually renders: blocked rows first with no header of their
-// own (color already marks them, and there are rarely more than one or two);
-// then every non-blocked favorite under its own "★ Favorites" header; then
-// the rest, grouped by project for "name" and "herdr", flat for "status" and
-// "recent" -- both are about the one thing across every project at once
-// (what needs you, what moved last), and a project header would pull a run
-// of a project's older rows up to sit with its one recent agent, the same
-// way it would hide a run of idle ones behind a working one.
+// What the list actually renders: every blocked row under its own
+// "◼ Blocked" header; then every remaining favorite under its own
+// "★ Favorites" header; then the rest, grouped by project for "name" and
+// "herdr", flat for "status" and "recent" -- both are about the one thing
+// across every project at once (what needs you, what moved last), and a
+// project header would pull a run of a project's older rows up to sit with
+// its one recent agent, the same way it would hide a run of idle ones
+// behind a working one.
 //
 // Blocked and favorite are already contiguous at the top of `rows` --
 // sortRows put them there -- so labelling them here costs no reordering, and
 // unlike project grouping it never pulls an unrelated row out of its sorted
-// position. That is why the favorites header is safe in every mode,
-// "status" and "recent" included, where a project header is not.
+// position. That is why both headers are safe in every mode, "status" and
+// "recent" included, where a project header is not.
 //
-// A plain divider follows the favorites, but only ahead of a flat tail: a
-// grouped one already gets a boundary for free from the next project's own
-// header, and drawing a second line right above it would be one too many.
+// A plain divider follows whichever of the two headed sections ran last,
+// but only ahead of a flat tail: a grouped one already gets a boundary for
+// free from the next project's own header, and a favorites header right
+// under a blocked one already is its own boundary -- drawing a second line
+// there would be one too many.
 function renderItemsFor(rows, mode, favorites) {
   rows = rows || [];
   var out = [];
   var visualIndex = 0;
   var i = 0;
 
-  while (i < rows.length && rows[i].status === "blocked") {
-    out.push({ isHeader: false, row: rows[i], index: visualIndex });
-    visualIndex++;
-    i++;
+  var blockedStart = i;
+  while (i < rows.length && rows[i].status === "blocked") i++;
+  if (i > blockedStart) {
+    out.push({ isHeader: true, label: "◼ Blocked", isUrgent: true });
+    for (var b = blockedStart; b < i; b++) {
+      out.push({ isHeader: false, row: rows[b], index: visualIndex });
+      visualIndex++;
+    }
   }
 
   var favStart = i;
   while (i < rows.length && isFavorite(favorites, rows[i])) i++;
-  var hadFavorites = i > favStart;
-  if (hadFavorites) {
+  if (i > favStart) {
     out.push({ isHeader: true, label: "★ Favorites" });
     for (var f = favStart; f < i; f++) {
       out.push({ isHeader: false, row: rows[f], index: visualIndex });
@@ -417,14 +422,21 @@ function renderItemsFor(rows, mode, favorites) {
     }
   }
 
+  // Whether blocked and/or favorites drew anything above -- either one
+  // already gave itself a header, so the only boundary still missing is the
+  // one between the last of those headed sections and a flat tail with none
+  // of its own.
+  var hadTopSections = i > 0;
+
   var rest = rows.slice(i);
   var flat = mode === "status" || mode === "recent";
   var tail = flat ? flattenRows(rest) : groupByProject(rest);
 
   // A grouped tail draws its own boundary for free -- the next project's
-  // header. A flat one has none, so favorites would run straight into
-  // everyone else with nothing between them; this line is that boundary.
-  if (hadFavorites && flat && tail.length > 0) {
+  // header. A flat one has none, so the sections above would run straight
+  // into everyone else with nothing between them; this line is that
+  // boundary.
+  if (hadTopSections && flat && tail.length > 0) {
     out.push({ isHeader: true, isDivider: true });
   }
 
